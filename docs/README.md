@@ -19,6 +19,7 @@ See [`whitepapers/`](whitepapers/) for the index and citation details.
 
 | Document | Contents |
 | --- | --- |
+| [setup.md](setup.md) | The cross-platform `mariana setup` command: pyenv, virtual environment, requirements profiles, extras and troubleshooting. |
 | [fast-training.md](fast-training.md) | Sprint-DRV flags, benchmark command, tradeoffs, and MoE kernels. |
 | [latent-language.md](latent-language.md) | SAINT commands, metrics, ablations, and limitations. |
 | [ncm.md](ncm.md) | NCM training/inference recipes, controls, and evaluation requirements. |

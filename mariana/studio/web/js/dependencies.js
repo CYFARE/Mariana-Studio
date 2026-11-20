@@ -11,7 +11,7 @@
   const FAILED_KEY = "dependencies-failed";
 
   function signature(status) {
-    return status ? status.missing.join(",") : "";
+    return status ? `${status.python || ""}|${status.missing.join(",")}` : "";
   }
 
   function running(job) {
@@ -230,7 +230,7 @@
     const actions = Studio.ui.render($("dependencies-actions"));
     if (state.preparing) {
       actions.append(Studio.ui.button("Hide", { small: true, kind: "ghost", onclick: hide }));
-    } else if (active) {
+    } else if (view.active) {
       actions.append(Studio.ui.button("Hide", { small: true, kind: "ghost", onclick: hide }));
       actions.append(Studio.ui.button("Stop", { small: true, kind: "danger", onclick: stop }));
     } else if (job && job.status === "failed") {
@@ -246,7 +246,7 @@
     } else if (job && job.status === "completed") {
       actions.append(Studio.ui.button("Reload Studio", { small: true, kind: "primary", onclick: () => window.location.reload() }));
       actions.append(Studio.ui.button("Dismiss", { small: true, kind: "ghost", onclick: dismiss }));
-    } else if (anyError) {
+    } else if (view.anyError) {
       actions.append(Studio.ui.button("Dismiss", { small: true, kind: "ghost", onclick: dismiss }));
     } else if (status.missing.length && status.pip === false) {
       actions.append(Studio.ui.button("Dismiss", { small: true, kind: "ghost", onclick: dismiss }));

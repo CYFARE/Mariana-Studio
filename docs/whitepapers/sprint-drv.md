@@ -1,6 +1,6 @@
 # Sprint-DRV: single-pass training for a hybrid diffusion–autoregressive language model
 
-**Whitepaper · Mariana v2.3.0 · 2026-11-20**
+**Whitepaper · Mariana v2.3.1 · 2026-11-20**
 
 | | |
 | --- | --- |
@@ -429,7 +429,7 @@ with a clearly bounded tradeoff in full-sequence alignment.
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.0},
+  version     = {2.3.1},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/sprint-drv.md}
 }
 ```

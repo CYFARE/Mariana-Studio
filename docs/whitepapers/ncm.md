@@ -1,6 +1,6 @@
 # Next-Concept Modeling in Mariana: coarse-to-fine residual VQ and parallel concept generation
 
-**Whitepaper · Mariana v2.3.0 · 2026-11-20**
+**Whitepaper · Mariana v2.3.1 · 2026-11-20**
 
 | | |
 | --- | --- |
@@ -439,7 +439,7 @@ better trade than one per byte for a given corpus and deployment target.
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.0},
+  version     = {2.3.1},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/ncm.md}
 }
 ```

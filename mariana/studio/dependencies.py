@@ -24,6 +24,11 @@ from .errors import BadRequestError, UnavailableError
 REQUIREMENTS_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_SECONDS = 15.0
 _NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_EXTERNALLY_MANAGED = (
+    "externally-managed-environment",
+    "externally managed environment",
+    "externally managed",
+)
 
 
 @dataclass(frozen=True)
@@ -172,7 +177,17 @@ class DependencyManager:
                 )
                 job.check_cancelled()
                 if code != 0:
-                    raise RuntimeError(f"pip could not install {group.title}. {self._failure_detail(job)}")
+                    detail = self._failure_detail(job)
+                    if any(marker in detail.lower() for marker in _EXTERNALLY_MANAGED):
+                        raise RuntimeError(
+                            f"pip refused to install into {sys.executable} because it is "
+                            "externally managed. Start Studio with the project virtual "
+                            "environment (`python mariana.py studio` now selects .venv "
+                            "automatically), or run `python mariana.py setup` again."
+                        )
+                    raise RuntimeError(
+                        f"pip could not install {group.title} with {sys.executable}. {detail}"
+                    )
                 job.update(current=index + 1)
             job.update(stage="Refreshing feature detection")
             return {"groups": [group.id for group in groups]}
@@ -211,6 +226,7 @@ class DependencyManager:
         latest = max(jobs, key=lambda item: item.get("created") or 0, default=None)
         return {
             **detected,
+            "python": sys.executable,
             "auto_install": self._auto_install(),
             "pip": importlib.util.find_spec("pip") is not None,
             "busy": bool(self.registry.active("dependency")),

@@ -1,0 +1,16 @@
+# Virtual environments created by `python mariana.py setup` or by hand.
+.venv/
+venv/
+
+# Python caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime data (see AGENTS.md §1); these directories are created on demand.
+trained-model/
+models/
+datasets/
+exports/
+backups/
+agent-workspace/

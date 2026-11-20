@@ -400,6 +400,87 @@ console.log(JSON.stringify({
     assert result == {"text": "Hi there code link", "browser": False, "speech": False}
 
 
+def test_dependency_panel_renders_completed_and_missing_file_states():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+function element(id) {
+  const classes = new Set();
+  return {
+    id, children: [], textContent: "", style: {}, attrs: {},
+    classList: {
+      add(name) { classes.add(name); },
+      remove(...names) { names.forEach(name => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    append(...nodes) { this.children.push(...nodes); },
+    addEventListener() {},
+  };
+}
+const elements = {};
+function $(id) { return elements[id] || (elements[id] = element(id)); }
+function group(id, title, missing) {
+  return { id, title, description: "", file: `requirements-${id}.txt`,
+    required: id === "core", packages: [], missing, error: "" };
+}
+const base = {
+  python: "/repo/.venv/bin/python", auto_install: false, pip: true, busy: false,
+  missing_packages: [], installed: false, errors: [],
+};
+const statuses = [
+  { ...base,
+    groups: [group("core", "Core runtime", []), group("finetune", "Fine-tuning", []),
+      group("export", "Export toolchain", []),
+      group("data", "Dataset tooling", ["datasets", "pyarrow"])],
+    missing: ["data"],
+    job: { id: "dep-1", status: "completed", active: false, error: null,
+      meta: { groups: ["data"] }, progress: { percent: 100 } } },
+  { ...base, groups: [group("core", "Core runtime", []),
+      group("finetune", "Fine-tuning", []), group("export", "Export toolchain", []),
+      group("data", "Dataset tooling", [])],
+    missing: [], errors: ["export"], job: null },
+];
+const Studio = {
+  $, h: (...args) => ({ args }), toast() {}, on() {}, confirm: async () => true,
+  api: async () => statuses.shift(),
+  store: { get(key, fallback) { return fallback; }, set() {} },
+  ui: {
+    render(container) { container.children = []; return container; },
+    button(label, options) { return { label, options }; },
+  },
+  models: { load: async () => {} },
+};
+const sandbox = { window: { Studio }, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+(async () => {
+  const results = [];
+  for (let index = 0; index < 2; index += 1) {
+    await Studio.dependencies.open();
+    results.push({
+      title: $("dependencies-title").textContent,
+      subtitle: $("dependencies-subtitle").textContent,
+      actions: $("dependencies-actions").children.map(button => button.label),
+    });
+  }
+  console.log(JSON.stringify(results));
+})().catch(error => { console.error(error.stack || error); process.exit(1); });
+"""
+    result = node_script(script, WEB / "js/dependencies.js")
+    assert result == [
+        {
+            "title": "Some dependencies are still unavailable",
+            "subtitle": "Retry, or open the job centre to inspect the pip output.",
+            "actions": ["Retry", "Dismiss"],
+        },
+        {
+            "title": "Requirement files are missing",
+            "subtitle": "Restore the missing requirements file, then check again.",
+            "actions": ["Dismiss"],
+        },
+    ]
+
+
 def test_every_static_dom_lookup_has_exactly_one_target():
     parser = parse_page()
     ids = set(parser.ids)
@@ -1148,6 +1229,22 @@ def test_ide_context_ring_skills_editor_and_swarm_cards():
         assert marker in source, marker
     css = (WEB / "css/ide.css").read_text(encoding="utf-8")
     assert ".ide-budget-ring" in css and ".ide-swarm-agent" in css
+
+
+def test_ide_collapses_reasoning_and_follows_new_output():
+    page = render_index()
+    assert page.count('id="ide-scroll-latest"') == 1
+    source = (WEB / "js/views/ide.js").read_text(encoding="utf-8")
+    for marker in (
+        "thinkingBlock", "ide-thinking-tail", "THINKING_TAIL_CHARS",
+        "scheduleThinkingPreview", "reasoning_delta", 'entry.role === "thinking"',
+        "followOutput", "ide-scroll-latest", "expandedEntries", "last_event_seq",
+    ):
+        assert marker in source, marker
+    css = (WEB / "css/ide.css").read_text(encoding="utf-8")
+    for marker in (".ide-thinking-toggle", ".ide-thinking-tail", ".ide-thinking-body",
+                   ".ide-entry.tool > summary", ".ide-scroll-latest"):
+        assert marker in css, marker
 
 
 def test_ide_context_ring_sits_in_the_composer_footer_and_session_can_be_cleaned():

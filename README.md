@@ -7,7 +7,7 @@
 <p align="center"><em>Into The Depths of AI's Ocean</em></p>
 
 <p align="center">
-  <a href="VERSION.txt"><img src="https://img.shields.io/badge/version-2.3.0-0b7285" alt="Version 2.3.0"></a>
+  <a href="VERSION.txt"><img src="https://img.shields.io/badge/version-2.3.1-0b7285" alt="Version 2.3.1"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/devices-CUDA%20%7C%20XPU%20%7C%20MPS%20%7C%20CPU-555" alt="CUDA, XPU, MPS and CPU">
@@ -76,14 +76,23 @@ states the hardware and protocol that produced it.
 
 ```bash
 git clone https://github.com/CYFARE/Mariana-Studio.git && cd Mariana-Studio
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+python mariana.py setup                    # pyenv + .venv + PyTorch/NumPy, on any OS
 
 python mariana.py                          # smoke-test train on the built-in demo corpus
 python -m mariana train --data corpus.txt  # train on your own text
 python mariana.py studio                   # open the studio
 python mariana.py update                   # update from the latest GitHub release
 ```
+
+`setup` prefers [pyenv](https://github.com/pyenv/pyenv) (installing the
+requested CPython line when it is missing) and always installs inside a virtual
+environment, never into the system interpreter — so distributions that mark
+Python as externally managed keep working. The `mariana.py` wrapper selects
+`.venv` automatically, so activation is only needed for direct `pip`/`pytest`
+commands (or set `MARIANA_NO_VENV=1` to keep the current interpreter). Use
+`--device cpu|cuda|xpu` to pick a requirements profile and
+`--extras export,data,finetune` for optional tool groups; every flag is
+documented in [docs/setup.md](docs/setup.md).
 
 Device selection is automatic — **CUDA → Intel XPU → Apple MPS → CPU** — with
 per-device mixed precision; `--device cuda|xpu|mps|cpu` overrides. Smaller
@@ -107,6 +116,7 @@ verified by a numeric parity test. Runner commands and caveats are in
 
 | Topic | Read |
 | --- | --- |
+| Set up a new machine | [docs/setup.md](docs/setup.md) |
 | Train, fine-tune or distill | [README_training.md](README_training.md) · [docs/distillation.md](docs/distillation.md) |
 | Sprint-DRV, SAINT and NCM runbooks | [docs/fast-training.md](docs/fast-training.md) · [docs/latent-language.md](docs/latent-language.md) · [docs/ncm.md](docs/ncm.md) |
 | Agents and the coding IDE | [docs/agentic.md](docs/agentic.md) · [docs/ide.md](docs/ide.md) |

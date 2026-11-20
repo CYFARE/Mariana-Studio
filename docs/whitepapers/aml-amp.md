@@ -1,6 +1,6 @@
 # AML and AMP: a portable language and protocol for local agent automation
 
-**Whitepaper · Mariana v2.3.0 · 2026-11-20**
+**Whitepaper · Mariana v2.3.1 · 2026-11-20**
 
 | | |
 | --- | --- |
@@ -513,7 +513,7 @@ behind them.
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.0},
+  version     = {2.3.1},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/aml-amp.md}
 }
 ```

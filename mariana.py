@@ -12,6 +12,7 @@ Examples:
     python mariana.py think --prompt "KING: "   # print the private latent code
     python mariana.py bench
     python mariana.py export --format all  # GGUF + ONNX + safetensors -> exports/
+    python mariana.py setup                # pyenv + venv + core requirements (any OS)
     python mariana.py update               # update from the latest GitHub release
 
 Device selection is automatic: CUDA -> Intel XPU -> Apple MPS -> CPU.
@@ -27,11 +28,22 @@ os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
 
 from mariana.bootstrap import ensure_core  # noqa: E402 - environment is configured first
 
-# Updating must work even when the runtime is broken, so it runs before torch.
+# Setup and updating must work even when the runtime is missing, so they run
+# before torch (and before ensure_core tries to install anything).
 if __name__ == "__main__" and sys.argv[1:2] == ["update"]:
     from mariana.update import main as update_main
 
     raise SystemExit(update_main(sys.argv[2:]))
+
+if __name__ == "__main__" and sys.argv[1:2] == ["setup"]:
+    from mariana.setup import main as setup_main
+
+    raise SystemExit(setup_main(sys.argv[2:]))
+
+if __name__ == "__main__":
+    from mariana.setup import reexec_in_venv
+
+    reexec_in_venv()
 
 ensure_core()
 

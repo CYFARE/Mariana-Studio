@@ -11,6 +11,9 @@
   const PREVIEW_LINES = 4000;
   const MAX_SAFE_EDIT_BYTES = 1_500_000;
   const MAX_RENDERED_ENTRIES = 300;
+  const THINKING_BODY_CHARS = 20_000;
+  const THINKING_TAIL_CHARS = 2_400;
+  const SCROLL_SLACK = 48;
   const BUDGET_RING = 2 * Math.PI * 9;
   const MODE_LABELS = { ask: "Ask", edit: "Edit", auto: "Auto" };
   const PROMPTS = [
@@ -23,6 +26,7 @@
   ];
 
   let layout = null;
+  const expandedEntries = new WeakMap();
 
   const state = {
     info: null,
@@ -84,6 +88,8 @@
       swarmTimers: new Map(),
       live: null,
       liveText: "",
+      liveReasoning: "",
+      followOutput: true,
       lastPrompt: "",
       draft: "",
       statusText: "",
@@ -2252,7 +2258,7 @@
       };
       project.runId = session.active_run_id || "";
       project.running = Boolean(project.runId);
-      project.lastSeq = 0;
+      project.lastSeq = Number(session.last_event_seq) || 0;
       project.pendingTools.clear();
       project.live = null;
       project.liveText = "";
@@ -2269,7 +2275,7 @@
         updateBusy(project);
         if (project.runId) {
           setStatus(project, "Resuming the live run…");
-          if (state.viewActive) followRun(project, project.runId, 0);
+          if (state.viewActive) followRun(project, project.runId, project.lastSeq);
         }
       }
       if (!options.quiet) {
@@ -2410,7 +2416,9 @@
     for (const entry of session.transcript || []) {
       if (entry.role === "user") lines.push("## You", "", entry.text || "", "");
       else if (entry.role === "assistant") lines.push("## Mariana", "", entry.text || "", "");
-      else if (entry.role === "plan") {
+      else if (entry.role === "thinking") {
+        lines.push("<details><summary>Thinking</summary>", "", entry.text || "", "", "</details>", "");
+      } else if (entry.role === "plan") {
         lines.push("## Plan", "");
         for (const todo of entry.todos || []) lines.push(`- [${todo.status === "done" ? "x" : " "}] ${todo.text}`);
         lines.push("");
@@ -2422,10 +2430,102 @@
     Studio.download(`${name}.md`, lines.join("\n"), "text/markdown");
   }
 
-  function scrollTranscript(project) {
+  function updateJumpButton(project) {
     if (!isActive(project)) return;
     const root = $("ide-transcript");
-    if (root.scrollHeight - root.scrollTop - root.clientHeight < 160) root.scrollTop = root.scrollHeight;
+    const button = $("ide-scroll-latest");
+    const show = !project.followOutput && root.scrollHeight - root.clientHeight > 8;
+    button.classList.toggle("hidden", !show);
+  }
+
+  /* Follow new output only while the reader is at the bottom.  Checking the
+     distance after a large tool card is inserted is too late, so the scroll
+     listener records the intent before the transcript grows. */
+  function scrollTranscript(project, force = false) {
+    if (!isActive(project)) return;
+    if (force) project.followOutput = true;
+    if (!project.followOutput) {
+      updateJumpButton(project);
+      return;
+    }
+    const root = $("ide-transcript");
+    const stick = () => {
+      if (!isActive(project) || !project.followOutput) return;
+      root.scrollTop = root.scrollHeight;
+      updateJumpButton(project);
+    };
+    root.scrollTop = root.scrollHeight;
+    requestAnimationFrame(stick);
+  }
+
+  /* The collapsed thinking row keeps the newest lines visible, like Zed's
+     streaming thought block: four clamped lines by default, full text on
+     demand, and the tail always pinned to the bottom. */
+  function thinkingTailText(text) {
+    const source = String(text || "");
+    return source.length > THINKING_TAIL_CHARS ? `…${source.slice(-THINKING_TAIL_CHARS)}` : source;
+  }
+
+  function thinkingBlock(text, options = {}) {
+    let followBody = true;
+    const body = h("pre", { class: "ide-thinking-body", text: "" });
+    body.addEventListener("scroll", () => {
+      followBody = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    }, { passive: true });
+    const tail = h("div", { class: "ide-thinking-tail", text: "" });
+    const meta = h("span", { class: "muted tiny ide-thinking-meta", text: "" });
+    const chevron = icon("chevron-right", "small");
+    const summary = h("span", { class: "grow truncate", text: options.live ? "Thinking" : "Thought" });
+    const panel = h("div", { class: "ide-thinking-panel hidden" }, body);
+    const toggle = h("button", {
+      class: "ide-thinking-toggle", type: "button", "aria-expanded": "false",
+      title: "Show the full reasoning",
+      onclick: () => {
+        const open = toggle.getAttribute("aria-expanded") !== "true";
+        toggle.setAttribute("aria-expanded", String(open));
+        toggle.title = open ? "Hide the reasoning" : "Show the full reasoning";
+        const use = chevron.querySelector("use");
+        if (use) use.setAttribute("href", open ? "#i-chevron-down" : "#i-chevron-right");
+        panel.classList.toggle("hidden", !open);
+        tail.classList.toggle("hidden", open);
+        if (open) {
+          followBody = true;
+          body.scrollTop = body.scrollHeight;
+        }
+      },
+    }, chevron, summary, meta);
+    const element = h("div", { class: "ide-thinking hidden" }, toggle, panel, tail);
+
+    function update(next) {
+      const source = String(next || "");
+      element.classList.toggle("hidden", !source.trim());
+      body.textContent = source.slice(-THINKING_BODY_CHARS);
+      tail.textContent = thinkingTailText(source);
+      meta.textContent = source.length
+        ? `${source.length > 1000 ? `${Math.round(source.length / 100) / 10}k` : source.length} chars`
+        : "";
+      requestAnimationFrame(() => {
+        if (!panel.classList.contains("hidden")) {
+          if (followBody) body.scrollTop = body.scrollHeight;
+        } else {
+          tail.scrollTop = tail.scrollHeight;
+        }
+      });
+    }
+
+    element.update = update;
+    update(text);
+    return { element, update, toggle, summary, meta };
+  }
+
+  function scheduleThinkingPreview(project) {
+    if (!isActive(project) || !project.live || !project.live.thinking) return;
+    clearTimeout(project.live.thinkingTimer);
+    project.live.thinkingTimer = setTimeout(() => {
+      if (!project.live || !isActive(project)) return;
+      project.live.thinking.update(project.liveReasoning);
+      scrollTranscript(project);
+    }, 100);
   }
 
   function transcriptEmpty(project) {
@@ -2437,6 +2537,8 @@
         ? `It reads the project, makes snapshotted edits and checks diagnostics. ${hidden} hidden path(s) stay out of its context.`
         : "It reads the project, makes snapshotted edits and checks diagnostics.",
     }));
+    project.followOutput = true;
+    updateJumpButton(project);
   }
 
   function renderTranscript(project) {
@@ -2460,7 +2562,8 @@
         if (pending) pending.card = node;
       }
     }
-    root.scrollTop = root.scrollHeight;
+    project.followOutput = true;
+    scrollTranscript(project, true);
   }
 
   function appendEntry(project, entry) {
@@ -2820,15 +2923,30 @@
         h("summary", { text: "Synthesised result" }), summary));
     }
 
-    return h("article", { class: `ide-entry tool swarm${failed ? " failed" : ""}` },
-      h("div", { class: "ide-entry-head" },
+    return rememberDetails(entry, h("details", {
+      class: `ide-entry tool swarm${failed ? " failed" : ""}`,
+      open: expandedEntries.has(entry) ? expandedEntries.get(entry)
+        : Boolean(active || failed),
+    },
+      h("summary", { class: "ide-entry-head" },
         h("span", { class: "ide-entry-glyph" }, icon("agents", "small")),
         h("strong", { class: "grow", text: "Agent swarm" }),
         h("span", { class: "muted tiny", text: `${finished}/${agents.length} finished` }),
         active ? Studio.ui.badge("Running", "running")
           : Studio.ui.badge(failed ? "Finished with failures" : "Done",
-            failed ? "failed" : "completed")),
-      body);
+            failed ? "failed" : "completed"),
+        h("span", { class: "ide-chevron" }, icon("chevron-right", "small"))),
+      body));
+  }
+
+  function rememberDetails(entry, element) {
+    const summary = element.querySelector("summary");
+    if (summary) {
+      summary.addEventListener("click", () => {
+        setTimeout(() => expandedEntries.set(entry, element.open), 0);
+      });
+    }
+    return element;
   }
 
   function renderToolEntry(entry, pending) {
@@ -2844,18 +2962,23 @@
       ? h("div", { class: "row wrap" },
         Studio.ui.button("Open file", { small: true, onclick: () => openFile(path, startLine) }))
       : null;
-    return h("article", { class: `ide-entry tool${ok === false ? " failed" : ""}` },
-      h("div", { class: "ide-entry-head" },
+    return rememberDetails(entry, h("details", {
+      class: `ide-entry tool${ok === false ? " failed" : ""}`,
+      open: expandedEntries.has(entry) ? expandedEntries.get(entry)
+        : Boolean(pending || ok === false),
+    },
+      h("summary", { class: "ide-entry-head" },
         h("span", { class: "ide-entry-glyph" }, icon(ok === false ? "alert" : "bolt", "small")),
         h("strong", { class: "grow", text: toolLabel(entry.tool) }),
         summary ? h("span", { class: "muted tiny truncate ide-tool-summary", text: summary }) : null,
-        badge),
+        badge,
+        h("span", { class: "ide-chevron" }, icon("chevron-right", "small"))),
       h("div", { class: "ide-entry-body" },
         h("div", { class: "ide-tool-path mono tiny muted", text: entry.tool }),
         Object.keys(input).length ? rawDetails("Input", pretty(input)) : null,
         pending ? null : renderToolResult(entry),
         diffBlock(entry.change),
-        actions));
+        actions)));
   }
 
   function renderEntry(project, entry) {
@@ -2895,6 +3018,10 @@
         bubble);
     }
     if (entry.role === "tool") return renderToolEntry(entry, Boolean(entry.pending));
+    if (entry.role === "thinking") {
+      const block = thinkingBlock(entry.text || "");
+      return h("article", { class: "ide-entry thinking" }, block.element);
+    }
     if (entry.role === "plan") {
       const list = h("ol", { class: "ide-plan-list" });
       for (const todo of entry.todos || []) {
@@ -2981,14 +3108,19 @@
     if (!isActive(project)) return;
     removeLive(project);
     project.liveText = "";
-    const preview = h("div", { class: "muted small", text: "Thinking…" });
-    const node = h("article", { class: "ide-entry live", "aria-hidden": "true" },
+    project.liveReasoning = "";
+    const status = h("span", { class: "muted tiny", text: "thinking" });
+    const thinking = thinkingBlock("", { live: true });
+    const preview = h("div", { class: "muted small" });
+    const output = h("div", { class: "ide-live-preview hidden" }, preview);
+    const node = h("article", { class: "ide-entry live" },
       h("div", { class: "ide-entry-head" },
         h("span", { class: "spinner" }),
-        h("strong", { text: "Mariana" }),
-        h("span", { class: "muted tiny", text: "working" })),
-      h("div", { class: "ide-live-preview" }, preview));
-    project.live = { node, preview, timer: null };
+        h("strong", { class: "grow", text: "Mariana" }),
+        status),
+      thinking.element,
+      output);
+    project.live = { node, preview, output, thinking, status, timer: null, thinkingTimer: null };
     const root = $("ide-transcript");
     const empty = root.querySelector(".empty");
     if (empty) root.replaceChildren();
@@ -2998,12 +3130,14 @@
 
   function removeLive(project) {
     if (project && project.live && project.live.timer) clearTimeout(project.live.timer);
+    if (project && project.live && project.live.thinkingTimer) clearTimeout(project.live.thinkingTimer);
     if (project && project.live && project.live.node && typeof project.live.node.remove === "function") {
       project.live.node.remove();
     }
     if (project) {
       project.live = null;
       project.liveText = "";
+      project.liveReasoning = "";
     }
   }
 
@@ -3016,14 +3150,18 @@
 
   function scheduleLivePreview(project) {
     if (!isActive(project) || !project.live) return;
+    project.live.output.classList.remove("hidden");
+    project.live.thinking.summary.textContent = "Thought";
     const trimmed = project.liveText.trimStart();
     if (trimmed.startsWith("{") || trimmed.startsWith("```json")) {
       clearTimeout(project.live.timer);
+      project.live.status.textContent = "preparing a tool call";
       project.live.preview.classList.remove("markdown");
       project.live.preview.textContent = "Preparing a tool call…";
       scrollLive(project);
       return;
     }
+    project.live.status.textContent = "writing";
     clearTimeout(project.live.timer);
     project.live.timer = setTimeout(() => {
       if (!project.live || !isActive(project)) return;
@@ -3099,24 +3237,31 @@
         showLive(project);
         break;
       case "assistant_delta":
-        project.liveText += event.text || "";
         if (isActive(project)) {
           if (!project.live) showLive(project);
-          scheduleLivePreview(project);
+          project.liveText = `${project.liveText}${event.text || ""}`.slice(-40000);
+          if (project.live) {
+            project.live.output.classList.remove("hidden");
+            scheduleLivePreview(project);
+          }
+        } else {
+          project.liveText = `${project.liveText}${event.text || ""}`.slice(-40000);
         }
         break;
       case "reasoning_delta":
         if (isActive(project)) {
           if (!project.live) showLive(project);
+          project.liveReasoning = `${project.liveReasoning}${event.text || ""}`.slice(-40000);
           if (project.live) {
-            clearTimeout(project.live.timer);
-            project.live.preview.classList.remove("markdown");
-            project.live.preview.textContent = "Reasoning…";
-            scrollLive(project);
+            project.live.status.textContent = "thinking";
+            project.live.thinking.summary.textContent = "Thinking";
+            scheduleThinkingPreview(project);
           }
+        } else {
+          project.liveReasoning = `${project.liveReasoning}${event.text || ""}`.slice(-40000);
         }
         break;
-      case "assistant_end":
+      case "assistant_end": {
         if (event.usage) {
           const usage = project.usage || { prompt_tokens: 0, completion_tokens: 0 };
           usage.prompt_tokens = (Number(usage.prompt_tokens) || 0) + (Number(event.usage.prompt_tokens) || 0);
@@ -3124,8 +3269,14 @@
           project.usage = usage;
           updateUsageBadge(project);
         }
+        const reasoning = String(event.reasoning || project.liveReasoning || "").trim();
+        if (reasoning && !event.empty && !event.retrying) {
+          appendEntry(project, { role: "thinking", text: reasoning.slice(-12000) });
+        }
         removeLive(project);
+        scrollTranscript(project);
         break;
+      }
       case "tool_call": {
         const entry = { role: "tool", tool: event.tool, input: event.input, call: event.call,
           pending: true, at: new Date().toISOString() };
@@ -4286,10 +4437,12 @@
       context_files: project.open.map(tab => tab.path)
         .filter(path => path !== project.activePath).slice(0, 4),
       context: sessionContext(project),
-      max_steps: 24,
+      max_steps: 40,
+      max_seconds: 3600,
     };
     if (project.session && project.session.id) body.session_id = project.session.id;
     project.lastPrompt = content;
+    project.followOutput = true;
     $("ide-send").disabled = true;
     try {
       const result = await api(`/api/ide/workspaces/${encodeURIComponent(project.id)}/runs`, { body });
@@ -4306,7 +4459,6 @@
         input.value = "";
         project.draft = "";
         input.style.height = "";
-        project.plan = [];
         renderPlan(project);
         renderSessions(project);
         renderContext(project);
@@ -4491,6 +4643,7 @@
       }));
       Studio.ui.render($("ide-sessions"));
       Studio.ui.render($("ide-transcript"));
+      $("ide-scroll-latest").classList.add("hidden");
       Studio.ui.render($("ide-plan"));
       Studio.ui.render($("ide-context-chips"));
       $("ide-context").textContent = "Open a project to define agent context.";
@@ -4726,6 +4879,17 @@
           event.preventDefault();
           event.returnValue = "";
         }
+      });
+      $("ide-transcript").addEventListener("scroll", () => {
+        const project = activeProject();
+        if (!project) return;
+        const root = $("ide-transcript");
+        project.followOutput = root.scrollHeight - root.scrollTop - root.clientHeight < SCROLL_SLACK;
+        updateJumpButton(project);
+      }, { passive: true });
+      $("ide-scroll-latest").addEventListener("click", () => {
+        const project = activeProject();
+        if (project) scrollTranscript(project, true);
       });
       setupLayout();
       if (Studio.voice) {

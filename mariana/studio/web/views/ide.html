@@ -89,7 +89,11 @@
           <button id="ide-session-menu" class="icon-button small" type="button" aria-label="Conversation actions" title="Conversation actions"></button>
         </header>
         <div id="ide-plan" class="ide-plan hidden"></div>
-        <div id="ide-transcript" class="ide-transcript" aria-live="polite"></div>
+        <div class="ide-transcript-wrap">
+          <div id="ide-transcript" class="ide-transcript" aria-live="polite"></div>
+          <button id="ide-scroll-latest" class="button small ide-scroll-latest hidden" type="button"
+            title="Scroll to the latest output">Jump to latest</button>
+        </div>
         <div class="ide-compose">
           <div id="ide-context-chips" class="ide-context-chips"></div>
           <div class="row between wrap">
