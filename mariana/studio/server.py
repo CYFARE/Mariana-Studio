@@ -239,6 +239,7 @@ def make_server(host: str = "127.0.0.1", port: int = 8765, root=None) -> StudioS
 def run(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
     """Serve Studio until interrupted, releasing models and runtimes on every exit path."""
     server = make_server(host, port)
+    server.app.updates.start()  # automatic release check after boot; never blocks
     url = f"http://{host if host not in WILDCARD_HOSTS else '127.0.0.1'}:{server.server_address[1]}"
     print(f"{NAME}: {url}")
     if host in WILDCARD_HOSTS:

@@ -52,6 +52,7 @@
     Studio.palette.start();
     Studio.jobs.start();
     Studio.dependencies.start();
+    Studio.updates.start();
     // Paint the routed workspace immediately; hardware discovery must never
     // hold the whole UI behind a slow probe.
     Studio.views.start();

@@ -82,6 +82,7 @@ pip install -r requirements.txt
 python mariana.py                          # smoke-test train on the built-in demo corpus
 python -m mariana train --data corpus.txt  # train on your own text
 python mariana.py studio                   # open the studio
+python mariana.py update                   # update from the latest GitHub release
 ```
 
 Device selection is automatic — **CUDA → Intel XPU → Apple MPS → CPU** — with
@@ -110,6 +111,7 @@ verified by a numeric parity test. Runner commands and caveats are in
 | Sprint-DRV, SAINT and NCM runbooks | [docs/fast-training.md](docs/fast-training.md) · [docs/latent-language.md](docs/latent-language.md) · [docs/ncm.md](docs/ncm.md) |
 | Agents and the coding IDE | [docs/agentic.md](docs/agentic.md) · [docs/ide.md](docs/ide.md) |
 | Export and serve | [docs/export.md](docs/export.md) |
+| Update the checkout | [docs/update.md](docs/update.md) |
 | MoE + MTP + SAINT on a small GPU | [docs/low-vram.md](docs/low-vram.md) |
 | Architecture and engineering standard | [architecture.txt](architecture.txt) · [AGENTS.md](AGENTS.md) |
 

@@ -201,6 +201,17 @@
   .install-panel { left: var(--space-4); right: var(--space-4); width: auto; }
 }
 
+/* -- update panel ---------------------------------------------------------- */
+.update-panel { top: calc(var(--topbar-height) + var(--space-4)); bottom: auto; }
+.update-versions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.update-version { display: inline-flex; align-items: center; padding: 3px 9px; font-size: var(--text-xs);
+  color: var(--muted); background: var(--panel-soft); border: 1px solid var(--border); border-radius: var(--radius-pill); }
+.update-version.next { color: var(--success); background: var(--success-soft); border-color: var(--success-border); }
+.update-arrow { color: var(--muted); font-size: var(--text-xs); }
+.update-notes { max-height: 90px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.update-panel .install-mark { background: linear-gradient(135deg, var(--accent-strong), var(--accent)); }
+.update-panel.completed .install-mark { background: var(--success); }
+
 @media (hover: none) {
   .message-actions, .code-block .code-copy, .message .code-block .code-preview { opacity: 1; }
 }

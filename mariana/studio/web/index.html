@@ -164,6 +164,27 @@
     <div id="dependencies-actions" class="row wrap"></div>
   </section>
 
+  <section id="update-panel" class="install-panel update-panel hidden" aria-label="Mariana update">
+    <div class="install-head">
+      <div class="install-mark" aria-hidden="true"><svg class="icon"><use href="#i-download"/></svg></div>
+      <div class="grow">
+        <h2 id="update-title">Update Mariana Studio</h2>
+        <p id="update-subtitle" class="muted small"></p>
+      </div>
+      <button id="update-close" class="icon-button" type="button" aria-label="Hide update panel"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>
+    <div id="update-versions" class="update-versions" aria-label="Versions"></div>
+    <p id="update-notes" class="update-notes muted small hidden"></p>
+    <div id="update-progress" class="install-progress" role="progressbar" aria-label="Update progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="update-bar" class="install-progress-fill"></div>
+    </div>
+    <div class="row between">
+      <span id="update-stage" class="muted small" aria-live="polite"></span>
+      <span id="update-percent" class="muted small numeric"></span>
+    </div>
+    <div id="update-actions" class="row wrap"></div>
+  </section>
+
   <dialog id="palette" class="palette" aria-label="Command palette">
     <div class="palette-input">
       <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
@@ -251,6 +272,7 @@
   <script src="/js/jobs.js"></script>
   <script src="/js/voice.js"></script>
   <script src="/js/dependencies.js"></script>
+  <script src="/js/updates.js"></script>
   <script src="/js/palette.js"></script>
   <script src="/js/views/home.js"></script>
   <script src="/js/views/models.js"></script>

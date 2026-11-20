@@ -256,6 +256,7 @@
     const url = h("input", { value: settings.ollama_url, placeholder: "http://127.0.0.1:11434" });
     const idle = h("input", { type: "number", min: 0, max: 1440, step: 1, value: settings.idle_unload_minutes });
     const autoInstall = h("input", { type: "checkbox", checked: settings.auto_install_dependencies });
+    const checkUpdates = h("input", { type: "checkbox", checked: settings.check_for_updates !== false });
     const osAccess = h("input", { type: "checkbox", checked: settings.allow_os_access === true });
     form.append(h("h2", { text: "Discovery and runtime settings" }),
       Studio.ui.field("Extra model folders (one per line)", dirs), h("label", { class: "check" }, discover, "Discover Ollama, llama.cpp, LM Studio, GPT4All, Jan and Hugging Face cache models"),
@@ -264,6 +265,9 @@
       h("div", { class: "row between wrap" },
         h("label", { class: "check" }, autoInstall, "Install missing Python packages when Studio opens"),
         Studio.ui.button("Manage dependencies", { small: true, onclick: () => Studio.dependencies.open() })),
+      h("div", { class: "row between wrap" },
+        h("label", { class: "check" }, checkUpdates, "Check GitHub for a new release when Studio opens"),
+        Studio.ui.button("Check for updates", { small: true, onclick: () => Studio.updates.open() })),
       h("div", { class: "stack tight" },
         h("label", { class: "check" }, osAccess, "Grant agents OS access (shell commands and private-network HTTP)"),
         h("p", { class: "muted tiny", text: "Off by default. When enabled, shell.exec can run any command this user can run, and HTTP tools may reach local addresses. Enable it only on a trusted machine and for tasks that need it." })),
@@ -271,7 +275,7 @@
         const body = { model_dirs: dirs.value.split("\n").map(value => value.trim()).filter(Boolean), discover_local: discover.checked,
           gguf_runtime: runtime.value, llama_server_path: binary.value.trim(), llama_gpu_layers: layers.value.trim() || "auto",
           ollama_url: url.value.trim(), idle_unload_minutes: Number(idle.value), auto_install_dependencies: autoInstall.checked,
-          allow_os_access: osAccess.checked };
+          check_for_updates: checkUpdates.checked, allow_os_access: osAccess.checked };
         const result = await Studio.run(() => api("/api/settings", { method: "PUT", body }), event.currentTarget);
         if (result) {
           state.settings = result.settings;

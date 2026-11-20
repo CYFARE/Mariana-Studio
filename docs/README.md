@@ -24,6 +24,7 @@ See [`whitepapers/`](whitepapers/) for the index and citation details.
 | [ncm.md](ncm.md) | NCM training/inference recipes, controls, and evaluation requirements. |
 | [distillation.md](distillation.md) | Sequence-level distillation from a local or cloud teacher. |
 | [export.md](export.md) | GGUF, ONNX and safetensors export, plus llama.cpp, Ollama and ONNX Runtime runners. |
+| [update.md](update.md) | CLI and Studio update checks against GitHub releases, the git fast-forward, and restart rules. |
 | [low-vram.md](low-vram.md) | External-disk Common Corpus run with MoE + MTP + SAINT on an 8 GB GPU. |
 | [agentic.md](agentic.md) | Studio Agents workspace, AML/AMP quick loop, and security. |
 | [ide.md](ide.md) | The coding workspace and its `/api/ide` protocol. |

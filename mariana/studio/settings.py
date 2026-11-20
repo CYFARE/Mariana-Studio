@@ -17,6 +17,7 @@ DEFAULTS = {
     "ollama_url": "",            # empty = OLLAMA_HOST or http://127.0.0.1:11434
     "idle_unload_minutes": 10,   # stop the managed llama.cpp server when idle (0 = never)
     "auto_install_dependencies": True,  # install missing optional requirement groups on startup
+    "check_for_updates": True,   # compare VERSION.txt with the latest GitHub release on startup
     "allow_os_access": False,    # let shell.exec run and HTTP reach private addresses
 }
 GGUF_RUNTIMES = ("auto", "llama-server", "llama-cpp-python")
@@ -75,6 +76,8 @@ def _clean(patch: dict) -> dict:
                 raise BadRequestError("idle_unload_minutes must be between 0 and 1440")
             clean[key] = minutes
         elif key == "auto_install_dependencies":
+            clean[key] = bool(value)
+        elif key == "check_for_updates":
             clean[key] = bool(value)
         elif key == "allow_os_access":
             clean[key] = bool(value)

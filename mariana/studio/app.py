@@ -19,6 +19,7 @@ from .models.downloads import DownloadManager
 from .monitor import SystemMonitor
 from .settings import SettingsStore
 from .training import TrainingJobs, TrainingManager
+from .updates import UpdateService
 from .voice import VoiceService
 
 NAME = "Mariana Studio"
@@ -53,6 +54,7 @@ class Studio:
         self.chat_swarm = ChatSwarm(self.root, self.gateway, settings=self.settings.get)
         self.deploy = DeployService(self.root, self.jobs, self.gateway)
         self.dependencies = DependencyManager(self.root, self.jobs, self.settings.get)
+        self.updates = UpdateService(self.root, self.jobs, self.settings.get)
 
     def close(self) -> None:
         """Stop every thread and child process the services started, releasing GPU memory."""
@@ -62,7 +64,7 @@ class Studio:
             self._closed = True
         self.monitor.close()
         for service in (self.ide, self.voice, self.agents, self.chat_swarm, self.training,
-                        self.jobs, self.gateway):
+                        self.updates, self.jobs, self.gateway):
             try:
                 service.close()
             except Exception:  # noqa: BLE001 - shutdown must reach every service

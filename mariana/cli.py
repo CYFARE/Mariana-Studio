@@ -10,6 +10,7 @@ Subcommands
     python -m mariana think  --prompt "KING: "       # show the private code
     python -m mariana bench  [--gen-len 50]          # hybrid vs AR speed test
     python -m mariana export --format gguf|onnx|safetensors|all [--out DIR]
+    python -m mariana update [--check]             # compare with GitHub releases, then update
 
 Backward compatibility: ``python mariana.py --steps 3000`` (no subcommand)
 still works and is treated as ``train``.
@@ -219,6 +220,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ncm", add_help=False, help="advanced Next-Concept Modeling commands")
     p.add_argument("ncm_args", nargs=argparse.REMAINDER)
 
+    p = sub.add_parser("update", add_help=False,
+                       help="check GitHub releases and update this git checkout")
+    p.add_argument("update_args", nargs=argparse.REMAINDER)
+
     return parser
 
 
@@ -228,7 +233,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         argv = ["gui"] + (argv[1:] if argv[0] in {"--gui", "--studio"} else argv[2:])
     if argv and argv[0] == "ncm":
         return argparse.Namespace(cmd="ncm", ncm_args=argv[1:])
-    cmds = {"train", "gen", "think", "bench", "export", "ncm", "gui", "studio"}
+    if argv and argv[0] == "update":
+        return argparse.Namespace(cmd="update", update_args=argv[1:])
+    cmds = {"train", "gen", "think", "bench", "export", "ncm", "update", "gui", "studio"}
     if argv and argv[0] not in cmds and not argv[0].startswith("-h") and argv[0] != "--help":
         argv = ["train"] + argv  # legacy flag style -> train
     elif not argv:
@@ -607,6 +614,14 @@ def cmd_export(args) -> None:
                                llama_compat=not args.raw)
 
 
+def cmd_update(args) -> None:
+    from .update import main as update_main
+
+    code = update_main(list(getattr(args, "update_args", [])))
+    if code:
+        raise SystemExit(code)
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     {
@@ -616,6 +631,7 @@ def main(argv=None) -> None:
         "bench": cmd_bench,
         "export": cmd_export,
         "ncm": cmd_ncm,
+        "update": cmd_update,
         "gui": cmd_studio,
         "studio": cmd_studio,
     }[args.cmd](args)

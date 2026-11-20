@@ -8,10 +8,10 @@ dict (200 JSON), a ``Response`` or an ``EventStream``.
 from __future__ import annotations
 
 from ..http import Router
-from . import agents, chat, corpus, dependencies, deploy, finetune, ide, jobs, models, openai_api, system, training
+from . import agents, chat, corpus, dependencies, deploy, finetune, ide, jobs, models, openai_api, system, training, updates
 
 router = Router()
-for module in (system, corpus, training, jobs, models, chat, finetune, agents, ide, deploy, dependencies, openai_api):
+for module in (system, corpus, training, jobs, models, chat, finetune, agents, ide, deploy, dependencies, updates, openai_api):
     router.include(module.router)
 
 __all__ = ["router"]

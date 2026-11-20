@@ -7,7 +7,7 @@ Read it before writing code. `tests/test_standards.py` enforces the checkable pa
 
 | Path | Owns | Must not |
 | --- | --- | --- |
-| `mariana/*.py` | Core DRV-LM: config, model, train, generate, latent, saint, cli | import `studio` or `agents` |
+| `mariana/*.py` | Core DRV-LM: config, model, train, generate, latent, saint, cli, and the torch-free release updater | import `studio` or `agents` |
 | `mariana/ncm/` | Next-Concept Modeling | import `studio` |
 | `mariana/export/` | GGUF / ONNX / safetensors converters | import `studio` |
 | `mariana/agents/` | AML language, flow runtime, swarm coordinator and IPC, abilities, store, scheduler | speak HTTP |
@@ -58,7 +58,7 @@ the UI, or `agent-workspace/` on disk).
 1. `server.py`, `http.py` — transport: sockets, static files, security headers, routing.
 2. `api/<resource>.py` — handlers: read the request, call one service, return a dict.
 3. Services — `training.py`, `jobs.py`, `corpus.py`, `models/`, `finetune/`, `chats.py`,
-   `ide.py`, `deploy.py`, `dependencies.py`, and `mariana.agents`. Plain Python, no HTTP types, unit-testable.
+   `ide.py`, `deploy.py`, `dependencies.py`, `updates.py`, and `mariana.agents`. Plain Python, no HTTP types, unit-testable.
 
 **Add an endpoint**
 
