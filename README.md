@@ -1,12 +1,28 @@
-<!-- Banner: replace this comment with the banner image once it is ready.
 <p align="center">
-  <img src="github-assets/banner.png" alt="Mariana — Into The Depths of AI's Ocean">
+  <img src="github-assets/banner.png" alt="Mariana — Into The Depths of AI's Ocean" width="100%">
 </p>
--->
 
-# Mariana
+<h1 align="center">Mariana Studio</h1>
 
-*Into The Depths of AI's Ocean*
+<p align="center"><em>Into The Depths of AI's Ocean</em></p>
+
+<p align="center">
+  <a href="VERSION.txt"><img src="https://img.shields.io/badge/version-2.3.0-0b7285" alt="Version 2.3.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License: AGPL-3.0"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/devices-CUDA%20%7C%20XPU%20%7C%20MPS%20%7C%20CPU-555" alt="CUDA, XPU, MPS and CPU">
+  <a href="https://github.com/CYFARE/Mariana-Studio/stargazers"><img src="https://img.shields.io/github/stars/CYFARE/Mariana-Studio?style=flat" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#backed-by-whitepapers">Whitepapers</a> ·
+  <a href="#one-studio-the-whole-workflow">Workspaces</a> ·
+  <a href="docs/README.md">Docs</a> ·
+  <a href="https://github.com/CYFARE/Mariana-Studio/issues">Issues</a>
+</p>
+
+---
 
 Mariana is a **one-stop research and development studio for language models**.
 Train a compact byte-level hybrid diffusion–autoregressive model from scratch,
@@ -59,6 +75,7 @@ states the hardware and protocol that produced it.
 ## Quick start
 
 ```bash
+git clone https://github.com/CYFARE/Mariana-Studio.git && cd Mariana-Studio
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
