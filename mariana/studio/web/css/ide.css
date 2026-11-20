@@ -282,8 +282,12 @@ body.pane-resizing-y, body.pane-resizing-y * { cursor: row-resize !important; us
 .plan-step.done { color: var(--success); text-decoration: line-through; }
 .plan-marker { flex: none; width: 14px; text-align: center; }
 .ide-plan-list { display: flex; flex-direction: column; gap: 2px; margin-top: var(--space-2); }
+.ide-transcript-wrap { position: relative; display: flex; flex-direction: column; flex: 1;
+  min-height: 0; }
 .ide-transcript { display: flex; flex-direction: column; gap: var(--space-3); flex: 1;
   min-height: 0; overflow: auto; padding: var(--space-3); }
+.ide-scroll-latest { position: absolute; right: var(--space-3); bottom: var(--space-3);
+  z-index: 1; box-shadow: var(--shadow-sm); }
 .ide-entry { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
 .ide-entry.user { align-items: flex-end; }
 .ide-entry-head { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs);
@@ -308,6 +312,15 @@ body.pane-resizing-y, body.pane-resizing-y * { cursor: row-resize !important; us
 .ide-entry.tool { padding: var(--space-2); background: var(--panel-soft);
   border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .ide-entry.tool.failed { background: var(--danger-soft); border-color: var(--danger-border); }
+.ide-entry.tool > summary, .ide-entry.swarm > summary { list-style: none; cursor: pointer; }
+.ide-entry.tool > summary::-webkit-details-marker,
+.ide-entry.swarm > summary::-webkit-details-marker { display: none; }
+.ide-entry.tool > summary:focus-visible, .ide-entry.swarm > summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px; border-radius: var(--radius-sm); }
+.ide-chevron { display: inline-flex; flex: none; color: var(--muted); transition: transform .15s; }
+.ide-entry.tool[open] > summary .ide-chevron,
+.ide-entry.swarm[open] > summary .ide-chevron { transform: rotate(90deg); }
+.ide-entry.tool .ide-entry-body { padding-top: var(--space-1); }
 .ide-entry.swarm { padding: var(--space-2); background: var(--panel-soft);
   border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .ide-swarm-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: var(--space-1); }
@@ -372,7 +385,32 @@ body.pane-resizing-y, body.pane-resizing-y * { cursor: row-resize !important; us
 .diff-line.del { color: var(--danger); background: var(--danger-soft); }
 .diff-line.hunk { color: var(--accent); }
 .diff-line.meta { color: var(--subtle); }
-.ide-live-preview { max-height: 130px; padding: var(--space-2) var(--space-3); overflow: hidden;
+.ide-entry.thinking { padding-left: var(--space-2); border-left: 2px solid var(--border); }
+.ide-thinking { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ide-thinking.hidden { display: none; }
+.ide-thinking-toggle { display: flex; align-items: center; gap: var(--space-2); width: 100%;
+  padding: 2px 6px; font: inherit; font-size: var(--text-xs); color: var(--muted);
+  text-align: left; background: transparent; border: 0; border-radius: var(--radius-sm);
+  cursor: pointer; }
+.ide-thinking-toggle:hover { background: var(--element-hover); }
+.ide-thinking-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ide-thinking-toggle .icon { flex: none; }
+.ide-thinking-meta { flex: none; font-variant-numeric: tabular-nums; }
+.ide-thinking-tail { max-height: calc(4 * 1.55em); padding: 0 6px 2px 24px; overflow: hidden;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); font-size: var(--text-xs);
+  line-height: 1.55; }
+.ide-thinking-tail.hidden { display: none; }
+.ide-thinking-panel { padding: var(--space-2); background: var(--log-bg);
+  border-radius: var(--radius-sm); }
+.ide-thinking-panel.hidden { display: none; }
+.ide-thinking-body { max-height: 260px; margin: 0; overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; color: var(--log-text); font-size: var(--text-xs); line-height: 1.5; }
+.ide-entry.live { padding: var(--space-2); background: var(--panel-soft);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.ide-entry.live .spinner { width: 12px; height: 12px; }
+.ide-entry.live .ide-live-preview { max-height: 160px; padding: 0; overflow: auto;
+  border: 0; background: transparent; }
+.ide-live-preview { max-height: 130px; padding: var(--space-2) var(--space-3); overflow: auto;
   color: var(--muted); background: var(--panel-soft); border: 1px dashed var(--border);
   border-radius: var(--radius-sm); font-size: var(--text-sm); white-space: pre-wrap;
   overflow-wrap: anywhere; }

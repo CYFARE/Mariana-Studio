@@ -22,13 +22,28 @@ contributing, you agree that your contribution is licensed under the same terms.
 git clone https://github.com/CYFARE/Mariana.git
 cd Mariana
 
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+python mariana.py setup --device cpu   # pyenv + .venv + core requirements
+source .venv/bin/activate              # Windows: .venv\Scripts\activate
+pip install pytest pyflakes
+```
 
-# Pick one runtime:
+The `mariana.py` wrapper selects `.venv` automatically for Studio and training;
+activate it here because the verification commands below call
+`python -m pytest` directly.
+
+`--device cuda` (NVIDIA), `--device xpu` (Intel Arc) and the default
+`--device auto` are also available; `--extras all` installs the optional export,
+fine-tune and dataset toolchains. Setup never touches the system interpreter —
+see [`docs/setup.md`](docs/setup.md) for every flag and for troubleshooting.
+
+Manual equivalent:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements-cpu.txt   # CI and CPU-only development
+# or
 pip install -r requirements.txt       # GPU-first default
-
 pip install pytest pyflakes
 ```
 

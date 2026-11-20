@@ -49,7 +49,7 @@ technique, cite the paper by name and version:
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.0},
+  version     = {2.3.1},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/sprint-drv.md}
 }
 ```
@@ -61,7 +61,7 @@ For the project as a whole:
   title   = {Mariana: a hybrid diffusion-AR language model and local studio},
   author  = {{Mariana contributors}},
   year    = {2026},
-  version = {2.3.0},
+  version = {2.3.1},
   url     = {https://github.com/CYFARE/Mariana}
 }
 ```

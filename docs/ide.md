@@ -273,8 +273,13 @@ hint in the observation so the model changes approach. After a Python or JSON
 edit the service runs diagnostics on that file and appends an `ok`/`issues`
 block to the observation, so a broken change is visible without spending another
 tool round. The transcript renders tool results as summaries, clickable paths,
-issues and syntax-coloured content instead of one large JSON blob. A swarm call
-renders as a live card: the leader's plan, one row per agent with its role,
+issues and syntax-coloured content instead of one large JSON blob. A completed
+tool or swarm card collapses to its header; expanding it shows the input,
+result, diff and file action. Reasoning tokens stream into a collapsed
+`Thought` row that keeps its newest four lines visible while the model thinks
+and expands on demand. The transcript follows new output while the reader is at
+the bottom; scrolling up pauses that and shows a **Jump to latest** button. A
+swarm call renders as a live card: the leader's plan, one row per agent with its role,
 score, version and streamed work, the review loop, the messages agents sent each
 other, shared-memory keys and every file the swarm changed.
 
@@ -356,13 +361,18 @@ The swarm has its own IPC and memory:
 The system prompt contains the operating rules, the enabled tools, the current
 task, project instructions from `AGENTS.md` or `.mariana-ide.md` (first 4,000
 characters), a compact project map (file paths and sizes, about 6,000
-characters), available skills (ids, names and descriptions) and, when one is open
-in the editor, the first 6,000 characters of that file. Up to four other open files contribute 1,500 characters each. Pinned
-context adds up to 24 files with 4,000 characters each, capped at 12,000
-characters total. The whole prompt is capped at 23,000 characters so it survives
-the chat gateway's message limit. Tool observations are capped at 6,000
-characters per call, and stored conversation history is trimmed to the last 40
-messages of 8,000 characters each.
+characters), available skills (ids, names and descriptions), the current plan
+from earlier turns and every file this conversation already changed, and, when
+one is open in the editor, the first 6,000 characters of that file. Up to four
+other open files contribute 1,500 characters each. Pinned context adds up to 24
+files with 4,000 characters each, capped at 12,000 characters total. The whole
+prompt is capped at 23,000 characters so it survives the chat gateway's message
+limit. The selected model's output budget is reserved as well: a request that
+would leave no room for the reply is flagged in the token dialog and consolidated
+before sending when possible. Tool observations are capped at 6,000 characters
+per call and 20,000 characters per round; long fields are shortened in place so
+the path, line range and truncation flags survive. Stored conversation history is
+trimmed to the last 40 messages of 8,000 characters each.
 
 Context is explicit:
 
@@ -372,11 +382,13 @@ to the next prompt. A folder expands to the first 24 files inside it.
 the project map, `file.tree`, `file.list` and `file.search` results. Hidden
 paths are saved in the workspace manifest, so they apply to every conversation.
 - **Automatic consolidation** starts when the next request reaches 80% of the
-model window. The service replaces older turns with a compact recap (user
-tasks, plans, tool calls and final answers), keeps the newest eight messages
-verbatim, records how much it freed and emits a `context_consolidated` event.
-The run continues without a separate summarisation round, and the token dialog
-can consolidate a saved conversation on demand.
+model window **or when more than 32 messages would be sent**. The service
+replaces older turns with a compact recap (user tasks, plans, tool calls and
+final answers), keeps the newest eight messages verbatim, records how much it
+freed and emits a `context_consolidated` event. The system prompt also carries
+the current plan and this conversation's changed files, so paths and next steps
+survive consolidation. The run continues without a separate summarisation round,
+and the token dialog can consolidate a saved conversation on demand.
 - The context dialog shows the estimated token cost before a run. Its window is
   the selected model's latest known maximum: the larger of catalog metadata
   (GGUF, Transformers config, Mariana checkpoints) and a live probe of a saved
@@ -387,9 +399,21 @@ can consolidate a saved conversation on demand.
 - Session-level pins are stored with the conversation; clearing them explicitly
   also clears a workspace default for that conversation.
 
-A run has a step budget (24 by default, up to 64) and a time budget (900 s by
-default, up to 3600 s). When either runs out the run stops cleanly, keeps its
-transcript, and tells the user to ask for the next step.
+A run has a step budget (the IDE sends 40 by default, the request default is 24
+and the ceiling is 128) and a time budget (the IDE requests 3,600 s; the request
+default is 900 s, up to 3,600 s). When a run reaches its step budget and the last
+few rounds produced distinct successful work, the service extends it by 24 steps,
+up to three times. A stalled loop (the same call over and over) is not extended.
+When either budget really runs out the run stops cleanly, keeps its transcript,
+and tells the user to ask for the next step. A reasoning model that spends its
+whole output budget on hidden thinking returns no visible text; the service
+retries that turn once with double the output tokens and a lower reasoning
+effort, and if it still has nothing to show it fails with an actionable error
+instead of recording an empty answer. Malformed JSON actions and empty final
+summaries are sent back to the model for correction instead of silently ending
+the run. A successful run marks every remaining plan step done and publishes the
+updated plan; an exhausted, timed-out or failed run leaves the remaining steps
+open so the next turn shows what is still left.
 
 ---
 
@@ -442,8 +466,16 @@ A run streams server-sent events:
 | `log` | Status or a recoverable warning. |
 | `run_completed`, `run_failed`, `run_cancelled` | Terminal state; `output` is the final answer. |
 
-If the page reloads during a run, the session reports `active_run_id` and the
-view reconnects with `?since=<last seq>`.
+`assistant_end` carries the round's `reasoning`, `finish_reason` and the
+`empty`, `truncated` and `retrying` flags, so a client can distinguish a
+reasoning-only placeholder from a real answer.
+
+The session is checkpointed every five seconds and immediately after a write, a
+plan update or a consolidation, so a crash keeps the model messages and
+transcript up to the last checkpoint. If the page reloads during a run, the
+session reports `active_run_id` and `last_event_seq`; the view renders the
+checkpointed transcript and reconnects with `?since=<last_event_seq>`, so tool
+cards are neither lost nor duplicated.
 
 ---
 

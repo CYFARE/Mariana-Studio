@@ -27,7 +27,8 @@ def _disabled() -> bool:
 
 def _hint() -> None:
     print("Install the core runtime with one of:")
-    print("    pip install -r requirements.txt          # cross-platform (GPU default)")
+    print("    python mariana.py setup                  # pyenv + venv + requirements (recommended)")
+    print("    pip install -r requirements.txt          # into an existing virtual environment")
     print("    pip install -r requirements-cpu.txt      # CPU-only wheels")
 
 

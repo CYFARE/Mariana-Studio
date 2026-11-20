@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from mariana.studio import ide as ide_module
-from mariana.studio.errors import BadRequestError, ConflictError, NotFoundError
+from mariana.studio.errors import (BadRequestError, ConflictError, NotFoundError,
+                                   UnavailableError)
 from mariana.studio.ide import IdeRun, IdeService
 from mariana.agents.tools import ToolError, execute_ability
 from tests.helpers import wait_for
@@ -66,6 +67,73 @@ class RequestScopedGateway(ScriptedGateway):
             yield from super().stream(config, request)
         finally:
             request.set()
+
+
+class ReasoningGateway(ScriptedGateway):
+    """A reasoning model that first returns hidden thinking only."""
+
+    def __init__(self, silent: bool = False):
+        super().__init__([])
+        self.silent = silent
+        self.calls: list[dict] = []
+
+    def stream(self, config, cancelled=None):
+        self.calls.append(copy.deepcopy(config))
+        yield {"type": "start", "model_id": "fake-coder", "model": "fake"}
+        if self.silent or len(self.calls) == 1:
+            yield {"type": "reasoning", "text": "Read every file before changing anything."}
+            yield {"type": "done", "reply": "", "finish_reason": "length",
+                   "usage": {"prompt_tokens": 12,
+                             "completion_tokens": config["max_tokens"]}}
+            return
+        reply = '{"final": "Restructured the vault."}'
+        yield {"type": "reasoning", "text": "The structure is clear now."}
+        yield {"type": "delta", "text": reply}
+        yield {"type": "done", "reply": reply, "finish_reason": "stop",
+               "usage": {"prompt_tokens": 12, "completion_tokens": 8}}
+
+
+class CheckpointGateway(ScriptedGateway):
+    """Run one tool round, then hold the next model call for inspection."""
+
+    def __init__(self):
+        super().__init__([])
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, config, cancelled=None):
+        self.calls.append(copy.deepcopy(config))
+        yield {"type": "start", "model_id": "fake-coder", "model": "fake"}
+        if len(self.calls) == 1:
+            reply = '{"tool": "file.read", "input": {"path": "main.py"}}'
+            yield {"type": "delta", "text": reply}
+            yield {"type": "done", "reply": reply, "finish_reason": "stop",
+                   "usage": {"prompt_tokens": 5, "completion_tokens": 3}}
+            return
+        self.blocked.set()
+        self.release.wait(5)
+        reply = '{"final": "Finished after the checkpoint."}'
+        yield {"type": "delta", "text": reply}
+        yield {"type": "done", "reply": reply, "finish_reason": "stop",
+               "usage": {"prompt_tokens": 5, "completion_tokens": 3}}
+
+
+class FlakyGateway(ScriptedGateway):
+    """Fail the first request as if the endpoint dropped the connection."""
+
+    def __init__(self):
+        super().__init__([])
+        self.calls: list[dict] = []
+
+    def stream(self, config, cancelled=None):
+        self.calls.append(copy.deepcopy(config))
+        if len(self.calls) == 1:
+            raise UnavailableError("endpoint offline")
+        yield {"type": "start", "model_id": "fake-coder", "model": "fake"}
+        reply = '{"final": "Recovered from a network failure."}'
+        yield {"type": "delta", "text": reply}
+        yield {"type": "done", "reply": reply, "finish_reason": "stop",
+               "usage": {"prompt_tokens": 5, "completion_tokens": 3}}
 
 
 @pytest.fixture()
@@ -463,6 +531,356 @@ def test_coding_run_streams_tools_plan_edits_and_reverts(service):
     assert service.read_file(workspace["id"], "main.py")["content"] == original
 
 
+def test_a_reasoning_only_reply_is_retried_with_a_larger_budget(service):
+    workspace = make_workspace(service)
+    gateway = ReasoningGateway()
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {
+        "message": "Restructure the notes", "mode": "edit",
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Restructured the vault."
+    assert len(gateway.calls) == 2
+    assert gateway.calls[1]["max_tokens"] == gateway.calls[0]["max_tokens"] * 2
+    assert gateway.calls[1]["reasoning_effort"] == "low"
+    ends = [event for event in final["events"] if event["type"] == "assistant_end"]
+    assert ends[0]["empty"] is True and ends[0]["retrying"] is True
+    assert ends[-1]["empty"] is False and ends[-1]["retrying"] is False
+    assert ends[-1]["reasoning"] == "The structure is clear now."
+    messages = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("no visible text" in message for message in messages)
+
+    session = service.get_session(started["session"]["id"])
+    thinking = [entry for entry in session["transcript"] if entry["role"] == "thinking"]
+    assert len(thinking) == 1 and "structure is clear" in thinking[0]["text"]
+
+
+def test_a_silent_reasoning_model_fails_with_actionable_guidance(service):
+    workspace = make_workspace(service)
+    gateway = ReasoningGateway(silent=True)
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {
+        "message": "Restructure the notes", "mode": "edit",
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert len(gateway.calls) == 2
+    assert final["status"] == "failed"
+    assert "output budget" in final["error"]
+    transcript = service.get_session(started["session"]["id"])["transcript"]
+    assert any(entry["role"] == "error" for entry in transcript)
+    assert not any(entry["role"] == "assistant" for entry in transcript)
+
+
+def test_a_long_run_extends_its_step_budget_when_it_is_making_progress(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+        '{"tool": "file.read", "input": {"path": "test_main.py"}}',
+        '{"tool": "file.read", "input": {"path": "main.py", '
+        '"start_line": 1, "end_line": 2}}',
+        '{"final": "Read everything."}',
+    ])
+    started = service.start_run(workspace["id"], {
+        "message": "Read the project", "mode": "ask", "max_steps": 2,
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Read everything."
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("Extended the step budget" in message for message in logs)
+
+
+def test_a_stalled_long_run_stops_at_its_step_budget(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+        '{"final": "never reached"}',
+    ])
+    started = service.start_run(workspace["id"], {
+        "message": "Loop on one file", "mode": "ask", "max_steps": 2,
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed"
+    assert final["exhausted"] is True
+    assert "without a final answer" in final["output"]
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert not any("Extended the step budget" in message for message in logs)
+
+
+def test_a_malformed_action_is_repaired_instead_of_ending_the_run(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.read", "input": {"path": "main.py"',
+        '{"final": "Recovered after the repair."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read main", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered after the repair."
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("malformed" in message for message in logs)
+
+
+def test_an_empty_final_answer_is_asked_for_again(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"final": ""}',
+        '{"final": "The work is done."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Finish", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "The work is done."
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("empty summary" in message for message in logs)
+
+
+def test_repeated_malformed_actions_fail_with_guidance(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway(['{"tool":', '{"tool":', '{"tool":'])
+    started = service.start_run(workspace["id"], {"message": "Break the format", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "failed"
+    assert "malformed actions" in final["error"]
+
+
+def test_a_swarm_internal_error_is_returned_to_the_model(service, monkeypatch):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "agent.swarm", "input": {}}',
+        '{"final": "Continued after the swarm error."}',
+    ])
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("swarm exploded")
+
+    monkeypatch.setattr(service, "_run_swarm", explode)
+    started = service.start_run(workspace["id"], {"message": "Use a swarm", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Continued after the swarm error."
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert results and results[0]["ok"] is False
+    assert "swarm exploded" in json.dumps(results[0]["output"])
+
+
+def test_observation_truncation_keeps_file_control_fields(service):
+    observation = {
+        "path": "main.py", "content": "x" * 50_000,
+        "start_line": 1, "end_line": 200, "total_lines": 900,
+        "truncated": False, "language": "Python",
+    }
+    bounded = service._bounded_observation(observation, 6_000)
+
+    assert bounded["path"] == "main.py"
+    assert bounded["start_line"] == 1 and bounded["end_line"] == 200
+    assert bounded["total_lines"] == 900
+    assert bounded["truncated"] is True
+    assert "content" in bounded["truncated_fields"]
+    assert len(bounded["content"]) < 50_000
+    assert len(json.dumps(bounded)) <= 6_200
+
+
+def test_a_multi_call_round_has_a_total_observation_budget(service):
+    observations = [
+        {"tool": "file.read", "ok": True,
+         "result": {"path": f"file{index}.py", "content": "x" * 5_000,
+                    "start_line": 1}}
+        for index in range(8)
+    ]
+    message = service._observation_message(observations)
+
+    assert len(message) <= ide_module.MAX_OBSERVATION_TOTAL_CHARS + 1_000
+    assert "Some results were shortened" in message
+
+
+def test_the_message_window_forces_a_recap_before_messages_are_dropped(service):
+    workspace = make_workspace(service)
+    session = service._new_session(workspace["id"], "Seed", "ask", "fake-coder")
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(30):
+        messages.append({"role": "assistant", "content": json.dumps({
+            "tool": "file.read", "input": {"path": f"file{index}.py"},
+        })})
+        messages.append({"role": "user", "content": "Tool results: " + "x" * 400})
+    budget = {"unit": "tokens", "context_window": 1_000_000}
+
+    combined, info = service._consolidate_for_budget(
+        messages, budget, session, "auto",
+        max_messages=ide_module.MESSAGE_RECAP_TRIGGER,
+    )
+
+    assert info is not None and info["after_tokens"] < info["before_tokens"]
+    assert len(combined) <= ide_module.MESSAGE_RECAP_TRIGGER
+    assert combined[1]["content"].startswith("Earlier conversation, consolidated")
+    assert "file0.py" in combined[1]["content"]
+
+
+def test_follow_up_context_keeps_the_plan_and_changed_files(service):
+    workspace = make_workspace(service)
+    session = service._new_session(workspace["id"], "Continue", "edit", "fake-coder")
+    session["plan"] = [
+        {"text": "Read the notes", "status": "done"},
+        {"text": "Rewrite the index", "status": "active"},
+    ]
+    session["changes"] = {"Notes/Index.md": {"added": 12, "removed": 3}}
+    tools = service._tools_for_mode("edit", workspace["id"])
+
+    prompt = service._system_prompt(
+        workspace["id"], "edit", tools, service.workspace_path(workspace["id"]),
+        None, None, session,
+    )
+    assert "Current plan from earlier turns" in prompt
+    assert "Rewrite the index" in prompt
+    assert "Notes/Index.md (+12/−3)" in prompt
+
+    message = service._observation_message(
+        [{"tool": "file.read", "ok": True, "result": {"path": "main.py"}}], session,
+    )
+    assert message.startswith("Progress:")
+    assert "Notes/Index.md" in message
+
+
+def test_a_follow_up_run_keeps_the_previous_plan(service):
+    workspace = make_workspace(service)
+    session = service._new_session(workspace["id"], "Continue", "edit", "fake-coder")
+    session["plan"] = [{"text": "Keep me", "status": "active"}]
+    service._save_session(session)
+    gateway = ScriptedGateway(['{"final": "continued"}'])
+    service.gateway = gateway
+
+    started = service.start_run(workspace["id"], {
+        "message": "Continue the work", "mode": "edit", "session_id": session["id"],
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    prompt = gateway.calls[0]["messages"][0]["content"]
+    assert "Current plan from earlier turns" in prompt and "Keep me" in prompt
+    # The follow-up saw the preserved plan and its successful finish closed it.
+    assert service.get_session(session["id"])["plan"] == [
+        {"text": "Keep me", "status": "done"},
+    ]
+
+
+def test_a_successful_run_marks_every_plan_step_done(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"plan": [{"text": "Read the notes", "status": "done"}, '
+        '{"text": "Rewrite the index", "status": "active"}, '
+        '{"text": "Check the links", "status": "pending"}]}',
+        '{"final": "Restructured the vault."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Restructure", "mode": "edit"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    session = service.get_session(started["session"]["id"])
+    assert [item["status"] for item in session["plan"]] == ["done", "done", "done"]
+    plan_events = [event for event in final["events"] if event["type"] == "plan"]
+    assert plan_events[-1]["message"] == "Plan completed"
+    assert [item["status"] for item in plan_events[-1]["plan"]] == ["done", "done", "done"]
+    plan_entries = [entry for entry in session["transcript"] if entry.get("role") == "plan"]
+    assert plan_entries[-1]["todos"] == session["plan"]
+
+
+def test_an_exhausted_run_leaves_the_remaining_plan_steps_open(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"plan": [{"text": "Read one", "status": "active"}, '
+        '{"text": "Read two", "status": "pending"}]}',
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+    ])
+    started = service.start_run(workspace["id"], {
+        "message": "Read", "mode": "ask", "max_steps": 2,
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["exhausted"] is True
+    session = service.get_session(started["session"]["id"])
+    assert [item["status"] for item in session["plan"]] == ["active", "pending"]
+
+
+def test_a_failed_run_leaves_the_plan_open(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"plan": [{"text": "Read", "status": "active"}]}',
+        '{"tool":', '{"tool":', '{"tool":',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Break", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "failed"
+    session = service.get_session(started["session"]["id"])
+    assert [item["status"] for item in session["plan"]] == ["active"]
+
+
+def test_a_long_run_checkpoints_its_history_before_it_finishes(service, monkeypatch):
+    monkeypatch.setattr(ide_module, "CHECKPOINT_SECONDS", 0)
+    workspace = make_workspace(service)
+    gateway = CheckpointGateway()
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {"message": "Read main", "mode": "ask"})
+
+    assert gateway.blocked.wait(5)
+    saved = json.loads(service._session_path(started["session"]["id"])
+                       .read_text(encoding="utf-8"))
+    assert saved["status"] == "running"
+    assert saved["last_event_seq"] > 0
+    assert saved["messages"]
+    assert any(entry.get("role") == "tool" for entry in saved["transcript"])
+
+    gateway.release.set()
+    final = run_until_finished(service, started["run"]["id"])
+    assert final["status"] == "completed"
+
+
+def test_renaming_a_conversation_while_a_run_is_active_survives_the_final_save(service):
+    workspace = make_workspace(service)
+    gateway = BlockingGateway()
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {"message": "Wait", "mode": "ask"})
+
+    assert gateway.started.wait(5)
+    service.rename_session(started["session"]["id"], {
+        "title": "Renamed mid-run", "pinned": True,
+    })
+    gateway.release.set()
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed"
+    reloaded = service.get_session(started["session"]["id"])
+    assert reloaded["title"] == "Renamed mid-run"
+    assert reloaded["pinned"] is True
+
+
+def test_a_transient_model_failure_is_retried_without_spending_a_step(service):
+    workspace = make_workspace(service)
+    gateway = FlakyGateway()
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {
+        "message": "Recover", "mode": "ask", "max_steps": 1,
+    })
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered from a network failure."
+    assert len(gateway.calls) == 2
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("retrying" in message.lower() for message in logs)
+
+
 def test_ask_mode_rejects_writes_and_created_files_are_reverted(service):
     workspace = make_workspace(service)
     service.gateway = ScriptedGateway([
@@ -523,6 +941,7 @@ def test_context_preview_includes_a_prompt_budget(service):
     assert budget["model"]["source"] == "default"
     assert budget["unit"] == "tokens"
     assert budget["used_tokens"] > budget["draft"]["tokens"] > 0
+    assert budget["output_reserve"] == 4_096
     labels = {section["id"] for section in budget["sections"]}
     assert {"instructions", "map", "pinned", "task"} <= labels
     assert budget["pinned"]["selected"] == 1

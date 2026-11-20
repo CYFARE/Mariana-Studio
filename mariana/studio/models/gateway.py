@@ -176,6 +176,21 @@ class ModelGateway:
         limit = (entry.get("detail") or {}).get("max_output_tokens")
         return min(default, int(limit)) if limit else default
 
+    def output_limit(self, model_id: str | None = None) -> int:
+        """The provider's recommended output cap for one request."""
+        entry = None
+        if model_id:
+            try:
+                entry = self.get(model_id)
+            except ModelError:
+                entry = None
+        if entry is None:
+            catalog = self.catalog()
+            chat = [item for item in catalog
+                    if item.get("available") and (item.get("capabilities") or {}).get("chat")]
+            entry = chat[0] if chat else (catalog[0] if catalog else None)
+        return self._default_max_tokens(entry) if entry else FALLBACK_MAX_TOKENS
+
     def context_window(self, model_id: str | None = None, force: bool = False) -> dict:
         """The largest context window known for a model.
 

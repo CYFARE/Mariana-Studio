@@ -7,7 +7,7 @@ Read it before writing code. `tests/test_standards.py` enforces the checkable pa
 
 | Path | Owns | Must not |
 | --- | --- | --- |
-| `mariana/*.py` | Core DRV-LM: config, model, train, generate, latent, saint, cli, and the torch-free release updater | import `studio` or `agents` |
+| `mariana/*.py` | Core DRV-LM: config, model, train, generate, latent, saint, cli, setup, and the torch-free release updater | import `studio` or `agents` |
 | `mariana/ncm/` | Next-Concept Modeling | import `studio` |
 | `mariana/export/` | GGUF / ONNX / safetensors converters | import `studio` |
 | `mariana/agents/` | AML language, flow runtime, swarm coordinator and IPC, abilities, store, scheduler | speak HTTP |

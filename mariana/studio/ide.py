@@ -25,17 +25,18 @@ import struct
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 
 from ..agents.aml import ABILITY_TYPES, slugify
-from ..agents.runtime import normalize_plan, parse_model_action
+from ..agents.runtime import EMPTY_REPLIES, normalize_plan, parse_model_action
 from ..agents.swarm import SwarmCoordinator, SwarmLimits, snapshot_due
 from ..agents.tools import execute_ability, json_safe
 from ..workspace import ensure_workspace, read_json, write_json
 from .models.context import entry_context
-from .errors import BadRequestError, ConflictError, NotFoundError
+from .errors import (BadRequestError, ConflictError, NotFoundError, UnavailableError,
+                     UpstreamError)
 from .tokens import estimate_tokens, utf8_length
 from .validation import choice, flag, number, text
 
@@ -81,6 +82,8 @@ MAX_TREE_ENTRIES = 1500
 MAX_TREE_DEPTH = 8
 MAX_SEARCH_RESULTS = 500
 MAX_OBSERVATION_CHARS = 6_000
+MAX_OBSERVATION_TOTAL_CHARS = 20_000
+OBSERVATION_FIELD_CHARS = 4_000
 MAX_PROMPT_CHARS = 23_000
 MAX_DIFF_CHARS = 24_000
 MAX_MESSAGES = 40
@@ -94,6 +97,7 @@ MAX_CONTEXT_FILES = 24
 MAX_CONTEXT_CHARS = 12_000
 MAX_CONTEXT_FILE_CHARS = 4_000
 MODEL_MESSAGE_WINDOW = 40  # mirrors the chat gateway's context window
+MESSAGE_RECAP_TRIGGER = MODEL_MESSAGE_WINDOW - 8
 DEFAULT_CONTEXT_WINDOW = 8_192
 BUDGET_WARNING_PERCENT = 80
 CONSOLIDATE_PERCENT = 80
@@ -107,8 +111,16 @@ MAX_SWARM_SECONDS = 600
 MAX_SWARM_OUTPUT_CHARS = 8_000
 MESSAGE_TOKEN_OVERHEAD = 4
 DEFAULT_MAX_STEPS = 24
-MAX_STEPS = 64
+MAX_STEPS = 128
+STEP_EXTENSION = 24
+MAX_STEP_EXTENSIONS = 3
+MAX_FORMAT_REPAIRS = 2
+MAX_NETWORK_RETRIES = 2
+CHECKPOINT_SECONDS = 5.0
 DEFAULT_MAX_SECONDS = 900
+DEFAULT_OUTPUT_TOKENS = 4_096
+MAX_OUTPUT_TOKENS = 16_384
+MAX_REASONING_CHARS = 12_000
 MAX_SECONDS = 3600
 IMPORT_MAX_FILES = 3000
 IMPORT_MAX_BYTES = 64_000_000
@@ -198,6 +210,42 @@ def shell_enabled() -> bool:
     """Shell access is opt-in for the whole server, never a per-request flag."""
     return (os.environ.get("MARIANA_AGENT_ALLOW_SHELL") == "1"
             or os.environ.get("MARIANA_AGENT_ALLOW_OS") == "1")
+
+
+def _tool_call_label(call) -> str:
+    """A compact ``tool(path or command)`` label for a consolidated recap."""
+    if not isinstance(call, dict):
+        return "tool"
+    name = str(call.get("tool") or call.get("name") or "tool")[:60]
+    arguments = call.get("input", call.get("arguments"))
+    detail = ""
+    if isinstance(arguments, dict):
+        detail = (arguments.get("path") or arguments.get("command")
+                  or arguments.get("query") or arguments.get("name")
+                  or arguments.get("sql") or "")
+    detail = " ".join(str(detail).split())[:80]
+    return f"{name}({detail})" if detail else name
+
+
+def _looks_like_action(value) -> bool:
+    """Whether a reply that failed to parse was probably meant as an action.
+
+    Prose is a legitimate final answer for models that do not follow the JSON
+    contract.  Broken JSON, a JSON code fence or an action key near the start is
+    instead asked for again, so a typo never silently ends a long coding run.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.startswith("```"):
+        text = text[3:]
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    if text.startswith(("{", "[")):
+        return True
+    head = text[:240]
+    return any(marker in head for marker in ('"tool"', '"calls"', '"plan"', '"final"'))
 
 
 def _clean_relative(value) -> str:
@@ -508,10 +556,12 @@ class IdeRun:
         self.session_id = session_id
         self.workspace_id = workspace_id
         self.message = message
+        self.session: dict | None = None
         self.status = "running"
         self.output = None
         self.error = None
         self.plan: list[dict] = []
+        self.plan_set = False
         self.swarm: dict | None = None
         self.swarm_snapshot_at = 0.0
         self.usage: dict = {}
@@ -1974,6 +2024,15 @@ class IdeService:
             session["pinned"] = bool(payload.get("pinned"))
         if "context" in payload:
             session["context"] = self._context_payload(payload.get("context"))
+        with self._lock:
+            live = next((run for run in self._runs.values()
+                         if run.session_id == session_id and run.status not in FINISHED), None)
+        if live is not None and live.session is not None:
+            # A long run checkpoints the session itself; keep a rename or pin that
+            # happened while it was working instead of overwriting it at the end.
+            for key in ("title", "titled", "pinned", "context"):
+                if key in session:
+                    live.session[key] = session[key]
         self._save_session(session)
         return self._session_summary(session)
 
@@ -2225,6 +2284,7 @@ class IdeService:
                     pass
             raise
         run = IdeRun(f"ide-run-{uuid.uuid4().hex[:12]}", session["id"], workspace_id, message)
+        run.session = session
         try:
             session.setdefault("transcript", []).append(
                 {"role": "user", "text": message, "at": _iso()}
@@ -2233,7 +2293,7 @@ class IdeService:
             session["mode"] = mode
             session["model"] = model or session.get("model") or ""
             session["status"] = "running"
-            session["plan"] = []
+            session["last_event_seq"] = 0
             session["active_run_id"] = run.id
             session.setdefault("runs", []).append(run.id)
             self._save_session(session)
@@ -2360,7 +2420,7 @@ class IdeService:
             include = self._context_include(workspace_id, context)
             pieces, prompt, prompt_truncated = self._prompt_pieces(
                 workspace_id, options["mode"], tools, workspace, active, context,
-                options["message"], options.get("context_files") or [],
+                options["message"], options.get("context_files") or [], session,
             )
             history = self._history(session)[-(MODEL_MESSAGE_WINDOW - 1):]
             messages = [{"role": "system", "content": prompt}]
@@ -2369,7 +2429,9 @@ class IdeService:
             budget = self._budget_from_parts(
                 model, pieces, prompt, prompt_truncated, history, options["message"],
             )
-            messages, consolidated = self._consolidate_for_budget(messages, budget, session, "auto")
+            messages, consolidated = self._consolidate_for_budget(
+                messages, budget, session, "auto", max_messages=MESSAGE_RECAP_TRIGGER,
+            )
             if consolidated:
                 history = [item for item in messages[1:-1]
                            if item.get("role") in {"user", "assistant"}]
@@ -2386,17 +2448,82 @@ class IdeService:
                     "context_consolidated", trigger="auto", iteration=0,
                     **consolidated,
                     message=(f"Consolidated older turns to free about "
-                             f"{consolidated['before_tokens'] - consolidated['after_tokens']:,} "
+                             f"{max(0, consolidated['before_tokens'] - consolidated['after_tokens']):,} "
                              f"{consolidated['unit']} before the run."),
                 )
             started = time.time()
             limit = options["max_steps"]
             repeated: Counter = Counter()
+            recent_calls: deque[tuple[str, bool, str]] = deque(maxlen=8)
+            format_repairs = 0
+            network_retries = 0
+            extensions = 0
+            iteration = 0
+            last_checkpoint = 0.0
+            action_help = (
+                "Reply with only one JSON object: "
+                '{"tool": ...}, {"calls": [...]}, {"plan": [...]} or {"final": "..."}. '
+                "Do not wrap it in prose or a code fence."
+            )
+
+            def checkpoint(force: bool = False) -> None:
+                """Persist the live transcript and model history during a long run."""
+                nonlocal last_checkpoint
+                now = time.time()
+                if not force and now - last_checkpoint < CHECKPOINT_SECONDS:
+                    return
+                last_checkpoint = now
+                if messages is not None:
+                    session["messages"] = self._trim_history(
+                        [item for item in messages if item.get("role") != "system"]
+                    )
+                session["usage"] = dict(usage)
+                session["last_event_seq"] = run.snapshot(0, include_events=False)["event_count"]
+                session["status"] = "running"
+                session["active_run_id"] = run.id
+                try:
+                    self._save_session(session)
+                except Exception:  # noqa: BLE001 - a checkpoint must not end the run
+                    pass
+
+            def consolidate_history(step: int) -> bool:
+                nonlocal messages
+                if messages is None:
+                    return False
+                messages, info = self._consolidate_for_budget(
+                    messages, budget, session, "auto", max_messages=MESSAGE_RECAP_TRIGGER,
+                )
+                if not info:
+                    return False
+                run.event(
+                    "context_consolidated", trigger="auto", iteration=step, **info,
+                    message=(f"Consolidated older turns to free about "
+                             f"{max(0, info['before_tokens'] - info['after_tokens']):,} "
+                             f"{info['unit']} during the run."),
+                )
+                return True
+
+            def extend_if_needed() -> None:
+                nonlocal limit, extensions
+                if iteration < limit or extensions >= MAX_STEP_EXTENSIONS:
+                    return
+                if limit >= MAX_STEPS or not self._should_extend(recent_calls):
+                    return
+                added = min(MAX_STEPS, limit + STEP_EXTENSION) - limit
+                limit += added
+                extensions += 1
+                run.event(
+                    "log", level="info", iteration=iteration,
+                    message=(f"Extended the step budget by {added} to {limit}; "
+                             "the run is still making progress."),
+                )
+
             timer = threading.Timer(options["max_seconds"], self._expire_run,
                                     args=(run, options["max_seconds"]))
             timer.daemon = True
             timer.start()
-            for iteration in range(1, limit + 1):
+            while iteration < limit:
+                iteration += 1
                 if run.cancelled.is_set():
                     raise _Cancelled()
                 if time.time() - started > options["max_seconds"]:
@@ -2407,14 +2534,65 @@ class IdeService:
                         f"({options['max_seconds']} s) ran out."
                     )
                     break
-                reply, round_usage = self._stream_reply(run, model, messages, iteration, tools)
+                reply, round_usage, round_meta = None, None, None
+                try:
+                    reply, round_usage, round_meta = self._stream_reply(
+                        run, model, messages, iteration, tools,
+                    )
+                except (UnavailableError, UpstreamError, TimeoutError, OSError) as failure:
+                    status_code = int(getattr(failure, "detail", {}).get("status") or 0)
+                    retryable = not (400 <= status_code < 500
+                                     and status_code not in {408, 429})
+                    if (retryable and network_retries < MAX_NETWORK_RETRIES
+                            and not run.cancelled.is_set()):
+                        network_retries += 1
+                        delay = float(network_retries)
+                        run.event(
+                            "log", level="warning", iteration=iteration,
+                            message=(f"Model endpoint failed ({failure}); retrying in "
+                                     f"{delay:.0f}s"),
+                        )
+                        checkpoint(force=True)
+                        time.sleep(delay)
+                        iteration -= 1  # a transport retry does not consume a step
+                        continue
+                    raise
                 for key in usage:
                     usage[key] += int(round_usage.get(key) or 0)
+                network_retries = 0
+                reasoning = str(round_meta.get("reasoning") or "").strip()
+                if reasoning:
+                    # Keep the thinking next to the tool calls it produced, the way
+                    # Zed shows a collapsed thought row before each action.
+                    self._append_transcript(session, {"role": "thinking", "text": reasoning})
                 if not reply.strip():
                     raise ValueError(
                         "The model returned an empty reply. Choose another model in the IDE toolbar."
                     )
                 action, calls = parse_model_action(reply)
+                malformed = action is None and _looks_like_action(reply)
+                unknown = (action is not None and not calls
+                           and "final" not in action and "plan" not in action)
+                if malformed or unknown:
+                    if format_repairs < MAX_FORMAT_REPAIRS:
+                        format_repairs += 1
+                        messages.append({"role": "assistant", "content": reply})
+                        messages.append({"role": "user", "content":
+                                         f"That reply was not a valid action. {action_help}"})
+                        run.event(
+                            "log", level="warning", iteration=iteration,
+                            message=("The model's action was malformed; asking for a "
+                                     "corrected JSON reply"),
+                        )
+                        consolidate_history(iteration)
+                        checkpoint(force=True)
+                        extend_if_needed()
+                        continue
+                    raise ValueError(
+                        "The model kept replying with malformed actions. Choose a model "
+                        "with reliable JSON tool calling or start a new conversation."
+                    )
+                format_repairs = 0
                 if action is None:
                     final_text = reply.strip()[:20_000]
                     self._append_transcript(session, {"role": "assistant", "text": final_text})
@@ -2424,12 +2602,32 @@ class IdeService:
                     plan = normalize_plan(action.get("plan"))
                     session["plan"] = plan
                     run.plan = plan
+                    run.plan_set = True
                     run.event("plan", plan=plan, message=f"Plan updated ({len(plan)} steps)")
                     self._append_transcript(session, {"role": "plan", "todos": plan})
                 if not calls:
                     if "final" in action:
                         final_text = self._final_text(action, reply)
-                        self._append_transcript(session, {"role": "assistant", "text": final_text})
+                        if not final_text.strip():
+                            if format_repairs < MAX_FORMAT_REPAIRS:
+                                format_repairs += 1
+                                messages.append({"role": "assistant", "content": reply})
+                                messages.append({"role": "user", "content": (
+                                    "Your final answer was empty. Reply with "
+                                    '{"final": "<summary>"} describing what was done, '
+                                    "or continue with a tool call."
+                                )})
+                                run.event(
+                                    "log", level="warning", iteration=iteration,
+                                    message=("The model finished with an empty summary; "
+                                             "asking for one"),
+                                )
+                                checkpoint(force=True)
+                                extend_if_needed()
+                                continue
+                            final_text = "The task finished without a summary."
+                        self._append_transcript(
+                            session, {"role": "assistant", "text": final_text})
                         final_recorded = True
                         break
                     if "plan" in action:
@@ -2438,6 +2636,9 @@ class IdeService:
                             "Plan recorded. Continue with a tool call, update the plan, "
                             "or reply with the final answer."
                         )})
+                        consolidate_history(iteration)
+                        checkpoint(force=True)
+                        extend_if_needed()
                         continue
                     final_text = self._final_text(action, reply)
                     self._append_transcript(session, {"role": "assistant", "text": final_text})
@@ -2448,27 +2649,26 @@ class IdeService:
                 for index, call in enumerate(calls):
                     if run.cancelled.is_set():
                         raise _Cancelled()
-                    observations.append(self._run_tool(
+                    result = self._run_tool(
                         run, workspace_id, session, tools, call, iteration, index, repeated,
                         excluded,
-                    ))
-                messages.append({"role": "user", "content": self._observation_message(observations)})
-                messages, consolidated = self._consolidate_for_budget(
-                    messages, budget, session, "auto",
-                )
-                if consolidated:
-                    run.event(
-                        "context_consolidated", trigger="auto", iteration=iteration,
-                        **consolidated,
-                        message=(f"Consolidated older turns to free about "
-                                 f"{consolidated['before_tokens'] - consolidated['after_tokens']:,} "
-                                 f"{consolidated['unit']} during the run."),
                     )
+                    observations.append(result)
+                    recent_calls.append((str(result.get("signature") or ""),
+                                         bool(result.get("ok")),
+                                         str(result.get("tool") or "")))
+                messages.append({"role": "user", "content":
+                                 self._observation_message(observations, session)})
+                consolidated = consolidate_history(iteration)
+                wrote = any(result.get("ok") and result.get("tool") in _WRITE_TOOLS
+                            for result in observations)
+                checkpoint(force=wrote or consolidated)
+                extend_if_needed()
             else:
                 run.exhausted = True
                 final_text = (
-                    f"Stopped after {limit} tool rounds without a final answer. "
-                    "Ask for the next step, or raise the step budget."
+                    f"Stopped after {limit} steps without a final answer. "
+                    "Ask for the next step to continue."
                 )
         except _Cancelled:
             if run.timed_out:
@@ -2488,13 +2688,16 @@ class IdeService:
                 timer.cancel()
             if final_text and not final_recorded and status == "completed":
                 self._append_transcript(session, {"role": "assistant", "text": final_text})
+            if (final_recorded and status == "completed"
+                    and not run.exhausted and not run.timed_out):
+                self._finish_plan(run, session)
             if "messages" in locals():
                 if final_text and status == "completed":
                     messages.append({"role": "assistant", "content": final_text[:MAX_MESSAGE_CHARS]})
                 session["messages"] = self._trim_history(
                     [item for item in messages if item.get("role") != "system"]
                 )
-            session["plan"] = run.plan or session.get("plan") or []
+            session["plan"] = run.plan if run.plan_set else (session.get("plan") or [])
             session["usage"] = dict(usage)
             session["status"] = status
             session["active_run_id"] = None
@@ -2519,6 +2722,7 @@ class IdeService:
                         for item in finished[:len(self._runs) - 24]:
                             self._runs.pop(item.id, None)
             self._save_run(run)
+            run.session = None
 
     def _expire_run(self, run: IdeRun, seconds: float) -> None:
         """A timer ends a run that outlived its wall-clock budget."""
@@ -2531,20 +2735,34 @@ class IdeService:
                   message=f"Time budget of {seconds:.0f}s exhausted")
 
     def _stream_reply(self, run: IdeRun, model: str, messages: list[dict],
-                      iteration: int, tools: list[dict]) -> tuple[str, dict]:
+                      iteration: int, tools: list[dict], *,
+                      max_tokens: int | None = None, allow_retry: bool = True,
+                      effort: str | None = None) -> tuple[str, dict, dict]:
+        """One streamed model turn, retrying an empty or truncated reply once.
+
+        A reasoning endpoint can spend the whole output budget on hidden thinking
+        and return no visible content; ``finish_reason`` is then ``length`` and
+        the gateway reports its empty-reply placeholder.  Treating that as the
+        final answer silently ended the run, so the turn is retried with double
+        the output budget and a lower reasoning effort before failing loudly.
+        """
+        limit = int(max_tokens or self._output_limit(model))
         config = {
             "model": model,
             "messages": self._model_messages(messages),
             "temperature": 0.2,
             "top_p": 0.95,
-            "max_tokens": 4096,
+            "max_tokens": limit,
         }
+        if effort:
+            config["reasoning_effort"] = effort
         if tools:
             # Native function calling where the provider supports it; the prompted
             # JSON path and DSML parsing remain the fallback.
             config["tools"] = tools
         run.event("assistant_start", iteration=iteration)
         parts: list[str] = []
+        thoughts: list[str] = []
         result: dict = {}
         pending: dict[str, str] = {}
         last_emit = 0.0
@@ -2567,8 +2785,7 @@ class IdeService:
                     kind = event.get("type")
                     if kind in {"delta", "reasoning"}:
                         text = str(event.get("text") or "")
-                        if kind == "delta":
-                            parts.append(text)
+                        (parts if kind == "delta" else thoughts).append(text)
                         pending[kind] = pending.get(kind, "") + text
                         if time.time() - last_emit >= 0.12:
                             flush_pending()
@@ -2584,13 +2801,55 @@ class IdeService:
             if pending:
                 flush_pending()
         except Exception as failure:
-            run.event("assistant_end", iteration=iteration, text="", error=str(failure))
+            run.event("assistant_end", iteration=iteration, text="", error=str(failure),
+                      empty=True, truncated=False, retrying=False)
             raise
         reply = str(result.get("reply") or "".join(parts))
         usage = dict(result.get("usage") or {})
+        finish = str(result.get("finish_reason") or "")
+        completion = int(usage.get("completion_tokens") or 0)
+        empty = not reply.strip() or reply.strip() in EMPTY_REPLIES
+        truncated = finish == "length" or (not empty and completion >= limit)
+        reasoning = "".join(thoughts)[-MAX_REASONING_CHARS:]
+        retrying = bool((empty or truncated) and allow_retry and not result.get("error"))
         run.event("assistant_end", iteration=iteration, text=reply[:2000],
-                  chars=len(reply), usage=usage, elapsed=float(result.get("elapsed") or 0.0))
-        return reply, usage
+                  chars=len(reply), usage=usage, elapsed=float(result.get("elapsed") or 0.0),
+                  finish_reason=finish, empty=empty, truncated=truncated,
+                  retrying=retrying, reasoning=reasoning)
+        if retrying:
+            retry_limit = min(MAX_OUTPUT_TOKENS, max(limit * 2, limit + 256))
+            reason = ("The model returned no visible text" if empty
+                      else "The model hit its output limit")
+            run.event(
+                "log", level="warning", iteration=iteration,
+                message=(
+                    f"{reason}"
+                    f"{f' (finish: {finish})' if finish else ''}; retrying this step with "
+                    f"{retry_limit:,} output tokens and lower reasoning effort"
+                ),
+            )
+            retry_reply, retry_usage, retry_meta = self._stream_reply(
+                run, model, messages, iteration, tools,
+                max_tokens=retry_limit, allow_retry=False, effort="low",
+            )
+            for key in usage:
+                usage[key] = int(usage.get(key) or 0) + int(retry_usage.get(key) or 0)
+            return retry_reply, usage, retry_meta
+        if empty:
+            if result.get("error"):
+                raise ValueError(str(result["error"]))
+            if finish == "length":
+                raise ValueError(
+                    "The model used its whole output budget before writing a visible "
+                    "answer. Lower its reasoning effort, raise Maximum output tokens on "
+                    "the saved endpoint, or choose a model that returns visible text."
+                )
+            raise ValueError(
+                "The model returned an empty reply. Choose another model in the IDE toolbar."
+            )
+        return reply, usage, {
+            "reasoning": reasoning, "finish_reason": finish, "truncated": truncated,
+        }
 
     def _swarm_tools(self, workspace_id: str, write: bool = False,
                      mode: str = "ask") -> list[dict]:
@@ -2864,8 +3123,10 @@ class IdeService:
                 observation = self._run_swarm(
                     run, workspace_id, session, arguments, call_id, excluded)
                 ok = True
-            except (BadRequestError, ValueError, OSError) as failure:
-                observation = {"error": str(failure)}
+            except _Cancelled:
+                raise
+            except Exception as failure:  # noqa: BLE001 - a swarm bug must not end the run
+                observation = {"error": str(failure) or type(failure).__name__}
                 ok = False
         elif definition is None:
             observation = {
@@ -2885,8 +3146,8 @@ class IdeService:
                 "change your approach, or finish with the final answer."
             )
         step = {"role": "tool", "tool": tool_type, "input": json_safe(arguments, 4000),
-                "output": json_safe(observation, MAX_OBSERVATION_CHARS), "ok": ok,
-                "call": call_id, "at": _iso()}
+                "output": self._bounded_observation(observation, MAX_OBSERVATION_CHARS),
+                "ok": ok, "call": call_id, "at": _iso()}
         if change:
             step["change"] = change
         if tool_type == "agent.swarm" and isinstance(observation, dict):
@@ -2906,13 +3167,14 @@ class IdeService:
             }
         self._append_transcript(session, step)
         run.event("tool_result", call=call_id, iteration=iteration, tool=tool_type, ok=ok,
-                  output=json_safe(observation, MAX_OBSERVATION_CHARS), change=change,
-                  message=f"{tool_type} {'returned' if ok else 'failed'}")
+                  output=self._bounded_observation(observation, MAX_OBSERVATION_CHARS),
+                  change=change, message=f"{tool_type} {'returned' if ok else 'failed'}")
         if tool_type == "agent.swarm" and isinstance(observation, dict):
             parent_result = self._swarm_parent_observation(observation)
         else:
             parent_result = observation
-        return {"tool": tool_type, "ok": ok, "result": parent_result}
+        return {"tool": tool_type, "ok": ok, "signature": signature,
+                "result": parent_result}
 
     @staticmethod
     def _swarm_parent_observation(observation: dict) -> dict:
@@ -3088,25 +3350,169 @@ class IdeService:
             )
         return observation
 
-    def _observation_message(self, observations: list[dict]) -> str:
+    @staticmethod
+    def _shrink_value(value, field_cap: int, list_cap: int,
+                      path: str = "") -> tuple[object, list[str]]:
+        """Copy a JSON value with long strings and lists shortened."""
+        if isinstance(value, str):
+            if len(value) > field_cap:
+                return value[:field_cap], [path or "value"]
+            return value, []
+        if isinstance(value, list):
+            kept = value[:list_cap]
+            fields = [path or "list"] if len(value) > list_cap else []
+            result = []
+            for index, item in enumerate(kept):
+                shrunk, nested = IdeService._shrink_value(
+                    item, field_cap, list_cap,
+                    f"{path}[{index}]" if path else f"[{index}]",
+                )
+                result.append(shrunk)
+                fields.extend(nested)
+            return result, fields
+        if isinstance(value, dict):
+            result = {}
+            fields = []
+            for key, item in value.items():
+                if key in {"truncated", "truncated_fields"}:
+                    result[key] = item
+                    continue
+                shrunk, nested = IdeService._shrink_value(
+                    item, field_cap, list_cap, f"{path}.{key}" if path else str(key),
+                )
+                result[key] = shrunk
+                fields.extend(nested)
+            return result, fields
+        return value, []
+
+    def _bounded_observation(self, value, limit: int = MAX_OBSERVATION_CHARS):
+        """Shrink a tool result but keep the keys the agent needs to continue.
+
+        ``json_safe`` replaces a large result with one opaque preview, losing the
+        path, line range and truncation flags.  A long coding run needs those to
+        ask for the next range, so long fields are shortened in place and the
+        structure is preserved.
+        """
+        if not isinstance(value, dict):
+            return json_safe(value, limit)
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return json_safe(value, limit)
+        if len(encoded) <= limit:
+            return value
+        for field_cap, list_cap in ((OBSERVATION_FIELD_CHARS, 60), (2_000, 40),
+                                    (1_000, 20), (500, 10), (200, 5)):
+            shrunk, fields = self._shrink_value(value, field_cap, list_cap)
+            if not isinstance(shrunk, dict):
+                continue
+            if fields:
+                shrunk["truncated"] = True
+                shrunk["truncated_fields"] = list(dict.fromkeys(fields))[:16]
+            try:
+                encoded = json.dumps(shrunk, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                return json_safe(value, limit)
+            if len(encoded) <= limit:
+                return shrunk
+        return json_safe(value, limit)
+
+    @staticmethod
+    def _progress_line(session: dict | None) -> str:
+        """The plan and changed files, kept in front of every tool round."""
+        if not isinstance(session, dict):
+            return ""
+        plan = [item for item in session.get("plan") or [] if isinstance(item, dict)]
+        changes = session.get("changes") if isinstance(session.get("changes"), dict) else {}
+        changed = [(path, change) for path, change in changes.items()
+                   if isinstance(change, dict) and not change.get("reverted")]
+        if not plan and not changed:
+            return ""
+        parts = []
+        if plan:
+            done = sum(1 for item in plan if item.get("status") == "done")
+            active = next((item for item in plan if item.get("status") == "active"), None)
+            text = f"Progress: {done}/{len(plan)} plan steps done"
+            if active:
+                now = " ".join(str(active.get("text") or "").split())[:160]
+                text += f" (now: {now})"
+            parts.append(text + ".")
+        if changed:
+            files = ", ".join(
+                f"{str(path)[:120]} (+{int(change.get('added') or 0)}/"
+                f"−{int(change.get('removed') or 0)})"
+                for path, change in changed[:6]
+            )
+            more = f" and {len(changed) - 6} more" if len(changed) > 6 else ""
+            parts.append(f"Files changed: {files}{more}.")
+        return " ".join(parts)
+
+    def _observation_message(self, observations: list[dict],
+                             session: dict | None = None) -> str:
+        count = max(1, len(observations))
+        per_result = max(1_200, min(MAX_OBSERVATION_CHARS,
+                                   MAX_OBSERVATION_TOTAL_CHARS // count))
         blocks = []
+        limited = False
         for item in observations:
-            rendered = json.dumps(
-                json_safe(item["result"], MAX_OBSERVATION_CHARS), ensure_ascii=False,
-            )
+            bounded = self._bounded_observation(item["result"], per_result)
+            if isinstance(bounded, dict) and (bounded.get("truncated_fields")
+                                              or bounded.get("truncated")):
+                limited = True
+            rendered = json.dumps(bounded, ensure_ascii=False, default=str)
             blocks.append(
-                f"{item['tool']} {'returned' if item['ok'] else 'failed'}:\n"
-                f"{rendered[:MAX_OBSERVATION_CHARS]}"
+                f"{item['tool']} {'returned' if item['ok'] else 'failed'}:\n{rendered}"
             )
-        return ("Tool results:\n\n" + "\n\n".join(blocks) +
-                "\n\nContinue with a tool call, update the plan, or reply with "
-                '{"final": "..."} when the task is done.')
+        prefix = self._progress_line(session)
+        footer = ("Continue with a tool call, update the plan, or reply with "
+                  '{"final": "..."} when the task is done.')
+        if limited:
+            footer += (" Some results were shortened; request a narrower line range "
+                       "or a more specific path when you need the rest.")
+        body = "Tool results:\n\n" + "\n\n".join(blocks) + "\n\n" + footer
+        return f"{prefix}\n\n{body}" if prefix else body
+
+    @staticmethod
+    def _should_extend(recent) -> bool:
+        """Extend only when the last few rounds produced new, successful work.
+
+        A model looping on one read or failing repeatedly should stop at its
+        budget, not be rewarded with more steps.
+        """
+        if len(recent) < 2:
+            return False
+        successes = [(signature, tool) for signature, ok, tool in recent if ok and signature]
+        if not successes:
+            return False
+        return (len({signature for signature, _ in successes}) >= 2
+                or any(tool in _WRITE_TOOLS for _, tool in successes))
 
     def _final_text(self, action: dict, reply: str) -> str:
         value = action.get("final") if "final" in action else reply
         if isinstance(value, str):
             return value.strip()[:20_000]
         return json.dumps(value, indent=2, ensure_ascii=False, default=str)[:20_000]
+
+    def _finish_plan(self, run: IdeRun, session: dict) -> None:
+        """Mark the current plan complete when a run ends with a final answer.
+
+        Models often forget the last few status updates.  Exhausted, timed-out
+        and failed runs keep their remaining steps so a continuation shows what
+        is still left to do.
+        """
+        plan = session.get("plan") if isinstance(session.get("plan"), list) else run.plan
+        todos = [item for item in plan or [] if isinstance(item, dict)]
+        if not todos or all(item.get("status") == "done" for item in todos):
+            return
+        completed = [{**item, "status": "done"} for item in todos]
+        run.plan = completed
+        run.plan_set = True
+        session["plan"] = completed
+        for entry in reversed(session.get("transcript") or []):
+            if isinstance(entry, dict) and entry.get("role") == "plan":
+                entry["todos"] = completed
+                break
+        run.event("plan", plan=completed, message="Plan completed")
 
     def _append_transcript(self, session: dict, entry: dict) -> None:
         entry.setdefault("at", _iso())
@@ -3115,6 +3521,35 @@ class IdeService:
             del session["transcript"][:200]
 
     # -- context ---------------------------------------------------------
+    def _output_limit(self, model_id: str) -> int:
+        """The output budget for one coding step.
+
+        Saved endpoints may declare ``max_output_tokens``; it is honoured up to
+        the agent's own ceiling so one step cannot monopolise a long run.
+        """
+        try:
+            catalog = self.gateway.catalog()
+        except Exception:  # noqa: BLE001 - a catalog failure falls back to the default
+            return DEFAULT_OUTPUT_TOKENS
+        entry = next((item for item in catalog if item.get("id") == model_id), None)
+        detail = (entry or {}).get("detail")
+        detail = detail if isinstance(detail, dict) else {}
+        try:
+            declared = int(detail.get("max_output_tokens") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared:
+            return max(64, min(declared, MAX_OUTPUT_TOKENS))
+        resolver = getattr(self.gateway, "output_limit", None)
+        if callable(resolver):
+            try:
+                default = int(resolver(model_id) or 0)
+            except Exception:  # noqa: BLE001 - a missing limit falls back below
+                default = 0
+            if default > 0:
+                return max(64, min(default, MAX_OUTPUT_TOKENS))
+        return DEFAULT_OUTPUT_TOKENS
+
     def _pick_model(self, requested: str) -> str:
         catalog = self.gateway.catalog()
         chat = [entry for entry in catalog
@@ -3230,7 +3665,8 @@ class IdeService:
 
     def _system_sections(self, workspace_id: str, mode: str, tools: list[dict],
                          workspace: Path, active: dict | None,
-                         context: dict | None = None) -> list[dict]:
+                         context: dict | None = None,
+                         session: dict | None = None) -> list[dict]:
         """The system prompt split into labelled pieces for the budget view."""
         name = self._manifest(workspace_id).get("name") or workspace_id
         excluded = self._excluded_paths(workspace_id, context)
@@ -3257,13 +3693,17 @@ class IdeService:
             "7. Use agent.swarm when the task has independent parts, needs several areas "
             "investigated at once, or benefits from independent review. Do not spawn a swarm "
             "for a one-file change.",
-            "8. Finish with a concise summary of what changed and what was verified.",
+            "8. Batch independent reads in one turn: use {\"calls\": [...]} instead "
+            "of one round per file, then edit as soon as you have the needed context.",
+            "9. Finish with a concise summary of what changed and what was verified.",
             "",
             "Reply with only one JSON object per turn:",
             '  {"tool": "<tool id>", "input": {<input keys>}}',
             '  {"calls": [{"tool": "<tool id>", "input": {...}}, ...]}',
             '  {"plan": [{"text": "<step>", "status": "pending|active|done"}]}',
             '  {"final": "<short summary>"}',
+            "Hidden reasoning alone is not a reply: every turn must include a tool call, "
+            "a plan, or a final object.",
             "",
             "Available tools:",
         ]
@@ -3334,6 +3774,38 @@ class IdeService:
             "id": "map", "label": "Project map",
             "text": f"Project map:\n{self._map(workspace, include=include, exclude=excluded)}",
         })
+        session = session if isinstance(session, dict) else {}
+        plan = [item for item in session.get("plan") or [] if isinstance(item, dict)]
+        if plan:
+            plan_lines = [
+                "Current plan from earlier turns. Continue it, or replace it with a new "
+                "plan when this task differs:"
+            ]
+            markers = {"done": "x", "active": ">", "pending": " "}
+            for todo in plan[:20]:
+                status = str(todo.get("status") or "pending")
+                plan_lines.append(
+                    f"- [{markers.get(status, ' ')}] {str(todo.get('text') or '')[:200]}"
+                )
+            sections.append({"id": "plan", "label": "Current plan",
+                             "text": "\n".join(plan_lines)})
+        changes = session.get("changes") if isinstance(session.get("changes"), dict) else {}
+        changed = [(path, change) for path, change in changes.items()
+                   if isinstance(change, dict) and not change.get("reverted")]
+        if changed:
+            progress_lines = [
+                "Files this conversation already changed. Revert restores the originals, "
+                "so read before editing again:"
+            ]
+            for path, change in changed[:20]:
+                progress_lines.append(
+                    f"- {str(path)[:200]} (+{int(change.get('added') or 0)}/"
+                    f"−{int(change.get('removed') or 0)})"
+                )
+            if len(changed) > 20:
+                progress_lines.append(f"- … and {len(changed) - 20} more")
+            sections.append({"id": "progress", "label": "Session progress",
+                             "text": "\n".join(progress_lines)})
         skills = self.list_skills(workspace_id)
         if skills:
             skill_lines = [
@@ -3369,18 +3841,21 @@ class IdeService:
 
     def _system_prompt(self, workspace_id: str, mode: str, tools: list[dict],
                        workspace: Path, active: dict | None,
-                       context: dict | None = None) -> str:
+                       context: dict | None = None,
+                       session: dict | None = None) -> str:
         return "\n\n".join(
             section["text"]
             for section in self._system_sections(workspace_id, mode, tools, workspace,
-                                                 active, context)
+                                                 active, context, session)
         )
 
     def _prompt_pieces(self, workspace_id: str, mode: str, tools: list[dict],
                        workspace: Path, active: dict | None, context: dict | None,
-                       message: str, context_files: list[str]) -> tuple[list[dict], str, bool]:
+                       message: str, context_files: list[str],
+                       session: dict | None = None) -> tuple[list[dict], str, bool]:
         """The exact prompt pieces shared by the live request and the budget view."""
-        pieces = self._system_sections(workspace_id, mode, tools, workspace, active, context)
+        pieces = self._system_sections(workspace_id, mode, tools, workspace, active,
+                                       context, session)
         pieces.append({
             "id": "task", "label": "Current task",
             "text": f"Current task:\n{str(message or '')[:3000]}",
@@ -3519,6 +3994,9 @@ class IdeService:
         prompt_tokens = estimate_tokens(prompt, unit)
         used = prompt_tokens + history_tokens + draft_tokens
         window = model["context_window"]
+        output_reserve = self._output_limit(model["id"] or model_id)
+        if unit == "bytes":
+            output_reserve *= 4  # conservative bytes per output token
         percent = round(used * 100 / window, 1) if window else 0.0
         warnings: list[dict] = []
         if model_id and not model["found"]:
@@ -3561,11 +4039,19 @@ class IdeService:
                         f"consolidate automatically at {CONSOLIDATE_PERCENT}% and pinned files "
                         "can be unpinned to make room for tool results.",
             })
-        if len(history) >= MODEL_MESSAGE_WINDOW - 1:
+        if window and used <= window and used + output_reserve > window:
+            warnings.append({
+                "tone": "danger",
+                "text": f"The next request uses {used:,} {unit} and reserves "
+                        f"{output_reserve:,} {unit} for output, above the "
+                        f"{window:,} {unit} window. Unpin files or choose a larger model.",
+            })
+        if len(history) >= MESSAGE_RECAP_TRIGGER:
             warnings.append({
                 "tone": "info",
-                "text": f"Only the newest {MODEL_MESSAGE_WINDOW - 1} messages are sent; "
-                        "older turns stay in the saved transcript.",
+                "text": f"Older turns are consolidated into a recap when more than "
+                        f"{MESSAGE_RECAP_TRIGGER} messages would be sent; the newest eight "
+                        "stay verbatim.",
             })
         return {
             "model": model,
@@ -3578,6 +4064,7 @@ class IdeService:
             "task": {"chars": len(str(message or "")[:3000]), "tokens": task_tokens},
             "used_tokens": used,
             "context_window": window,
+            "output_reserve": output_reserve,
             "remaining_tokens": max(0, window - used),
             "percent": percent,
             "over": used > window,
@@ -3615,7 +4102,8 @@ class IdeService:
         active = self._active_file(workspace_id, active_file)
         tools = self._tools_for_mode(mode, workspace_id)
         pieces, prompt, truncated = self._prompt_pieces(
-            workspace_id, mode, tools, workspace, active, context, message, context_files,
+            workspace_id, mode, tools, workspace, active, context, message,
+            context_files, session,
         )
         history = self._history(session)[-(MODEL_MESSAGE_WINDOW - 1):]
         budget = self._budget_from_parts(
@@ -3685,7 +4173,7 @@ class IdeService:
                         if steps:
                             lines.append(f"- Plan: {steps}")
                     if calls:
-                        names = ", ".join(str(call["tool"]) for call in calls[:8])
+                        names = ", ".join(_tool_call_label(call) for call in calls[:8])
                         lines.append(f"- Tool calls: {names}")
                     if "final" in action and not calls:
                         final = action.get("final")
@@ -3697,14 +4185,15 @@ class IdeService:
                 else:
                     lines.append(f"- Assistant: {one_line[:500]}")
             elif role == "user":
-                if content.startswith("Tool results:"):
+                if "Tool results:" in content[:400]:
                     lines.append(f"- Tool results: {one_line[:800]}")
                 else:
                     lines.append(f"- User: {one_line[:500]}")
         return "\n".join(lines)[:CONSOLIDATE_SUMMARY_CHARS]
 
     def _consolidate_messages(self, messages: list[dict], unit: str, window: int,
-                              keep: int = CONSOLIDATE_KEEP_MESSAGES) -> tuple[list[dict], int, int]:
+                              keep: int = CONSOLIDATE_KEEP_MESSAGES,
+                              force: bool = False) -> tuple[list[dict], int, int]:
         """Replace older turns with one recap, keeping the newest turns verbatim."""
         before = self._message_tokens(messages, unit)
         leading = 0
@@ -3716,7 +4205,7 @@ class IdeService:
         summary = self._consolidation_summary(body[:-keep])
         combined = list(messages[:leading]) + [{"role": "user", "content": summary}] + list(body[-keep:])
         after = self._message_tokens(combined, unit)
-        if after >= before:
+        if after >= before and not force:
             return list(messages), before, before
         return combined, before, after
 
@@ -3734,27 +4223,39 @@ class IdeService:
             "at": _iso(),
         })
         session["consolidation"] = record
+        freed = max(0, before - after)
         session.setdefault("transcript", []).append({
             "role": "notice", "kind": "consolidation", "at": _iso(),
-            "text": f"Consolidated older turns: about {before - after:,} {unit} freed.",
+            "text": f"Consolidated older turns: about {freed:,} {unit} freed.",
         })
         return record
 
     def _consolidate_for_budget(self, messages: list[dict], budget: dict, session: dict,
-                                trigger: str) -> tuple[list[dict], dict | None]:
-        """Consolidate only when the estimated request crossed the trigger."""
+                                trigger: str,
+                                max_messages: int | None = None) -> tuple[list[dict], dict | None]:
+        """Consolidate when the request would overflow tokens or the message window."""
         unit = str(budget.get("unit") or "tokens")
         window = int(budget.get("context_window") or 0)
         before = self._message_tokens(messages, unit)
-        if window <= 0 or before * 100 < window * CONSOLIDATE_PERCENT:
+        over_messages = bool(max_messages) and len(messages) > max_messages
+        reserve = max(0, int(budget.get("output_reserve") or 0))
+        over_tokens = window > 0 and (
+            before * 100 >= window * CONSOLIDATE_PERCENT
+            or (reserve > 0 and before + reserve >= window)
+        )
+        if not over_messages and not over_tokens:
             return messages, None
-        combined, before, after = self._consolidate_messages(messages, unit, window)
-        if after >= before:
+        combined, before, after = self._consolidate_messages(
+            messages, unit, window, force=over_messages and not over_tokens,
+        )
+        if after >= before and not over_messages:
+            return messages, None
+        if len(combined) >= len(messages):
             return messages, None
         self._record_consolidation(session, before, after, unit, trigger)
         return combined, {
             "before_tokens": before, "after_tokens": after, "unit": unit,
-            "percent": round(after * 100 / window, 1),
+            "percent": round(after * 100 / window, 1) if window else 0.0,
         }
 
     def consolidate_session(self, session_id: str, model_id: str = "") -> dict:

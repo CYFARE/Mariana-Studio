@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 
 import pytest
@@ -45,6 +46,7 @@ def test_status_lists_groups_and_missing_packages(registry, monkeypatch):
     ]
     assert status["installed"] is False and status["auto_install"] is False
     assert status["pip"] is True and status["busy"] is False and status["job"] is None
+    assert status["python"] == sys.executable
 
 
 def test_auto_install_preference_and_environment_override(registry, monkeypatch):
@@ -88,6 +90,22 @@ def test_failed_install_reports_the_pip_error(registry, monkeypatch):
     assert job["status"] == "failed"
     assert "pip could not install Fine-tuning" in job["error"]
     assert "Could not find a version" in job["error"]
+
+
+def test_externally_managed_pip_error_points_at_the_project_venv(registry, monkeypatch):
+    instance = manager(registry)
+
+    def fake_run(job, command, **kwargs):
+        job.log("error: externally-managed-environment")
+        return 1
+
+    monkeypatch.setattr(registry, "run_process", fake_run)
+    started = instance.install(["finetune"])
+    job = settled(registry, started["job"]["id"])
+    assert job["status"] == "failed"
+    assert "externally managed" in job["error"]
+    assert ".venv" in job["error"]
+    assert "mariana.py setup" in job["error"]
 
 
 def test_unknown_groups_are_rejected(registry):

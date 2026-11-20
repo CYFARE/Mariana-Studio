@@ -324,3 +324,4 @@ def test_provider_presets_and_default_token_limits(gateway):
     assert gateway._default_max_tokens({"runtime": "anthropic", "detail": {}}) == 16000
     assert gateway._default_max_tokens({"runtime": "anthropic", "detail": {"max_output_tokens": 4096}}) == 4096
     assert gateway._default_max_tokens({"runtime": "ollama", "detail": {}}) == gateway_module.FALLBACK_MAX_TOKENS
+    assert gateway.output_limit() == gateway_module.FALLBACK_MAX_TOKENS
