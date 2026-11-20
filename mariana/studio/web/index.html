@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Mariana Studio</title>
+  <link rel="icon" href="/img/favicon.svg" type="image/svg+xml">
+  <script src="/js/theme.js"></script>
+  <link rel="stylesheet" href="/css/tokens.css">
+  <link rel="stylesheet" href="/css/base.css">
+  <link rel="stylesheet" href="/css/components.css">
+  <link rel="stylesheet" href="/css/shell.css">
+  <link rel="stylesheet" href="/css/views.css">
+  <link rel="stylesheet" href="/css/agents.css">
+  <link rel="stylesheet" href="/css/ide.css">
+</head>
+<body>
+  <svg class="sr-only" aria-hidden="true" focusable="false">
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7"/><path d="M6 10v9h12v-9"/><path d="M10 19v-5h4v5"/></symbol>
+    <symbol id="i-models" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5"/><path d="M12 12v9"/></symbol>
+    <symbol id="i-train" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+    <symbol id="i-tune" viewBox="0 0 24 24"><path d="M5 4v6"/><path d="M5 14v6"/><path d="M12 4v10"/><path d="M12 18v2"/><path d="M19 4v3"/><path d="M19 11v9"/><circle cx="5" cy="12" r="2"/><circle cx="12" cy="16" r="2"/><circle cx="19" cy="9" r="2"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+    <symbol id="i-agents" viewBox="0 0 24 24"><rect x="3" y="4" width="6" height="5" rx="1"/><rect x="15" y="4" width="6" height="5" rx="1"/><rect x="9" y="15" width="6" height="5" rx="1"/><path d="M6 9v3h12V9"/><path d="M12 12v3"/></symbol>
+    <symbol id="i-deploy" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M7 9l5-5 5 5"/><path d="M4 15v4h16v-4"/></symbol>
+    <symbol id="i-ide" viewBox="0 0 24 24"><path d="M8 6l-5 6 5 6"/><path d="M16 6l5 6-5 6"/><path d="M13 4l-2 16"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></symbol>
+    <symbol id="i-jobs" viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h10"/><path d="M4 18h13"/><circle cx="19" cy="12" r="2"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M5 9l7 7 7-7"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4"/><path d="M7 9l5-5 5 5"/><path d="M4 19h16"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h7l2 3h9v10H3z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7.5v.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4l9 16H3z"/><path d="M12 10v5"/><path d="M12 17.5v.5"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v6H4V6h6"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 4h6l-1 6 3 3H7l3-3z"/><path d="M12 13v7"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6z"/><path d="M11 14l9-10"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/></symbol>
+    <symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="8" width="8" height="11" rx="4"/><path d="M9.5 8a2.5 2.5 0 0 1 5 0"/><path d="M4 13h4M16 13h4M5 7l3 3M19 7l-3 3M5 20l3-3M19 20l-3-3"/></symbol>
+    <symbol id="i-step" viewBox="0 0 24 24"><path d="M5 5l9 7-9 7z"/><path d="M18 5v14"/></symbol>
+    <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5M11 8v6M8 11h6"/></symbol>
+    <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5M8 11h6"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+    <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="6" rx="1"/><rect x="14" y="4" width="7" height="6" rx="1"/><rect x="14" y="14" width="7" height="6" rx="1"/><path d="M10 7h4M17.5 10v4"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7L4 12l5 5"/><path d="M4 12h10a6 6 0 0 1 0 12"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 7l5 5-5 5"/><path d="M20 12H10a6 6 0 0 0 0 12"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5v.5M7 16.5v.5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3M8 21h8"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16 8a5 5 0 0 1 0 8"/><path d="M19 5a9 9 0 0 1 0 14"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3L5 13h6l-1 8 8-10h-6z"/></symbol>
+    <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 12V6a1.5 1.5 0 0 1 3 0v5M11 11V4.5a1.5 1.5 0 0 1 3 0V11M14 11V6a1.5 1.5 0 0 1 3 0v8a6 6 0 0 1-6 6h-1a5 5 0 0 1-4-2l-3-5 1-1a1.5 1.5 0 0 1 2 0l1 1"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z"/><path d="M5 17a3 3 0 0 1 3-3h11"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></symbol>
+    <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M3 15h18M9 5v14"/></symbol>
+    <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M8 12.5l6.4-6.4a3.5 3.5 0 0 1 5 5L10 20.5a5.5 5.5 0 0 1-7.8-7.8L11.6 3.3"/></symbol>
+    <symbol id="i-preview" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M14 4v16"/><path d="M7 9h4M7 13h4"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5"/><path d="M16 7l5 5-5 5"/><path d="M14 4l-4 16"/></symbol>
+  </svg>
+
+  <a id="skip-to-main" class="skip-link" href="#main">Skip to content</a>
+
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Primary">
+      <a class="brand" href="#/home" title="Mariana Studio">
+        <span class="brand-mark" aria-hidden="true">M</span>
+        <span class="brand-name">MARIANA<small>STUDIO</small></span>
+      </a>
+      <nav class="nav" aria-label="Workspaces">
+        <a class="nav-item" data-view="home" href="#/home" title="Home"><svg class="icon" aria-hidden="true"><use href="#i-home"/></svg><span>Home</span></a>
+        <div class="nav-label">Build</div>
+        <a class="nav-item" data-view="models" href="#/models" title="Models"><svg class="icon" aria-hidden="true"><use href="#i-models"/></svg><span>Models</span></a>
+        <a class="nav-item" data-view="train" href="#/train" title="Train"><svg class="icon" aria-hidden="true"><use href="#i-train"/></svg><span>Train</span></a>
+        <a class="nav-item" data-view="finetune" href="#/finetune" title="Fine-tune"><svg class="icon" aria-hidden="true"><use href="#i-tune"/></svg><span>Fine-tune</span></a>
+        <div class="nav-label">Use</div>
+        <a class="nav-item" data-view="ide" href="#/ide" title="IDE"><svg class="icon" aria-hidden="true"><use href="#i-ide"/></svg><span>IDE</span></a>
+        <a class="nav-item" data-view="chat" href="#/chat" title="Chat"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span>Chat</span></a>
+        <a class="nav-item" data-view="agents" href="#/agents" title="Agents"><svg class="icon" aria-hidden="true"><use href="#i-agents"/></svg><span>Agents</span></a>
+        <a class="nav-item" data-view="deploy" href="#/deploy" title="Deploy"><svg class="icon" aria-hidden="true"><use href="#i-deploy"/></svg><span>Deploy</span></a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="device-chip" title="Compute device"><svg class="icon small" aria-hidden="true"><use href="#i-cpu"/></svg><span id="shell-device">Detecting device…</span></div>
+        <button id="shell-collapse" class="icon-button collapse-button" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><svg class="icon" aria-hidden="true"><use href="#i-sidebar"/></svg></button>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button id="shell-menu" class="icon-button menu-button" type="button" aria-label="Open navigation"><svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg></button>
+        <div class="topbar-title">
+          <h1 id="shell-title">Mariana Studio</h1>
+          <p id="shell-subtitle"></p>
+        </div>
+        <div class="topbar-actions">
+          <button id="shell-command" class="command-button" type="button" aria-label="Search and commands"><svg class="icon small" aria-hidden="true"><use href="#i-search"/></svg><span>Search or jump to…</span><kbd id="shell-command-key">Ctrl K</kbd></button>
+          <button id="jobs-button" class="icon-button jobs-button" type="button" aria-label="Jobs" aria-haspopup="dialog" aria-expanded="false" title="Jobs"><svg class="icon" aria-hidden="true"><use href="#i-jobs"/></svg><span id="jobs-count" class="jobs-count hidden">0</span></button>
+          <button id="theme-toggle" class="icon-button" type="button" aria-label="Switch colour theme" title="Switch colour theme"><svg class="icon" aria-hidden="true"><use id="theme-icon" href="#i-sun"/></svg></button>
+        </div>
+      </header>
+
+      <main id="main" class="content" tabindex="-1" aria-labelledby="shell-title">
+        <!-- include views/home.html -->
+        <!-- include views/models.html -->
+        <!-- include views/train.html -->
+        <!-- include views/finetune.html -->
+        <!-- include views/chat.html -->
+        <!-- include views/ide.html -->
+        <!-- include views/agents.html -->
+        <!-- include views/deploy.html -->
+      </main>
+    </div>
+  </div>
+
+  <div id="jobs-popover" class="popover jobs-popover hidden" role="dialog" aria-label="Jobs">
+    <header>
+      <h3>Jobs</h3>
+      <button id="jobs-clear" class="button small ghost" type="button">Clear finished</button>
+    </header>
+    <div id="jobs-list"></div>
+  </div>
+
+  <section id="dependencies-panel" class="install-panel hidden" aria-label="Python dependency installer">
+    <div class="install-head">
+      <div class="install-mark" aria-hidden="true"><svg class="icon"><use href="#i-download"/></svg></div>
+      <div class="grow">
+        <h2 id="dependencies-title">Installing dependencies</h2>
+        <p id="dependencies-subtitle" class="muted small"></p>
+      </div>
+      <button id="dependencies-close" class="icon-button" type="button" aria-label="Hide dependency installer"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>
+    <div id="dependencies-groups" class="install-groups" aria-label="Requirement groups"></div>
+    <div id="dependencies-progress" class="install-progress" role="progressbar" aria-label="Dependency installation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="dependencies-bar" class="install-progress-fill"></div>
+    </div>
+    <div class="row between">
+      <span id="dependencies-stage" class="muted small" aria-live="polite"></span>
+      <span id="dependencies-percent" class="muted small numeric"></span>
+    </div>
+    <div id="dependencies-actions" class="row wrap"></div>
+  </section>
+
+  <dialog id="palette" class="palette" aria-label="Command palette">
+    <div class="palette-input">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" placeholder="Search workspaces, models, agents and actions…" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="palette-list" class="palette-list" role="listbox" aria-label="Results"></div>
+    <div id="palette-status" class="sr-only" role="status" aria-live="polite"></div>
+    <div class="palette-footer" aria-hidden="true">
+      <span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span>
+      <span><kbd>Enter</kbd> Open</span>
+      <span><kbd>Esc</kbd> Close</span>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="dialog narrow" aria-labelledby="confirm-title">
+    <div class="dialog-header">
+      <div><h2 id="confirm-title">Are you sure?</h2></div>
+    </div>
+    <div class="dialog-body">
+      <p id="confirm-message"></p>
+      <label id="confirm-field" class="field hidden">
+        <span id="confirm-label"></span>
+        <input id="confirm-input" type="text" autocomplete="off" spellcheck="false">
+        <textarea id="confirm-textarea" rows="5" class="hidden" spellcheck="false"></textarea>
+      </label>
+    </div>
+    <div class="dialog-footer">
+      <button id="confirm-cancel" class="button" type="button">Cancel</button>
+      <button id="confirm-accept" class="button primary" type="button">Confirm</button>
+    </div>
+  </dialog>
+
+  <dialog id="picker-dialog" class="dialog" aria-labelledby="picker-title">
+    <div class="dialog-header">
+      <div>
+        <h2 id="picker-title">Choose a folder</h2>
+        <p id="picker-hint"></p>
+      </div>
+      <button id="picker-close" class="icon-button" type="button" aria-label="Close"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="dialog-body">
+      <div class="picker-path">
+        <button id="picker-up" class="icon-button" type="button" aria-label="Parent folder" title="Parent folder"><svg class="icon" aria-hidden="true"><use href="#i-chevron-left"/></svg></button>
+        <input id="picker-path" type="text" aria-label="Path" spellcheck="false" autocomplete="off">
+        <button id="picker-go" class="button" type="button">Go</button>
+      </div>
+      <div class="row wrap">
+        <button id="picker-home" class="button small ghost" type="button">Home</button>
+        <button id="picker-workspace" class="button small ghost" type="button">Workspace</button>
+      </div>
+      <div id="picker-list" class="picker-list" role="listbox" aria-label="Folders"></div>
+    </div>
+    <div class="dialog-footer">
+      <span id="picker-selection" class="muted small spacer truncate"></span>
+      <button id="picker-cancel" class="button" type="button">Cancel</button>
+      <button id="picker-accept" class="button primary" type="button">Use this folder</button>
+    </div>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+
+  <script src="/js/dom.js"></script>
+  <script src="/js/events.js"></script>
+  <script src="/js/format.js"></script>
+  <script src="/js/tokens.js"></script>
+  <script src="/js/storage.js"></script>
+  <script src="/js/util.js"></script>
+  <script src="/js/feedback.js"></script>
+  <script src="/js/api.js"></script>
+  <script src="/js/catalog.js"></script>
+  <script src="/js/router.js"></script>
+  <script src="/js/ui.js"></script>
+  <script src="/js/split.js"></script>
+  <script src="/js/overlay.js"></script>
+  <script src="/js/markdown.js"></script>
+  <script src="/js/diagrams.js"></script>
+  <script src="/js/artifacts.js"></script>
+  <script src="/js/form.js"></script>
+  <script src="/js/components.js"></script>
+  <script src="/js/swarm.js"></script>
+  <script src="/js/providers.js"></script>
+  <script src="/js/training-viz.js"></script>
+  <script src="/js/highlight.js"></script>
+  <script src="/js/editor.js"></script>
+  <script src="/js/jobs.js"></script>
+  <script src="/js/voice.js"></script>
+  <script src="/js/dependencies.js"></script>
+  <script src="/js/palette.js"></script>
+  <script src="/js/views/home.js"></script>
+  <script src="/js/views/models.js"></script>
+  <script src="/js/views/train.js"></script>
+  <script src="/js/views/finetune.js"></script>
+  <script src="/js/views/chat.js"></script>
+  <script src="/js/views/ide.js"></script>
+  <script src="/js/views/agents.js"></script>
+  <script src="/js/views/deploy.js"></script>
+  <script src="/js/boot.js"></script>
+</body>
+</html>

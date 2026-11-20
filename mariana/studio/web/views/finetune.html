@@ -1,0 +1,153 @@
+<section id="finetune-view" class="view hidden" aria-label="Fine-tune">
+  <div id="finetune-tabs" class="tabs view-tabs" role="tablist" aria-label="Fine-tune workspace">
+    <button type="button" role="tab" data-tab="setup" aria-controls="finetune-setup" aria-selected="true">Setup</button>
+    <button type="button" role="tab" data-tab="discovery" aria-controls="finetune-discovery" aria-selected="false">Discovery</button>
+  </div>
+
+  <div id="finetune-setup" role="tabpanel" class="workspace-split">
+    <div class="stack loose">
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">1</span>
+          <div>
+            <h2>Base model</h2>
+            <p class="muted small">Fine-tune Mariana checkpoints or local Hugging Face causal language models.</p>
+          </div>
+          <span class="spacer"></span>
+          <button id="finetune-find-base" class="button small" type="button">Find a base</button>
+        </div>
+        <select id="finetune-base" aria-label="Base model"><option value="">Loading base models…</option></select>
+        <div id="finetune-base-info"></div>
+        <details class="disclosure">
+          <summary>Models that cannot be fine-tuned</summary>
+          <div id="finetune-unavailable" class="disclosure-body stack tight"></div>
+        </details>
+      </div>
+
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">2</span>
+          <div>
+            <h2>Adaptation data</h2>
+            <p class="muted small">Use plain text or chat rows with messages, prompt/completion, or instruction/output.</p>
+          </div>
+        </div>
+        <div class="input-action">
+          <input id="finetune-folder" aria-label="Fine-tuning data path" placeholder="Path to a data folder or file">
+          <button id="finetune-browse" class="button" type="button">Browse</button>
+          <button id="finetune-find-data" class="button" type="button">Find data</button>
+        </div>
+        <div class="form-grid">
+          <label class="field">
+            <span>Extraction</span>
+            <select id="finetune-corpus-mode">
+              <option value="smart">Smart extraction</option>
+              <option value="raw">Raw text</option>
+            </select>
+          </label>
+          <label class="field" id="finetune-data-field">
+            <span>Data format</span>
+            <select id="finetune-data-mode">
+              <option value="auto">Detect automatically</option>
+              <option value="text">Plain text</option>
+              <option value="chat">Conversations</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">3</span>
+          <div>
+            <h2>Method and output</h2>
+            <p class="muted small">The base model is never overwritten.</p>
+          </div>
+        </div>
+        <div id="finetune-presets" class="option-grid"></div>
+        <label class="field">
+          <span>Output name</span>
+          <input id="finetune-name" spellcheck="false">
+        </label>
+        <div id="finetune-fields" class="form-grid three"></div>
+        <details class="disclosure">
+          <summary>Advanced fine-tuning options</summary>
+          <div id="finetune-advanced" class="disclosure-body form-grid three"></div>
+        </details>
+        <label class="check"><input id="finetune-backup" type="checkbox" checked> Back up an existing output before replacing it</label>
+      </div>
+
+      <div class="row end">
+        <button id="finetune-plan" class="button" type="button">Review plan</button>
+        <button id="finetune-start" class="button primary large" type="button">Start fine-tune</button>
+      </div>
+    </div>
+
+    <aside class="stack loose">
+      <div class="card padded stack">
+        <div class="row between"><h2>Training plan</h2><span id="finetune-engine" class="badge"></span></div>
+        <div id="finetune-plan-output" class="empty compact"><p>Select a base and data, then review the validated plan.</p></div>
+      </div>
+      <div class="card padded stack">
+        <div class="row between"><h2>Live run</h2><span id="finetune-status"></span></div>
+        <div id="finetune-run" class="stack">
+          <div id="finetune-run-empty" class="empty compact"><p>Fine-tuning progress and loss will appear here.</p></div>
+          <div id="finetune-run-content" class="stack hidden">
+            <strong id="finetune-run-title"></strong>
+            <span id="finetune-run-stage" class="muted small"></span>
+            <div id="finetune-progress"></div>
+            <div id="finetune-stats" class="stat-row"></div>
+            <div id="finetune-chart"></div>
+            <div class="row wrap">
+              <button id="finetune-pause" class="button" type="button">Pause &amp; save</button>
+              <button id="finetune-cancel" class="button danger" type="button">Cancel</button>
+              <button id="finetune-chat" class="button" type="button">Open in Chat</button>
+            </div>
+            <details class="disclosure">
+              <summary>Logs</summary>
+              <pre id="finetune-logs" class="log" tabindex="0"></pre>
+            </details>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="finetune-discovery" role="tabpanel" class="stack loose hidden">
+    <div class="card padded stack">
+      <div class="section-heading">
+        <span class="section-glyph"><svg class="icon" aria-hidden="true"><use href="#i-search"/></svg></span>
+        <div>
+          <h2>Discovery centre</h2>
+          <p class="muted small">Search Hugging Face datasets, fine-tunable base models, GitHub repositories, OpenML and Zenodo. A Hugging Face dataset downloads as ready-to-train JSON Lines; a base downloads and becomes the selected model. Other results open in a new tab.</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <input id="finetune-discover-query" type="search" aria-label="Search fine-tuning material" placeholder="Search datasets and bases, for example: grammar, alpaca, code…">
+        <select id="finetune-discover-platform" aria-label="Discovery source">
+          <option value="datasets">Hugging Face datasets</option>
+          <option value="models">Hugging Face models</option>
+          <option value="github">GitHub repositories</option>
+          <option value="openml">OpenML datasets</option>
+          <option value="zenodo">Zenodo records</option>
+          <option value="all">All sources</option>
+        </select>
+        <button id="finetune-discover-search" class="button primary" type="button">Search</button>
+      </div>
+      <div id="finetune-discover-quick" class="tag-list" role="group" aria-label="Suggested searches"></div>
+      <div id="finetune-discover-status" aria-live="polite"></div>
+    </div>
+    <div class="stack">
+      <h2 id="finetune-discover-heading" class="section-title">Featured datasets and bases</h2>
+      <div id="finetune-discover-results" class="result-grid"></div>
+    </div>
+    <div class="stack">
+      <h2 class="section-title">Your downloaded datasets</h2>
+      <div id="finetune-discover-installed" class="result-grid"></div>
+    </div>
+    <div class="stack">
+      <h2 class="section-title">Other places to look</h2>
+      <div id="finetune-discover-sources" class="grid-auto"></div>
+    </div>
+  </div>
+</section>

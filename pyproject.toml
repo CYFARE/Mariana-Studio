@@ -1,0 +1,26 @@
+# Tooling configuration only. Dependencies live in requirements*.txt.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "scripts"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: spawns real training subprocesses (deselect with -m 'not slow')",
+    "browser: drives a headless browser against a live Studio server",
+]
+filterwarnings = [
+    "ignore:_pytest.python.CallSpec2 has been renamed:pytest.PytestRemovedIn10Warning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["venv", "backups", "trained-model", "models", "exports", "agent-workspace"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # long lines are tolerated in data tables and CLI help
+    "E731",  # small lambdas are idiomatic in the model code
+    "B905",  # zip() without strict= is intentional for ragged model shapes
+]

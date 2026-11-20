@@ -1,0 +1,96 @@
+<section id="train-view" class="view hidden" aria-label="Train">
+  <div class="workspace-split">
+    <div class="stack loose">
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">1</span>
+          <div>
+            <h2>Training data</h2>
+            <p class="muted small">Choose a folder or a supported text, JSON, HTML, XML or Parquet file.</p>
+          </div>
+        </div>
+        <div class="input-action">
+          <input id="train-folder" aria-label="Training data path" placeholder="Path to a corpus folder or file">
+          <button id="train-browse" class="button" type="button">Browse</button>
+          <button id="train-inspect" class="button" type="button">Inspect</button>
+        </div>
+        <div class="row wrap">
+          <select id="train-corpus-mode" aria-label="Corpus extraction">
+            <option value="smart">Smart text extraction</option>
+            <option value="raw">Raw text only</option>
+          </select>
+          <span id="train-corpus-summary" class="muted small grow"></span>
+        </div>
+      </div>
+
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">2</span>
+          <div>
+            <h2>Architecture</h2>
+            <p class="muted small">Train a new model or continue an existing checkpoint.</p>
+          </div>
+        </div>
+        <div id="train-techniques" class="option-grid"></div>
+        <div class="form-grid">
+          <label class="field">
+            <span>Run mode</span>
+            <select id="train-mode">
+              <option value="fresh">Fresh model</option>
+              <option value="continue">Continue checkpoint</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Checkpoint name</span>
+            <input id="train-name" value="mariana-fast-gui.pt" spellcheck="false">
+          </label>
+        </div>
+      </div>
+
+      <div class="card padded stack">
+        <div class="section-heading">
+          <span class="step-number">3</span>
+          <div>
+            <h2>Configuration</h2>
+            <p class="muted small">Start with data-aware options, then adjust any value.</p>
+          </div>
+        </div>
+        <div class="row between wrap">
+          <label class="check"><input id="train-smart" type="checkbox" checked> Apply smart options when training starts</label>
+          <button id="train-recommend" class="button small" type="button">Calculate now</button>
+        </div>
+        <div id="train-smart-summary"></div>
+        <div id="train-fields" class="form-grid three"></div>
+        <details class="disclosure">
+          <summary>Advanced architecture and inference options</summary>
+          <div id="train-advanced" class="disclosure-body form-grid three"></div>
+        </details>
+      </div>
+
+      <div class="row end">
+        <button id="train-start" class="button primary large" type="button">Start training</button>
+      </div>
+    </div>
+
+    <aside class="card padded stack run-panel">
+      <div class="row between"><h2>Live run</h2><span id="train-status"></span></div>
+      <div id="train-empty" class="empty compact"><p>No training run yet. Configure a run and press Start training.</p></div>
+      <div id="train-active" class="stack hidden">
+        <strong id="train-title"></strong>
+        <span id="train-stage" class="muted small"></span>
+        <div id="train-progress"></div>
+        <div id="train-stats" class="stat-row"></div>
+        <div id="train-chart"></div>
+        <div class="row wrap">
+          <button id="train-pause" class="button" type="button">Pause &amp; save</button>
+          <button id="train-cancel" class="button danger" type="button">Cancel</button>
+          <button id="train-chat" class="button" type="button">Open in Chat</button>
+        </div>
+        <details class="disclosure">
+          <summary>Logs and command</summary>
+          <pre id="train-logs" class="log" tabindex="0"></pre>
+        </details>
+      </div>
+    </aside>
+  </div>
+</section>

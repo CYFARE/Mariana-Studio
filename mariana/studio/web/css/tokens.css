@@ -1,0 +1,192 @@
+/* Design tokens: every colour, size and radius used by Studio.
+   Light is the default; dark uses Zed's One Dark palette.  Component and view CSS
+   must reference these custom properties and never a raw colour. */
+
+:root {
+  color-scheme: light;
+
+  /* surfaces */
+  --bg: #f3f4f6;
+  --panel: #ffffff;
+  --panel-raised: #ffffff;
+  --panel-soft: #f7f8fa;
+  --sidebar: #eceef1;
+  --input: #ffffff;
+  --element-hover: #e5e7eb;
+  --backdrop: #1b1e2666;
+
+  /* lines */
+  --border: #d8dce3;
+  --border-bright: #c1c7d1;
+
+  /* ink */
+  --text: #242529;
+  --muted: #58585a;
+  --subtle: #6f7178;
+
+  /* accent */
+  --accent: #4c64c5;
+  --accent-strong: #3f55b0;
+  --accent-hover: #35499b;
+  --accent-ink: #ffffff;
+  --accent-soft: #eef0fb;
+  --accent-border: #c8cff1;
+
+  /* secondary hue (categories, never status) */
+  --violet: #a449ab;
+  --violet-soft: #f6edf7;
+  --violet-border: #e4cbe7;
+
+  /* status: always paired with an icon or a word, never colour alone */
+  --danger: #b8424d;
+  --danger-soft: #fbeaea;
+  --danger-border: #edc2c5;
+  --success: #4a7040;
+  --success-soft: #e9f1e5;
+  --success-border: #c8dcc1;
+  --warning: #7d5a10;
+  --warning-soft: #fbf3df;
+  --warning-border: #ead7a8;
+
+  /* code and logs */
+  --log-bg: #f7f8fa;
+  --log-text: #414854;
+
+  /* syntax highlighting: verified for contrast on --panel and --panel-soft */
+  --syntax-comment: #6f7178;
+  --syntax-keyword: #7a3e9d;
+  --syntax-string: #2f6f4e;
+  --syntax-number: #8a5a00;
+  --syntax-function: #3f55b0;
+  --syntax-type: #0f6a78;
+  --syntax-constant: #9c4221;
+  --syntax-builtin: #0f6a78;
+  --syntax-variable: #7d5a10;
+  --syntax-tag: #b8424d;
+  --syntax-attr: #7d5a10;
+  --syntax-property: #3f55b0;
+  --syntax-operator: #58585a;
+  --syntax-meta: #6f7178;
+  --syntax-link: #3f55b0;
+  --syntax-added: #4a7040;
+  --syntax-removed: #b8424d;
+  --code-selection: #4c64c533;
+  --code-line: #4c64c50d;
+  --code-find: #f0c36d66;
+  --code-find-current: #e39b3f8c;
+
+  /* chat */
+  --user-bg: #e8edfb;
+  --user-border: #c6d0ef;
+  --user-text: #27324b;
+
+  /* Chart series.  Validated for both colour-vision deficiency and contrast on
+     --panel and --panel-soft with the dataviz palette validator; blue + violet
+     failed it, so identity series are blue + orange.  Re-validate before changing. */
+  --series-1: #4c64c5;
+  --series-2: #d9662b;
+  --chart-grid: #e3e6eb;
+
+  /* type: body text is never below 12px */
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 26px;
+
+  /* space (4px scale) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* shape */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+  --shadow-sm: 0 1px 2px #2c344014;
+  --shadow: 0 12px 34px #2c34401f;
+  --focus-ring: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent-strong);
+
+  /* layout */
+  --sidebar-width: 232px;
+  --sidebar-collapsed: 64px;
+  --topbar-height: 60px;
+  --layer-popover: 30;
+  --layer-dialog: 40;
+  --layer-toast: 50;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #282c33;
+  --panel: #2f343e;
+  --panel-raised: #363c46;
+  --panel-soft: #282c33;
+  --sidebar: #2f343e;
+  --input: #282c33;
+  --element-hover: #363c46;
+  --backdrop: #03060bd9;
+  --border: #464b57;
+  --border-bright: #636d83;
+  --text: #dce0e5;
+  --muted: #a9afbc;
+  --subtle: #9499a8;
+  --accent: #74ade8;
+  --accent-strong: #61afef;
+  --accent-hover: #85c1ff;
+  --accent-ink: #202b3a;
+  --accent-soft: #293b5b;
+  --accent-border: #47679e;
+  --violet: #c678dd;
+  --violet-soft: #3a3142;
+  --violet-border: #654b70;
+  --danger: #e08a8f;
+  --danger-soft: #3d3036;
+  --danger-border: #6b3a3d;
+  --success: #a1c181;
+  --success-soft: #303a30;
+  --success-border: #4a5f3d;
+  --warning: #e5c07b;
+  --warning-soft: #3a3428;
+  --warning-border: #66573a;
+  --log-bg: #282c34;
+  --log-text: #abb2bf;
+  --syntax-comment: #8a909b;
+  --syntax-keyword: #c678dd;
+  --syntax-string: #98c379;
+  --syntax-number: #d19a66;
+  --syntax-function: #61afef;
+  --syntax-type: #e5c07b;
+  --syntax-constant: #56b6c2;
+  --syntax-builtin: #56b6c2;
+  --syntax-variable: #e06c75;
+  --syntax-tag: #e06c75;
+  --syntax-attr: #d19a66;
+  --syntax-property: #61afef;
+  --syntax-operator: #abb2bf;
+  --syntax-meta: #8a909b;
+  --syntax-link: #61afef;
+  --syntax-added: #98c379;
+  --syntax-removed: #e06c75;
+  --code-selection: #74ade83d;
+  --code-line: #ffffff0a;
+  --code-find: #e5c07b33;
+  --code-find-current: #e5c07b66;
+  --user-bg: #293b5b;
+  --user-border: #47679e;
+  --user-text: #dce0e5;
+  --series-1: #4d93e6;
+  --series-2: #dc6a33;
+  --chart-grid: #3d424d;
+  --shadow-sm: 0 1px 2px #0005;
+  --shadow: 0 14px 40px #0008;
+}

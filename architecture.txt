@@ -1,0 +1,169 @@
+Mariana DRV-LM v2.3 — Sprint-DRV + Hybrid Diffusion-AR + SAINT Thought
+====================================================================
+
+This document describes the architecture *actually implemented* in the
+`mariana/` package (v2.3).  Items from the original design spec that are not
+yet implemented are listed at the end.  Defaults refer to `Config`.
+The Next-Concept Model enabled by `train --ncm` and its `NCMConfig` are
+specified in `docs/ncm.md`; advanced commands use `python -m mariana ncm`, and
+NCM checkpoints and export paths remain separate from DRV-LM.
+
+├── 0. Backbone & Initialization
+│   ├── Trained from scratch (no pretrained init yet)
+│   ├── Byte-level vocab: 256 byte tokens + [BOS] + [MASK]  (vocab_size 258)
+│   ├── Pre-norm transformer: RMSNorm, SwiGLU FFN (mlp_mult 4), tied
+│   │   embedding / LM head, GPT-2-style residual init scaled by 1/sqrt(2L)
+│   ├── Optional sparse-MoE FFN (top-k=2 of moe_experts=4, Switch-style
+│   │   load-balancing loss w=0.01) — off by default (--moe); exact grouped
+│   │   CUDA AMP GEMMs + fused gate/up projections with reference fallback
+│   └── Layout: n_pre + (n_core shared × max_loops) + n_post blocks
+│       (default 2 + 2×2 + 2 = 8 flattened layers, dim 256, 4 heads)
+│
+├── 1. Embedding & Conditioning
+│   ├── 2D RoPE (mariana/rope.py)
+│   │   ├── Position axis: full-spectrum, LLaMA-exact schedule
+│   │   │   freq_j = rope_base_pos^(-j/half)  (= theta^(-2j/head_dim), θ=10000)
+│   │   ├── Time axis: additive rotation on odd pair slots only
+│   │   │   (rope_base_time=100); exactly zero rotation at time bucket 0
+│   │   └── Absolute positions; KV-cached tokens rotate with offset =
+│   │       cache length; SAINT tables cover max compressed training length and
+│   │       extend on demand during longer cached generation
+│   ├── adaLN-zero timestep conditioning (DiT-style): per-block FiLM
+│   │   scale/shift/gate from MLP(time_emb), computed *relative to the t=0
+│   │   baseline* → exact identity for committed/AR tokens
+│   ├── Region embedding {committed=0, draft=1}, also baseline-relative
+│   └── Consequence: at t=0/region=0 the model *is* a vanilla LLaMA
+│       transformer — this is what makes lossless export possible
+│
+├── 2. Training Objective (mariana/train.py)
+│   ├── Batch construction (corrupt_batch): random cutoff splits each row
+│   │   into clean prefix (causal) + draft region; draft region is split
+│   │   into block_size (32) blocks with an *independent noise level t per
+│   │   block* (64 time buckets); corruption = absorbing [MASK] +
+│   │   10% uniform random-replace (self-correction training)
+│   ├── Attention: prefix strictly causal; draft block-causal (bidirectional
+│   │   inside a block, causal across blocks) via SDPA boolean masks;
+│   │   optional FlexAttention kernel on CUDA/XPU (--flex)
+│   ├── Mask annealing: fraction of batches use a purely causal mask,
+│   │   annealed 0.5 → 0 over the first --anneal-frac (0.5) of training
+│   ├── Loop dropout: core loop count sampled ∈ {1..max_loops} per step,
+│   │   so every depth is a valid operating point
+│   ├── Sprint-DRV (--fast): ONE shared hybrid pass supplies exact causal
+│   │   prefix AR, draft diffusion/verifier, and causal-prefix MTP losses;
+│   │   random cutoffs include fully clean batches for final-byte AR coverage
+│   ├── Legacy multi-task loss (single diffusion pass + one clean causal pass):
+│   │   ├── L_AR    (w 1.0): next-token NLL on the clean causal pass
+│   │   ├── L_diff  (w 1.0): denoising CE on the draft region
+│   │   ├── L_align (w 0.1): KL(AR_conditional || diffusion_marginal) on the
+│   │   │   draft region, AR side detached — trains speculative acceptance
+│   │   ├── L_verify (w 0.1): BCE of verifier head vs "draft == original"
+│   │   ├── L_MTP   (w 0.1): hidden state at i predicts token i+2
+│   │   └── L_MoE-LB (w 0.01) when MoE enabled
+│   ├── Fast-mode tradeoff: full-sequence L_align is zero (its clean draft
+│   │   teacher needs the removed second pass); --legacy resumes same weights
+│   ├── Vectorized on-device corruption/masks, one fixed-shape CE with masked
+│   │   reductions (no variable-size boolean indexing), fused RMSNorm, and
+│   │   RoPE cos/sin shared by Q/K/all blocks
+│   └── Optimizer: AdamW (β 0.9/0.95, wd 0.05), warmup + cosine LR,
+│       grad-clip 1.0, AMP bf16 (fp16+GradScaler where bf16 unavailable)
+│
+├── 3. Inference: Draft → Refine → Verify (mariana/generate.py)
+│   ├── A. Draft: all-[MASK] block of N tokens appended after the prefix
+│   │   └── N adaptive: starts at block_size, +4 when rolling acceptance
+│   │       > 0.8, −4 when < 0.4, clamped to [4, 2×block_size]
+│   ├── B. Refine: n_steps (default 2) denoising passes with a decreasing
+│   │   noise schedule; confidence-ordered (logp) unmasking with nucleus
+│   │   sampling; verifier-driven remasking of low-confidence tokens
+│   │   (sigmoid < 0.1); verifier-consensus early exit (all committed and
+│   │   min sigmoid > 0.9)
+│   │   └── Draft sampling temperature matches the target temperature by
+│   │       default (acceptance = 1 − TV(p, q) is maximized at q ≈ p);
+│   │       --draft-temperature 0 gives greedy drafting
+│   ├── C. Verify: SINGLE-PASS parallel verification — one causal forward
+│   │   over the whole draft block yields the AR conditional at every
+│   │   position at once
+│   │   ├── Lossless speculative sampling: accept d with min(1, p_AR/q_draft);
+│   │   │   on rejection resample from relu(p_AR − q_draft) renormalized
+│   │   │   → output distribution exactly equals AR sampling
+│   │   ├── Accepted tokens reuse the block's KV entries verbatim; on
+│   │   │   rejection the cache is truncated to the accepted prefix and one
+│   │   │   "repair" forward commits the resampled token
+│   │   └── Speed law: tokens/forward ≈ [1/(1−a)] / (n_steps + 1 + ε),
+│   │       a = rolling acceptance; crossover vs AR at a ≈ 50–60%
+│   └── Exact KV cache on committed tokens (absolute RoPE offsets)
+│
+├── 4. Systems & Serving
+│   ├── Cross-platform device selection: CUDA → XPU → MPS → CPU with
+│   │   per-device AMP (bf16 / fp16+GradScaler / fp32 fallback);
+│   │   --device override degrades gracefully
+│   ├── Export (mariana/export/) of the AR decoding path — LOSSLESS by
+│   │   construction (see §1): unroll recurrent core, permute Q/K rows
+│   │   interleaved → half-split (NeoX) layout, fold nothing else
+│   │   ├── GGUF (LLaMA arch, GPT-2 bytes-to-unicode tokenizer, BOS/EOS,
+│   │   │   F16/F32/BF16) + auto-generated Ollama Modelfile
+│   │   ├── ONNX (dynamic batch/seq axes, onnxruntime-verified, err 0.0)
+│   │   └── safetensors (LLaMA-converted or raw) + config JSON
+│   ├── Teacher distillation (scripts/distill_teacher.py): local llama.cpp
+│   │   chat/OpenAI/native endpoints → plain-text corpus, best-of-n and
+│   │   confidence filtering; sequence-level because teacher BPE ≠ byte student
+│   ├── Checkpoints default to trained-model/ (large *.pt files git-ignored);
+│   │   save_checkpoint creates the parent directory
+│   ├── Numeric parity test: converted weights reproduce the AR forward
+│   │   bit-exactly (tests/test_export.py::test_llama_compat_parity)
+│   └── Sprint correctness: one forward, exact prefix-AR parity, empty-draft
+│       safety, mask equivalence (tests/test_train.py)
+│
+├── 5. SAINT latent thought (mariana/saint.py, --latent)
+│   ├── Backward compatibility: --latent-legacy and Config's latent_saint=False
+│   │   retain the fixed discrete code; resumed checkpoints never change layout
+│   ├── Adaptive discrete policy: content symbols + EOS + masked PAD, minimum
+│   │   thought count, early inference exit, per-row action/content masks
+│   ├── Hierarchical memory: masked mean/max child-block pooling → parent policy
+│   │   and codebook; parent grammar + parent-to-child reconstruction objectives
+│   ├── Continuous reasoning: per-thought variational Gaussian slots, KL budget,
+│   │   residual self-attention/FFN refinement, discrete/continuous channel dropout
+│   ├── Grammar: permuted associative recall plus key/operator/key composition
+│   │   (XOR/add/subtract/rotate); next-action, adjacent-pair, reversed-order,
+│   │   and next-parent auxiliary losses
+│   ├── Policy learning: return = compressed NLL improvement + exact-byte reward
+│   │   − thought budget; detached-context value critic, centered/scaled advantage,
+│   │   joint child/parent action log probabilities, exploration entropy
+│   ├── Compressed AR: children + continuous slots + parents + local bytes only;
+│   │   invalid memory keys are masked, continuation/local CE force information storage
+│   ├── Diffusion integration: zero-gated cross-attention in every backbone block,
+│   │   enabled only for region=1 drafts in natural fast/legacy batches and
+│   │   generation; synthetic curricula skip draft conditioning, and clean prefix,
+│   │   AR verification, compressed AR, and export do not read memory
+│   ├── Diagnostics: lat_len/stop/parents, grammar/pair/order/hier, KL, RL/return/
+│   │   value, symbol entropy and true/shuffled/random/blank memory ablations
+│   └── Export: every latent tensor is omitted; ordinary AR and GGUF/ONNX/
+│       LLaMA-safetensors paths remain bit-exact (legacy and SAINT parity tests)
+│
+├── 6. Measured status (byte-level, TinyShakespeare → Common Corpus subset)
+│   ├── 9M / dim 256 / 1.1MB corpus (2.5k steps):  val ar 1.56, align 1.63,
+│   │   acceptance ~19%, hybrid ≈ 0.5× AR
+│   ├── 20M / dim 384 / 2GiB Common Corpus (250k steps): val ar 1.08,
+│   │   diff 0.58, align 1.13, acceptance ~25–31%, hybrid ≈ 0.4–0.7×
+│   ├── 10k steps on 1.1MB corpus → memorization (train CE 0.05, val CE
+│   │   3.85): keep steps×batch×ctx ≲ 3–5× corpus size
+│   ├── Latent ablation, 2.3M / TinyShakespeare, 900 steps: natural-text
+│   │   code largely ignored (blank-code gain ≈ 0); with the earlier unordered-
+│   │   query recall curriculum, local reconstruction gain +1.78, random-symbol
+│   │   penalty +0.31, but shuffle penalty ≈ 0 → a functional unordered memory
+│   └── Acceptance is the governing metric: it rises with data scale and
+│       AR/diffusion agreement (L_align), not with sampling-side tuning
+│
+└── 7. Spec items NOT yet implemented
+    ├── Pretrained AR init / continual pretraining workflow
+    ├── Variable-length *byte* decoding / [EXPAND] logic (SAINT thought EOS is
+    │   implemented in §5; this item concerns the ordinary byte generator)
+    ├── Truncated non-Markovian trajectory window (CaDDi-style context)
+    ├── Adaptive-halting *training* (ACT/ponder loss) — halting currently
+    │   inference-only (max|Δh| < tol, cache-free calls), loop dropout
+    │   provides the training-side robustness
+    ├── Diffusion-native CoT SFT, GRPO/RL on ELBO likelihoods,
+    │   trajectory self-distillation
+    ├── CUDA graphs / fused hybrid-mask kernels (SDPA/FlexAttention only)
+    ├── MoE export to GGUF/ONNX (dense checkpoints only)
+    └── Generation-matched align curriculum (w_align scheduling, drafting
+        from partially-committed blocks during training)

@@ -1,0 +1,85 @@
+<section id="agents-view" class="view fill hidden" aria-label="Agent designer">
+  <div class="agent-toolbar card padded">
+    <select id="agents-select" aria-label="Saved agent"></select>
+    <button id="agents-new" class="button" type="button">New agent</button>
+    <button id="agents-save" class="button" type="button">Save</button>
+    <span class="spacer"></span>
+    <button id="agents-provider" class="icon-button" type="button" aria-label="Model providers" title="Add or manage model providers"></button>
+    <button id="agents-undo" class="icon-button" type="button" aria-label="Undo" title="Undo"></button>
+    <button id="agents-redo" class="icon-button" type="button" aria-label="Redo" title="Redo"></button>
+    <button id="agents-pane-menu" class="icon-button" type="button" aria-label="Panel layout options" title="Panel layout options"></button>
+    <button id="agents-more" class="icon-button" type="button" aria-label="Agent actions" title="More agent actions"></button>
+    <button id="agents-run" class="button primary" type="button" title="Run this agent">Run</button>
+    <button id="agents-run-menu" class="icon-button" type="button" aria-haspopup="menu" aria-label="Run options" title="Run with input, test, debug or stop"></button>
+  </div>
+
+  <div id="agents-designer" class="agent-designer card">
+    <aside id="agents-palette" class="agent-palette">
+      <div class="row between">
+        <h3>Nodes</h3>
+        <button id="agents-add-ability" class="icon-button small" type="button" aria-label="Add ability" title="Add ability"></button>
+      </div>
+      <input id="agents-node-search" type="search" aria-label="Find node" placeholder="Find a node…">
+      <div id="agents-node-palette" class="agent-node-palette"></div>
+      <details class="disclosure">
+        <summary>Abilities <span id="agents-ability-count" class="badge square">0</span></summary>
+        <div id="agents-abilities" class="disclosure-body stack tight"></div>
+      </details>
+    </aside>
+
+    <div id="agents-split-palette" class="agent-splitter" role="separator" aria-orientation="vertical"
+      aria-label="Resize node palette" aria-controls="agents-palette agents-canvas-column" tabindex="0"></div>
+
+    <div id="agents-canvas-column" class="agent-canvas-column">
+      <div class="agent-canvas-toolbar">
+        <button id="agents-add-node" class="button small" type="button" aria-label="Add a node" aria-keyshortcuts="N" title="Add a node (N)">Add node</button>
+        <button id="agents-find-toggle" class="icon-button small" type="button" aria-pressed="false" aria-label="Find nodes" aria-keyshortcuts="Control+F" title="Find nodes (Ctrl+F)"></button>
+        <button id="agents-pan-mode" class="icon-button small" type="button" aria-pressed="false" aria-label="Pan mode" aria-keyshortcuts="H" title="Pan mode (H)"></button>
+        <span class="spacer"></span>
+        <button id="agents-toggle-details" class="icon-button small" type="button" aria-pressed="false" aria-label="Show details panel" aria-keyshortcuts="Control+J" title="Show details panel (Ctrl+J)"></button>
+        <button id="agents-zoom-out" class="icon-button small" type="button" aria-label="Zoom out"></button>
+        <button id="agents-zoom" class="button small ghost numeric" type="button" aria-label="Reset zoom to 100%" title="Reset zoom to 100%">100%</button>
+        <button id="agents-zoom-in" class="icon-button small" type="button" aria-label="Zoom in"></button>
+        <button id="agents-fit" class="icon-button small" type="button" aria-label="Fit flow" title="Fit flow"></button>
+        <button id="agents-layout" class="icon-button small" type="button" aria-label="Auto layout" title="Auto layout"></button>
+      </div>
+
+      <div id="agents-canvas" class="agent-canvas" tabindex="0" aria-label="Agent flow canvas">
+        <div id="agents-world" class="agent-world">
+          <svg id="agents-edges" class="agent-edges" aria-hidden="true"></svg>
+          <div id="agents-nodes"></div>
+        </div>
+        <div id="agents-guides" class="agent-guides" aria-hidden="true"></div>
+        <div id="agents-find" class="agent-find hidden" role="search" aria-label="Find nodes"></div>
+        <div id="agents-selection-toolbar" class="agent-selection-toolbar hidden" role="toolbar" aria-label="Selection actions"></div>
+        <canvas id="agents-minimap" class="agent-minimap" tabindex="0" aria-label="Flow minimap" title="Drag to move the viewport; arrow keys pan"></canvas>
+        <div id="agents-canvas-hint" class="agent-canvas-hint">Drag nodes here, drag from a port to connect, or select a node to edit it.</div>
+      </div>
+
+      <div id="agents-status" class="agent-statusbar" aria-label="Designer status"></div>
+
+      <div id="agents-split-dock" class="agent-splitter" role="separator" aria-orientation="horizontal"
+        aria-label="Resize details panel" aria-controls="agents-bottom" tabindex="0"></div>
+
+      <div id="agents-bottom" class="agent-bottom">
+        <div class="agent-bottom-tabs tabs" role="tablist" aria-label="Agent details">
+          <button type="button" role="tab" data-tab="problems" aria-controls="agents-problems" aria-selected="true">Problems <span id="agents-problem-count" class="badge square">0</span></button>
+          <button type="button" role="tab" data-tab="run" aria-controls="agents-run-panel" aria-selected="false">Run &amp; events</button>
+          <button type="button" role="tab" data-tab="schedule" aria-controls="agents-schedule" aria-selected="false">Schedule</button>
+          <button type="button" role="tab" data-tab="spec" aria-controls="agents-spec" aria-selected="false">AML / AMP</button>
+        </div>
+        <div class="agent-bottom-panel">
+          <div id="agents-problems" role="tabpanel"></div>
+          <div id="agents-run-panel" role="tabpanel" class="hidden"></div>
+          <div id="agents-schedule" role="tabpanel" class="hidden"></div>
+          <div id="agents-spec" role="tabpanel" class="hidden"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="agents-split-inspector" class="agent-splitter" role="separator" aria-orientation="vertical"
+      aria-label="Resize inspector" aria-controls="agents-inspector agents-canvas-column" tabindex="0"></div>
+
+    <aside id="agents-inspector" class="agent-inspector"></aside>
+  </div>
+</section>

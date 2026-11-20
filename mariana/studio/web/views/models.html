@@ -1,0 +1,55 @@
+<section id="models-view" class="view hidden" aria-label="Models">
+  <div class="row between wrap">
+    <div id="models-tabs" class="tabs" role="tablist" aria-label="Model management">
+      <button type="button" role="tab" data-tab="library" aria-controls="models-library" aria-selected="true">Library <span id="models-count" class="count">0</span></button>
+      <button type="button" role="tab" data-tab="discover" aria-controls="models-discover" aria-selected="false">Discover</button>
+      <button type="button" role="tab" data-tab="endpoints" aria-controls="models-endpoints" aria-selected="false">Endpoints</button>
+      <button type="button" role="tab" data-tab="runtimes" aria-controls="models-runtimes" aria-selected="false">Runtimes &amp; settings</button>
+    </div>
+    <div class="row">
+      <button id="models-add" class="button" type="button">Add endpoint</button>
+      <button id="models-refresh" class="button primary" type="button">Refresh</button>
+    </div>
+  </div>
+
+  <div id="models-library" role="tabpanel" class="stack">
+    <div class="toolbar card padded">
+      <input id="models-search" type="search" aria-label="Filter models" placeholder="Filter by name, source or format…">
+      <select id="models-source" aria-label="Filter by source"><option value="">All sources</option></select>
+      <select id="models-capability" aria-label="Filter by capability">
+        <option value="">All capabilities</option>
+        <option value="chat">Chat ready</option>
+        <option value="finetune">Fine-tunable</option>
+      </select>
+    </div>
+    <div id="models-list" class="result-grid"></div>
+  </div>
+
+  <div id="models-discover" role="tabpanel" class="stack hidden">
+    <div class="card padded stack">
+      <div class="row wrap">
+        <input id="discover-query" class="grow" type="search" aria-label="Search Hugging Face" placeholder="Search Hugging Face models…">
+        <select id="discover-format" aria-label="Model format">
+          <option value="gguf">GGUF</option>
+          <option value="transformers">Transformers</option>
+        </select>
+        <button id="discover-search" class="button primary" type="button">Search</button>
+      </div>
+      <p class="help">Downloads run in the background. Check each repository's licence and required disk space before downloading.</p>
+    </div>
+    <div id="discover-results" class="result-grid"></div>
+    <div>
+      <h2 class="section-title">Ollama library</h2>
+      <div id="discover-ollama" class="result-grid"></div>
+    </div>
+  </div>
+
+  <div id="models-endpoints" role="tabpanel" class="stack hidden">
+    <div id="endpoints-list" class="result-grid"></div>
+  </div>
+
+  <div id="models-runtimes" role="tabpanel" class="stack hidden">
+    <div id="runtimes-list" class="result-grid"></div>
+    <form id="settings-form" class="card padded stack"></form>
+  </div>
+</section>

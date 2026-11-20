@@ -1,0 +1,104 @@
+<section id="chat-view" class="view fill hidden" aria-label="Chat">
+  <div class="chat-layout card">
+    <aside class="chat-sidebar">
+      <div class="row">
+        <button id="chat-new" class="button primary grow" type="button">New chat</button>
+        <button id="chat-more" class="icon-button" type="button" aria-label="Conversation actions"></button>
+      </div>
+      <input id="chat-search" type="search" aria-label="Search conversations" placeholder="Search chats…">
+      <div id="chat-list" class="chat-list"></div>
+    </aside>
+
+    <div id="chat-workspace" class="chat-workspace">
+      <div class="chat-main">
+        <header class="chat-header">
+          <select id="chat-model" aria-label="Chat model"><option value="">Loading models…</option></select>
+          <div class="row">
+            <div id="chat-mode" class="segmented" role="group" aria-label="Response mode: Swarm is the default">
+              <button id="chat-mode-solo" type="button" aria-pressed="false" title="One model answers directly · faster and cheaper">Solo</button>
+              <button id="chat-mode-swarm" type="button" aria-pressed="true" title="Default: a leader-planned team of agents answers together">Swarm</button>
+            </div>
+            <button id="chat-preview-toggle" class="icon-button" type="button" aria-label="Show preview panel"
+              aria-pressed="false" aria-controls="chat-preview" title="Show preview panel (Ctrl+Shift+P)"></button>
+            <button id="chat-runtime" class="button small hidden" type="button">Start Ollama</button>
+            <button id="chat-provider" class="icon-button" type="button" aria-label="Model providers" title="Add or manage model providers"></button>
+            <button id="chat-settings" class="icon-button" type="button" aria-label="Model settings" title="Model settings"></button>
+          </div>
+        </header>
+        <div id="chat-notice"></div>
+        <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+        <div class="chat-compose">
+          <div id="chat-attachments" class="chat-attachments" aria-live="polite"></div>
+          <div id="chat-stream-status" class="muted small"></div>
+          <textarea id="chat-input" rows="3" aria-label="Message" placeholder="Message the model. Enter to send, Shift+Enter for a new line. Drop files to attach them."></textarea>
+          <div class="row between wrap">
+            <div class="row wrap chat-compose-meta">
+              <div class="chat-budget">
+                <button id="chat-budget-open" class="chat-budget-button" type="button"
+                  aria-label="Open context and token analysis">
+                  <span id="chat-budget-track" class="chat-budget-track" role="meter" aria-label="Context used"
+                    aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <circle class="chat-budget-ring" cx="12" cy="12" r="9"></circle>
+                      <circle id="chat-budget-fill" class="chat-budget-fill" cx="12" cy="12" r="9"></circle>
+                    </svg>
+                    <span id="chat-budget-text" class="sr-only">Estimating…</span>
+                  </span>
+                </button>
+              </div>
+              <span id="chat-context" class="muted tiny"></span>
+            </div>
+            <div class="row wrap">
+              <input id="chat-file-input" type="file" multiple hidden aria-label="Attach files">
+              <button id="chat-attach" class="icon-button" type="button" aria-label="Attach files"
+                title="Attach files or images"></button>
+              <button id="chat-voice" class="icon-button" type="button" aria-label="Dictate a message"
+                aria-pressed="false" title="Dictate a message"></button>
+              <button id="chat-voice-auto" class="icon-button" type="button" aria-label="Read replies aloud automatically"
+                aria-pressed="false" title="Read replies aloud automatically"></button>
+              <button id="chat-prompts" class="button small ghost" type="button" title="Prompt presets">Prompts</button>
+              <button id="chat-scroll" class="button small ghost hidden" type="button">Jump to latest</button>
+              <button id="chat-stop" class="button danger hidden" type="button">Stop</button>
+              <button id="chat-send" class="button primary" type="button">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="chat-split-preview" class="chat-splitter" role="separator" aria-orientation="vertical"
+        aria-label="Resize preview panel" aria-controls="chat-preview" tabindex="0"></div>
+
+      <aside id="chat-preview" class="chat-preview" aria-label="Artifact preview">
+        <header class="chat-preview-head">
+          <div class="grow">
+            <h2 id="chat-preview-title">Preview</h2>
+            <p id="chat-preview-subtitle" class="muted tiny">Code, designs, diagrams and attachments from this conversation.</p>
+          </div>
+          <button id="chat-preview-copy" class="icon-button small" type="button" aria-label="Copy artifact source"
+            title="Copy artifact source"></button>
+          <button id="chat-preview-download" class="icon-button small" type="button" aria-label="Download artifact"
+            title="Download artifact"></button>
+          <button id="chat-preview-close" class="icon-button small" type="button" aria-label="Close preview panel"
+            title="Close preview panel"></button>
+        </header>
+        <div id="chat-preview-modes" class="chat-preview-modes" role="group" aria-label="Preview mode"></div>
+        <div id="chat-preview-list" class="chat-preview-list" role="tablist" aria-label="Artifacts"></div>
+        <div id="chat-preview-body" class="chat-preview-body" role="tabpanel" aria-label="Selected artifact"></div>
+      </aside>
+    </div>
+  </div>
+
+  <dialog id="chat-settings-dialog" class="dialog" aria-labelledby="chat-settings-title">
+    <div class="dialog-header">
+      <div>
+        <h2 id="chat-settings-title">Conversation settings</h2>
+        <p id="chat-settings-model" class="muted small"></p>
+      </div>
+      <button id="chat-settings-close" class="icon-button" type="button" aria-label="Close"></button>
+    </div>
+    <div id="chat-settings-body" class="dialog-body stack"></div>
+    <div class="dialog-footer">
+      <button id="chat-settings-save" class="button primary" type="button">Apply settings</button>
+    </div>
+  </dialog>
+</section>

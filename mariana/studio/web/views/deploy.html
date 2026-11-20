@@ -1,0 +1,64 @@
+<section id="deploy-view" class="view hidden" aria-label="Deploy">
+  <div class="grid-2 deploy-grid">
+    <div class="card padded stack">
+      <div>
+        <h2>Export a checkpoint</h2>
+        <p class="muted small">Convert dense Mariana DRV-LM checkpoints to portable inference formats.</p>
+      </div>
+      <label class="field">
+        <span>Checkpoint</span>
+        <select id="deploy-model"><option value="">Loading checkpoints…</option></select>
+      </label>
+      <div class="form-grid">
+        <label class="field">
+          <span>Format</span>
+          <select id="deploy-format">
+            <option value="gguf">GGUF</option>
+            <option value="onnx">ONNX</option>
+            <option value="safetensors">Safetensors</option>
+            <option value="all">All formats</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Precision</span>
+          <select id="deploy-dtype">
+            <option value="f16">Float 16</option>
+            <option value="f32">Float 32</option>
+            <option value="bf16">BFloat 16</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">
+        <span>Export name</span>
+        <input id="deploy-name" spellcheck="false">
+      </label>
+      <div class="row wrap">
+        <button id="deploy-export" class="button primary" type="button">Start export</button>
+        <span class="help">Requires <code>pip install -r requirements-export.txt</code></span>
+      </div>
+    </div>
+
+    <div class="card padded stack">
+      <div>
+        <h2>OpenAI-compatible API</h2>
+        <p class="muted small">Use any model in the library from existing tools through this local server.</p>
+      </div>
+      <label class="field">
+        <span>Example model</span>
+        <select id="deploy-api-model"><option value="">Loading models…</option></select>
+      </label>
+      <div id="deploy-api-snippet"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header row between">
+      <div>
+        <h2>Exported artifacts</h2>
+        <p class="muted small">Files in <code>exports/</code>, ready to chat with or register with Ollama.</p>
+      </div>
+      <button id="deploy-refresh" class="button small" type="button">Refresh</button>
+    </div>
+    <div id="deploy-artifacts" class="card-body"></div>
+  </div>
+</section>

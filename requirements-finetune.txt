@@ -1,0 +1,6 @@
+# Fine-tuning and chatting with third-party Hugging Face models in Mariana Studio.
+# Used by:  mariana/studio/finetune/trainer.py and the Transformers chat backend
+# LoRA is implemented natively, so PEFT is not required; adapters are written in
+# the PEFT layout and load there too.
+transformers>=4.44
+safetensors>=0.4

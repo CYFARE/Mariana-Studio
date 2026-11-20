@@ -1,0 +1,129 @@
+<section id="ide-view" class="view fill hidden" aria-label="IDE">
+  <div class="ide-shell card">
+    <header class="ide-toolbar">
+      <button id="ide-sidebar-toggle" class="icon-button small" type="button" aria-label="Toggle explorer" aria-pressed="true" title="Toggle explorer (Ctrl+B)"></button>
+      <button id="ide-layout-menu" class="icon-button small" type="button" aria-label="Layout options" title="Layout options"></button>
+      <select id="ide-workspace" aria-label="Open project"><option value="">Open project…</option></select>
+      <button id="ide-new-workspace" class="button small" type="button">New</button>
+      <button id="ide-open-folder" class="button small" type="button" title="Open an existing project folder in place">Open folder</button>
+      <button id="ide-refresh" class="icon-button small" type="button" aria-label="Refresh files" title="Refresh files"></button>
+      <button id="ide-quick-open" class="button small ghost" type="button" title="Quick open (Ctrl+P)">Quick open</button>
+      <span class="spacer"></span>
+      <button id="ide-agent-toggle" class="icon-button small" type="button" aria-label="Toggle agent panel" aria-pressed="true" title="Toggle agent panel (Ctrl+Shift+B)"></button>
+      <select id="ide-model" aria-label="Coding model" class="ide-model"><option value="">Default model</option></select>
+      <button id="ide-provider-menu" class="icon-button small" type="button" aria-label="Model providers" title="Add or manage model providers"></button>
+      <div id="ide-mode" class="segmented" role="group" aria-label="Agent mode">
+        <button type="button" data-value="ask" aria-pressed="false" title="Read and diagnose only">Ask</button>
+        <button type="button" data-value="edit" aria-pressed="true" title="Edit files with snapshots">Edit</button>
+        <button type="button" data-value="auto" aria-pressed="false" title="Edit, delete and run commands when enabled">Auto</button>
+      </div>
+      <button id="ide-save" class="button small primary" type="button" title="Save the open file (Ctrl+S)">Save</button>
+      <button id="ide-revert" class="button small danger" type="button" disabled title="Restore every file this session changed">Revert edits</button>
+    </header>
+
+    <div id="ide-project-tabs" class="ide-project-tabs" role="tablist" aria-label="Open projects"></div>
+
+    <div id="ide-body" class="ide-body">
+      <aside id="ide-sidebar" class="ide-sidebar">
+        <div class="tabs ide-sidebar-tabs" role="tablist" aria-label="IDE explorer">
+          <button type="button" role="tab" data-tab="files" aria-controls="ide-files-panel" aria-selected="true">Files</button>
+          <button type="button" role="tab" data-tab="search" aria-controls="ide-search-panel" aria-selected="false">Search</button>
+          <button type="button" role="tab" data-tab="sessions" aria-controls="ide-sessions-panel" aria-selected="false">Chats</button>
+        </div>
+        <div id="ide-files-panel" role="tabpanel" class="ide-panel">
+          <div class="row">
+            <input id="ide-file-filter" type="search" aria-label="Filter files" placeholder="Filter files…">
+            <button id="ide-new-file" class="icon-button small" type="button" aria-label="New file" title="New file"></button>
+            <button id="ide-new-folder" class="icon-button small" type="button" aria-label="New folder" title="New folder"></button>
+          </div>
+          <div id="ide-tree" class="ide-tree"></div>
+        </div>
+        <div id="ide-search-panel" role="tabpanel" class="ide-panel hidden">
+          <div class="row">
+            <input id="ide-search-query" type="search" aria-label="Search project" placeholder="Search project…">
+            <button id="ide-search-run" class="button small" type="button">Find</button>
+          </div>
+          <div id="ide-search-results" class="ide-search-results"></div>
+        </div>
+        <div id="ide-sessions-panel" role="tabpanel" class="ide-panel hidden">
+          <div class="row">
+            <button id="ide-new-session" class="button small" type="button">New chat</button>
+            <span class="spacer"></span>
+            <button id="ide-delete-session" class="icon-button small" type="button" aria-label="Delete this conversation" title="Delete this conversation"></button>
+          </div>
+          <input id="ide-session-search" type="search" aria-label="Search conversations" placeholder="Search conversations…">
+          <div id="ide-sessions" class="ide-sessions"></div>
+        </div>
+      </aside>
+
+      <div id="ide-split-sidebar" class="ide-splitter" role="separator" aria-orientation="vertical"
+        aria-label="Resize explorer" aria-controls="ide-sidebar ide-editor-column" tabindex="0"></div>
+
+      <div id="ide-editor-column" class="ide-editor-column">
+        <div id="ide-file-tabs" class="ide-file-tabs" role="tablist" aria-label="Open files"></div>
+        <div id="ide-view-bar" class="ide-view-bar hidden" role="toolbar" aria-label="File view"></div>
+        <div id="ide-file-notice" class="ide-file-notice hidden" role="status"></div>
+        <div id="ide-editor-host" class="ide-editor-host" role="tabpanel" aria-label="Editor"></div>
+        <footer class="ide-statusbar">
+          <span id="ide-status-file" class="truncate muted">No file open</span>
+          <span class="spacer"></span>
+          <span id="ide-status-mode" class="badge">Edit</span>
+          <span id="ide-status-shell" class="badge">Shell off</span>
+          <span id="ide-status-tokens" class="badge hidden" title="Tokens used by the last run">0 tokens</span>
+          <button id="ide-check" class="button small ghost" type="button">Check project</button>
+        </footer>
+      </div>
+
+      <div id="ide-split-agent" class="ide-splitter" role="separator" aria-orientation="vertical"
+        aria-label="Resize agent panel" aria-controls="ide-agent ide-editor-column" tabindex="0"></div>
+
+      <aside id="ide-agent" class="ide-agent" aria-label="Coding agent">
+        <header class="ide-agent-head">
+          <div class="grow">
+            <h2 id="ide-session-title">New session</h2>
+            <p id="ide-agent-status" class="muted tiny">Ask for a change; the agent reads, edits and verifies.</p>
+          </div>
+          <span id="ide-run-badge" class="badge running hidden">Running</span>
+          <button id="ide-voice-auto" class="icon-button small" type="button" aria-label="Read replies aloud automatically" aria-pressed="false" title="Read replies aloud automatically"></button>
+          <button id="ide-agent-collapse" class="icon-button small" type="button" aria-label="Collapse agent panel" title="Collapse agent panel"></button>
+          <button id="ide-session-menu" class="icon-button small" type="button" aria-label="Conversation actions" title="Conversation actions"></button>
+        </header>
+        <div id="ide-plan" class="ide-plan hidden"></div>
+        <div id="ide-transcript" class="ide-transcript" aria-live="polite"></div>
+        <div class="ide-compose">
+          <div id="ide-context-chips" class="ide-context-chips"></div>
+          <div class="row between wrap">
+            <div id="ide-context" class="ide-context muted tiny"></div>
+            <div class="row">
+              <button id="ide-context-add" class="button small ghost" type="button" title="Pin files or folders to the agent context">Pin context</button>
+              <button id="ide-context-manage" class="icon-button small" type="button" aria-label="Manage agent context" title="Manage agent context"></button>
+            </div>
+          </div>
+          <textarea id="ide-message" rows="3" aria-label="Coding task" placeholder="Describe a task. Ctrl+Enter sends; Shift+Enter adds a line."></textarea>
+          <div class="row between wrap">
+            <div class="ide-budget">
+              <button id="ide-budget-open" class="ide-budget-button" type="button"
+                aria-label="Open context and token analysis">
+                <span id="ide-budget-track" class="ide-budget-track" role="meter" aria-label="Context used"
+                  aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <circle class="ide-budget-ring" cx="12" cy="12" r="9"></circle>
+                    <circle id="ide-budget-fill" class="ide-budget-fill" cx="12" cy="12" r="9"></circle>
+                  </svg>
+                  <span id="ide-budget-text" class="sr-only">Estimating…</span>
+                </span>
+              </button>
+            </div>
+            <div class="row">
+              <button id="ide-voice" class="icon-button small" type="button" aria-label="Dictate a task"
+                aria-pressed="false" title="Dictate a task"></button>
+              <button id="ide-prompt-menu" class="button small ghost" type="button" title="Prompt presets">Prompts</button>
+              <button id="ide-stop" class="button danger small hidden" type="button">Stop</button>
+              <button id="ide-send" class="button primary" type="button">Send</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</section>
