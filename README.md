@@ -77,10 +77,10 @@ states the hardware and protocol that produced it.
 ```bash
 git clone https://github.com/CYFARE/Mariana-Studio.git && cd Mariana-Studio
 python mariana.py setup                    # pyenv + .venv + PyTorch/NumPy, on any OS
-
+# PERFORM SOURCE VENV ACTIVATE BEFORE RUNNING BELOW COMMANDS!
+python mariana.py studio                   # open the studio
 python mariana.py                          # smoke-test train on the built-in demo corpus
 python -m mariana train --data corpus.txt  # train on your own text
-python mariana.py studio                   # open the studio
 python mariana.py update                   # update from the latest GitHub release
 ```
 
