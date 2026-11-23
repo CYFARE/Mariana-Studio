@@ -21,7 +21,8 @@
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-label { padding: var(--space-4) 10px 6px; font-size: 11px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: var(--subtle); }
 .nav-item { position: relative; display: flex; align-items: center; gap: var(--space-3); min-height: 38px; padding: 8px 10px;
-  font-size: var(--text-md); font-weight: 550; color: var(--muted); border: 1px solid transparent; border-radius: var(--radius-sm); }
+  font-size: var(--text-md); font-weight: 550; color: var(--muted); border: 1px solid transparent;
+  border-radius: var(--radius-sm); transition: color .12s, background .12s, border-color .12s; }
 .nav-item:hover { color: var(--text); background: var(--element-hover); text-decoration: none; }
 .nav-item[aria-current="page"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
 .nav-item[aria-current="page"]::before { content: ""; position: absolute; left: calc(-1 * var(--space-3)); top: 8px; bottom: 8px; width: 3px;
@@ -41,7 +42,7 @@
 .topbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: var(--space-4);
   min-height: var(--topbar-height); padding: var(--space-2) var(--space-6);
   background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--border); box-shadow: 0 1px 0 color-mix(in srgb, var(--panel) 60%, transparent); }
+  border-bottom: 1px solid var(--border); }
 .topbar-title { min-width: 0; }
 .topbar-title h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-title p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--text-sm); color: var(--muted); }
@@ -57,6 +58,8 @@
 .content { flex: 1; min-width: 0; padding: var(--space-6); }
 .content:focus { outline: none; }
 .view { display: flex; flex-direction: column; gap: var(--space-5); max-width: 1480px; margin: 0 auto; }
+.view:not(.hidden) { animation: view-in .16s ease-out; }
+@keyframes view-in { from { opacity: .55; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .view.fill { max-width: none; height: calc(100vh - var(--topbar-height) - 2 * var(--space-6)); min-height: 520px; }
 .menu-button { display: none; }
 
@@ -98,9 +101,10 @@ dialog.palette::backdrop { background: var(--backdrop); }
 
 @media (max-width: 900px) {
   .app, .app.collapsed { grid-template-columns: minmax(0, 1fr); }
-  .sidebar { position: fixed; z-index: 35; left: 0; width: var(--sidebar-width); transform: translateX(-100%); transition: transform .18s; box-shadow: var(--shadow); }
+  .sidebar { position: fixed; z-index: 35; left: 0; width: min(86vw, var(--sidebar-width)); transform: translateX(-100%); transition: transform .18s; box-shadow: var(--shadow); }
   .app.menu-open .sidebar { transform: none; }
   .app.menu-open::after { content: ""; position: fixed; inset: 0; z-index: 34; background: var(--backdrop); }
+  body:has(.app.menu-open) { overflow: hidden; }
   .app.collapsed .brand-name, .app.collapsed .nav-item span, .app.collapsed .nav-label, .app.collapsed .device-chip span { display: revert; }
   .menu-button { display: inline-grid; }
   .collapse-button { display: none; }
@@ -110,4 +114,10 @@ dialog.palette::backdrop { background: var(--backdrop); }
   .command-button span, .command-button kbd { display: none; }
   .topbar-title p { display: none; }
   .view.fill { height: auto; }
+}
+
+@media (max-width: 560px) {
+  .topbar { gap: var(--space-2); }
+  .topbar-actions { gap: 2px; }
+  .topbar-title h1 { font-size: var(--text-lg); }
 }

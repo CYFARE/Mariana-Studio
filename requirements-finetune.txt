@@ -4,3 +4,8 @@
 # the PEFT layout and load there too.
 transformers>=4.44
 safetensors>=0.4
+# 4-bit/8-bit QLoRA for 6-8 GB GPUs. Bitsandbytes needs a CUDA platform; on macOS
+# the trainer still supports fp32 LoRA without it (no quantization).
+bitsandbytes>=0.43; platform_system != "Darwin"
+# Places quantized layers on the GPU and keeps loading peak memory low.
+accelerate>=0.30

@@ -12,7 +12,9 @@ import pytest
 from mariana.agents.swarm import (
     COMPACTED_PREFIX,
     CONTEXT_HANDLE,
+    RESERVED_MEMBER_IDS,
     SwarmBlackboard,
+    SwarmCancelled,
     SwarmChannel,
     SwarmContextBank,
     SwarmContextPool,
@@ -20,8 +22,10 @@ from mariana.agents.swarm import (
     SwarmError,
     SwarmLimitError,
     SwarmLimits,
+    SwarmMember,
     SwarmTimeout,
     _elide,
+    _finish_reserve,
     _json_object,
     _relative_target,
     _retry_tokens,
@@ -91,6 +95,272 @@ class SwarmGateway:
         else:
             reply = json.dumps({"final": "unexpected phase"})
         return {"reply": reply, "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+
+
+class DependencyGateway(SwarmGateway):
+    """A leader plan with criteria, per-member plans and a dependency edge."""
+
+    def chat(self, config):
+        system = config["messages"][0]["content"]
+        if "Plan a small, focused team" in system:
+            self.calls.append(copy.deepcopy(config))
+            return {"reply": json.dumps({
+                "strategy": "map_reduce", "rounds": 0,
+                "success_criteria": ["both files read", "answer cites evidence"],
+                "agents": [
+                    {"id": "reader", "label": "Reader", "role": "reader",
+                     "task": "read the first file", "tools": ["file.read"],
+                     "plan": [{"text": "open the file", "status": "active"}]},
+                    {"id": "checker", "label": "Checker", "role": "checker",
+                     "task": "check the reader's evidence", "tools": ["file.read"],
+                     "depends_on": ["reader"],
+                     "plan": [{"text": "compare the findings", "status": "pending"}]},
+                ],
+                "notes": "read first, then check",
+            }), "usage": {}}
+        return super().chat(config)
+
+
+def test_leader_plan_runs_dependencies_in_waves_with_criteria():
+    events = []
+    gateway = DependencyGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-waves", goal="compare two files", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        executor=lambda member, tool_id, arguments: ({"content": "hello"}, True),
+        limits=LIMITS, on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    result = coordinator.run(strategy="auto", rounds=0)
+
+    assert result["ok"] is True, result.get("error")
+    assert result["success_criteria"] == ["both files read", "answer cites evidence"]
+    plan_event = next(fields for kind, fields in events if kind == "swarm_plan")
+    assert plan_event["success_criteria"] == result["success_criteria"]
+    agents = {item["id"]: item for item in result["agents"]}
+    assert agents["checker"]["depends_on"] == ["reader"]
+    assert agents["reader"]["plan"][0] == {"text": "open the file", "status": "active"}
+    wave = next(fields for kind, fields in events
+                if kind == "swarm_leader" and fields.get("wave") == 2)
+    assert "dependencies finished" in wave["message"]
+    member_calls = [call for call in gateway.calls
+                    if "You are one member of the swarm" in call["messages"][0]["content"]]
+    first_reader = next(index for index, call in enumerate(member_calls)
+                        if "You are Reader (reader)" in call["messages"][0]["content"])
+    first_checker = next(index for index, call in enumerate(member_calls)
+                         if "You are Checker (checker)" in call["messages"][0]["content"])
+    assert first_reader < first_checker
+    assert result["blackboard"]
+    stored = next(item for item in result["blackboard"] if item["key"] == "swarm.plan")
+    assert stored["value"]["success_criteria"] == result["success_criteria"]
+    assert stored["value"]["members"][1]["depends_on"] == ["reader"]
+
+
+def test_a_dependency_cycle_is_ignored_with_a_warning():
+    class CycleGateway(SwarmGateway):
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "Plan a small, focused team" in system:
+                self.calls.append(copy.deepcopy(config))
+                return {"reply": json.dumps({
+                    "strategy": "map_reduce", "rounds": 0,
+                    "agents": [
+                        {"id": "a1", "label": "A", "role": "r", "task": "one",
+                         "tools": ["file.read"], "depends_on": ["a2"]},
+                        {"id": "a2", "label": "B", "role": "r", "task": "two",
+                         "tools": ["file.read"], "depends_on": ["a1"]},
+                    ],
+                }), "usage": {}}
+            return super().chat(config)
+
+    gateway = CycleGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-cycle", goal="cycle", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        executor=lambda member, tool_id, arguments: ({"content": "ok"}, True),
+        limits=LIMITS,
+    )
+    result = coordinator.run(strategy="map_reduce", rounds=0)
+    assert result["ok"] is True
+    assert any("cycle" in warning.lower() for warning in result["warnings"])
+    assert all(agent["depends_on"] == [] for agent in result["agents"])
+
+
+class ReflectionGateway(SwarmGateway):
+    """One member that plans, reads, drafts an answer, then answers the nudged check."""
+
+    def chat(self, config):
+        system = config["messages"][0]["content"]
+        user = config["messages"][-1]["content"]
+        if "Plan a small, focused team" in system:
+            self.calls.append(copy.deepcopy(config))
+            return {"reply": json.dumps({
+                "strategy": "map_reduce", "rounds": 0,
+                "agents": [{"id": "worker", "label": "Worker", "role": "researcher",
+                            "task": "read and answer", "tools": ["file.read"]}],
+            }), "usage": {}}
+        if "You are one member of the swarm" in system:
+            self.calls.append(copy.deepcopy(config))
+            if "You are about to finish" in user:
+                reply = json.dumps({"final": "checked answer"})
+            elif "returned:" in user:
+                reply = json.dumps({"final": "draft answer"})
+            else:
+                reply = json.dumps({
+                    "plan": [{"text": "read the evidence", "status": "active"}],
+                    "tool": "file.read", "input": {"path": "x.txt"},
+                })
+            return {"reply": reply, "usage": {}}
+        return super().chat(config)
+
+
+def test_a_member_plan_is_persisted_and_rechecked_before_finishing():
+    events = []
+    gateway = ReflectionGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-plan", goal="answer from the file", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        executor=lambda member, tool_id, arguments: ({"content": "evidence"}, True),
+        limits=LIMITS, on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    result = coordinator.run(strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True, result.get("error")
+    agent = result["agents"][0]
+    assert agent["plan"] == [{"text": "read the evidence", "status": "active"}]
+    assert agent["plan_version"] == 1
+    assert agent["output"] == "checked answer"
+    plan_events = [fields for kind, fields in events if kind == "swarm_agent_plan"]
+    assert plan_events and plan_events[0]["plan"][0]["status"] == "active"
+    assert any("unfinished plan" in fields.get("message", "").lower()
+               for kind, fields in events if kind == "swarm_agent_status")
+    assert any("unfinished plan step" in warning for warning in result["warnings"])
+
+
+def test_a_temporary_read_failure_is_retried_once():
+    events = []
+    calls = []
+
+    def executor(member, tool_id, arguments):
+        calls.append(tool_id)
+        if len(calls) == 1:
+            return {"error": "connection reset by peer"}, False
+        return {"content": "hello"}, True
+
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-retry", goal="read x", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}], executor=executor,
+        limits=SwarmLimits(max_agents=1, max_steps=4, max_rounds=1, max_seconds=20,
+                            max_messages=40, max_message_chars=200, max_memory_entries=20),
+        on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    result = coordinator.run(agents=[{"id": "a1", "task": "read the file"}],
+                             strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True, result.get("error")
+    assert calls == ["file.read", "file.read"]
+    agent = result["agents"][0]
+    assert agent["tool_calls"] == 1 and agent["tool_failures"] == 0
+    assert agent["tool_retries"] == 1
+    assert any("retrying file.read" in fields.get("message", "").lower()
+               for kind, fields in events if kind == "swarm_agent_status")
+    tool_events = [fields for kind, fields in events if kind == "swarm_agent_tool"]
+    assert tool_events[-1]["attempts"] == 2 and tool_events[-1]["ok"] is True
+
+
+def test_a_rejected_write_is_not_retried():
+    calls = []
+
+    class FinalGateway(SwarmGateway):
+        def __init__(self):
+            super().__init__()
+            self.member_turns = 0
+
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "You are one member of the swarm" in system:
+                self.calls.append(copy.deepcopy(config))
+                self.member_turns += 1
+                reply = (json.dumps({"tool": "file.write",
+                                     "input": {"path": "notes/a.txt", "content": "x"}})
+                         if self.member_turns == 1 else json.dumps({"final": "reported"}))
+                return {"reply": reply, "usage": {}}
+            return super().chat(config)
+
+    def executor(member, tool_id, arguments):
+        calls.append(tool_id)
+        return {"error": "Path is outside the member's write scope"}, False
+
+    coordinator = SwarmCoordinator(
+        gateway=FinalGateway(), swarm_id="swarm-no-retry", goal="write x", model="fake",
+        tools=[{"id": "file.write", "type": "file.write"}], executor=executor,
+        limits=SwarmLimits(max_agents=1, max_steps=4, max_rounds=1, max_seconds=20,
+                           max_messages=40, max_message_chars=200, max_memory_entries=20),
+        allow_write=True,
+    )
+    result = coordinator.run(
+        agents=[{"id": "a1", "task": "write a file", "writes": ["notes/"],
+                 "read_only": False}],
+        strategy="map_reduce", rounds=0,
+    )
+    assert result["ok"] is True, result.get("error")
+    assert calls == ["file.write"]
+    agent = result["agents"][0]
+    assert agent["tool_failures"] == 1 and agent["tool_retries"] == 0
+    assert agent["output"] == "reported"
+
+
+def test_leader_gap_analysis_reaches_the_synthesis():
+    class GapGateway(SwarmGateway):
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "Plan a small, focused team" in system:
+                self.calls.append(copy.deepcopy(config))
+                return {"reply": json.dumps({
+                    "strategy": "peer_review", "rounds": 2,
+                    "agents": [
+                        {"id": "a1", "label": "Reader", "role": "reader",
+                         "task": "read the file"},
+                        {"id": "a2", "label": "Checker", "role": "checker",
+                         "task": "check the file"},
+                    ],
+                }), "usage": {}}
+            if "Decide whether another revision round" in system:
+                self.calls.append(copy.deepcopy(config))
+                return {"reply": json.dumps({
+                    "continue": False, "reason": "one gap remains",
+                    "gaps": ["no source for the second claim"],
+                }), "usage": {}}
+            if "Synthesise the members' work" in system:
+                self.calls.append(copy.deepcopy(config))
+                user = config["messages"][-1]["content"]
+                assert "Open gaps from the review decision" in user
+                assert "Success criteria (check each against the answer)" in user
+                return {"reply": json.dumps({
+                    "final": "answer with a caveat", "summary": "done",
+                    "unmet_criteria": ["both files read"], "confidence": 0.6,
+                }), "usage": {}}
+            return super().chat(config)
+
+    gateway = GapGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-gaps", goal="explain x", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        executor=lambda member, tool_id, arguments: ({"content": "hello"}, True),
+        limits=SwarmLimits(max_agents=2, max_steps=4, max_rounds=2, max_seconds=20,
+                           max_messages=40, max_message_chars=200, max_memory_entries=20),
+        criteria="every claim needs evidence",
+    )
+    result = coordinator.run(
+        agents=[{"id": "a1", "task": "read the file"},
+                {"id": "a2", "task": "check the file"}],
+        strategy="peer_review", rounds=2,
+    )
+
+    assert result["ok"] is True, result.get("error")
+    assert result["success_criteria"] == ["every claim needs evidence"]
+    assert result["gaps"] == ["no source for the second claim"]
+    assert result["unmet_criteria"] == ["both files read"]
+    assert any("Unmet success criteria" in warning for warning in result["warnings"])
 
 
 def test_channel_rejects_unknown_recipients_oversize_and_quota():
@@ -452,6 +722,8 @@ def test_pipeline_strategy_hands_each_member_the_previous_work():
     assert result["ok"] is True and result["final"] == "pipeline result"
     assert result["strategy"] == "pipeline"
     assert gateway.saw_previous
+    assert any("pipeline has no dependencies" in warning
+               for warning in result["warnings"])
 
 
 def test_operator_message_is_refused_after_the_swarm_finishes():
@@ -541,19 +813,23 @@ def test_blackboard_starts_with_goal_and_plan_and_shares_results():
 
 
 def test_member_and_review_prompts_include_peer_results():
+    limits = SwarmLimits(max_agents=3, max_steps=4, max_rounds=1, max_seconds=20,
+                         max_messages=40, max_message_chars=200, max_memory_entries=20)
     coordinator = SwarmCoordinator(
         gateway=SwarmGateway(), swarm_id="swarm-digest", goal="understand x",
-        model="fake", tools=[], limits=LIMITS,
+        model="fake", tools=[], limits=limits,
     )
     specs = coordinator._normalise_agents([
         {"id": "a1", "task": "read the file"},
         {"id": "a2", "task": "check the file"},
+        {"id": "a3", "task": "check the logs"},
     ])
     coordinator._build_members(specs)
-    first, second = coordinator._members
+    first, second, third = coordinator._members
     first.output = "the file says hello"
     first.version = 2
     first.score = 4.5
+    third.output = "the logs say goodbye"
 
     member_system = coordinator._member_messages(second, "work", [])[0]["content"]
     assert "Peer results so far" in member_system
@@ -563,7 +839,8 @@ def test_member_and_review_prompts_include_peer_results():
 
     review_system = coordinator._review_messages(second, first, {"focus": "accuracy"}, 1)[0]["content"]
     assert "Peer results (compare the target against them" in review_system
-    assert "the file says hello" in review_system
+    assert "the logs say goodbye" in review_system
+    assert "the file says hello" not in review_system  # the target is shown in full below
     assert "read the file" in review_system
 
 
@@ -663,6 +940,194 @@ def test_a_hung_model_call_cannot_outlive_the_time_budget():
     assert elapsed < 4
     assert [agent["status"] for agent in result["agents"]] == ["failed"]
     assert result["agents"][0]["ended"]
+
+
+def test_a_timed_out_tool_loop_keeps_the_work_already_collected():
+    events = []
+
+    class BusyGateway(SwarmGateway):
+        def chat(self, config):
+            self.calls.append(copy.deepcopy(config))
+            system = config["messages"][0]["content"]
+            user = config["messages"][-1]["content"]
+            if "Plan a small, focused team" in system:
+                return {"reply": json.dumps({
+                    "strategy": "map_reduce", "rounds": 0,
+                    "agents": [
+                        {"id": "a1", "label": "Prod", "role": "reader",
+                         "task": "find the answer"},
+                        {"id": "a2", "label": "Busy", "role": "reader",
+                         "task": "keep looking", "tools": ["file.read"]},
+                    ],
+                }), "usage": {}}
+            if "Synthesise the members' work" in system:
+                final = ("merged: prod finding" if "prod finding" in user else "merged")
+                return {"reply": json.dumps({"final": final, "summary": "done",
+                                             "confidence": 0.5}), "usage": {}}
+            if "You are Prod (a1)" in system:
+                return {"reply": json.dumps({"final": "prod finding"}), "usage": {}}
+            if "You are Busy (a2)" in system:
+                if "Tool budget reached" in user:
+                    return {"reply": json.dumps({"final": "busy partial"}), "usage": {}}
+                return {"reply": json.dumps({
+                    "tool": "file.read", "input": {"path": "x.txt"}}), "usage": {}}
+            return super().chat(config)
+
+    coordinator = SwarmCoordinator(
+        gateway=BusyGateway(), swarm_id="swarm-budget-partial", goal="answer",
+        model="fake", tools=[{"id": "file.read", "type": "file.read"}],
+        limits=SwarmLimits(max_agents=2, max_steps=10, max_rounds=0, max_seconds=10,
+                           max_messages=40, max_message_chars=200),
+        on_event=lambda kind, **fields: events.append(fields)
+        if kind == "swarm_end" else None,
+    )
+
+    def executor(member, tool_id, arguments):
+        if member.get("id") == "a2":
+            # The next round is past the work deadline, but the finish reserve is intact.
+            coordinator.work_deadline = time.monotonic() - 1
+        return {"content": "observation"}, True
+
+    coordinator.executor = executor
+    result = coordinator.run(strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True
+    assert result["timed_out"] is True
+    assert result["assembled"] is False
+    assert "prod finding" in result["final"]
+    assert any("work deadline" in warning for warning in result["warnings"])
+    agents = {item["id"]: item for item in result["agents"]}
+    assert agents["a1"]["status"] == "done"
+    assert agents["a2"]["status"] == "done"
+    assert agents["a2"]["output"] == "busy partial"
+    assert events and events[-1]["timed_out"] is True and events[-1]["ok"] is True
+
+
+def test_a_hung_member_does_not_discard_a_finished_members_work():
+    class OneHungGateway(SwarmGateway):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "Plan a small, focused team" in system:
+                return {"reply": json.dumps({
+                    "strategy": "map_reduce", "rounds": 0,
+                    "agents": [
+                        {"id": "fast", "label": "Fast", "role": "reader",
+                         "task": "answer quickly"},
+                        {"id": "hung", "label": "Hung", "role": "reader",
+                         "task": "answer slowly"},
+                    ],
+                }), "usage": {}}
+            if "Synthesise the members' work" in system:
+                return {"reply": json.dumps({"final": "synthesised"}), "usage": {}}
+            if "You are Fast (fast)" in system:
+                return {"reply": json.dumps({"final": "fast finding"}), "usage": {}}
+            if "You are Hung (hung)" in system:
+                self.release.wait(5)
+                return {"reply": json.dumps({"final": "late"}), "usage": {}}
+            return super().chat(config)
+
+    gateway = OneHungGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-hung-partial", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=2, max_steps=2, max_rounds=0, max_seconds=1,
+                                     max_messages=20, max_message_chars=200),
+        on_event=None,
+    )
+    started = time.monotonic()
+    try:
+        result = coordinator.run(strategy="map_reduce", rounds=0)
+    finally:
+        gateway.release.set()
+    elapsed = time.monotonic() - started
+
+    assert result["ok"] is True
+    assert result["timed_out"] is True
+    assert result["assembled"] is True
+    assert result["final"].startswith("> The time budget ended before the leader")
+    assert "fast finding" in result["final"]
+    agents = {item["id"]: item for item in result["agents"]}
+    assert agents["fast"]["status"] == "done"
+    assert agents["hung"]["status"] == "failed"
+    assert any("continues with the results it has" in warning
+               for warning in result["warnings"])
+    assert elapsed < 4
+
+
+def test_member_tools_are_refused_once_the_work_budget_is_over():
+    called = []
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-tool-deadline", goal="answer", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        executor=lambda *arguments: called.append(arguments) or ({"content": "x"}, True),
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer",
+                         tools=["file.read"])
+    coordinator.work_deadline = time.monotonic() - 1
+
+    reply = coordinator._member_tool(
+        member, {"tool": "file.read", "input": {"path": "x.txt"}}, {}, 1)
+
+    assert "work budget is over" in reply.lower()
+    assert coordinator.timed_out is True
+    assert called == []
+
+
+def test_the_finish_reserve_is_bounded_for_short_and_long_runs():
+    assert _finish_reserve(0) == 0
+    assert _finish_reserve(2) == 1.0
+    assert _finish_reserve(20) == 5.0
+    assert _finish_reserve(300) == 30.0
+    assert _finish_reserve(1000) == 90.0
+    assert _finish_reserve(1800) == 90.0
+
+
+def test_peer_reviews_are_skipped_once_the_work_budget_is_over():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-review-deadline", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1, max_reviews=2),
+    )
+    coordinator.work_deadline = time.monotonic() - 1
+
+    assert coordinator._review_round(1) is False
+    assert coordinator.timed_out is True
+    assert any("reviews were skipped" in warning for warning in coordinator.warnings)
+
+
+def test_a_synthesis_timeout_returns_the_members_work():
+    class SynthesisTimeoutGateway(SwarmGateway):
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "Plan a small, focused team" in system:
+                return {"reply": json.dumps({
+                    "strategy": "map_reduce", "rounds": 0,
+                    "agents": [{"id": "a1", "label": "Reader", "role": "reader",
+                                "task": "answer"}],
+                }), "usage": {}}
+            if "Synthesise the members' work" in system:
+                raise SwarmTimeout("Swarm time budget exhausted")
+            if "You are one member of the swarm" in system:
+                return {"reply": json.dumps({"final": "member answer"}), "usage": {}}
+            return super().chat(config)
+
+    coordinator = SwarmCoordinator(
+        gateway=SynthesisTimeoutGateway(), swarm_id="swarm-synthesis-timeout",
+        goal="answer", model="fake", tools=[],
+        limits=SwarmLimits(max_agents=1, max_steps=2, max_rounds=0, max_seconds=20),
+    )
+    result = coordinator.run(strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True
+    assert result["timed_out"] is True
+    assert result["assembled"] is True
+    assert "member answer" in result["final"]
+    assert "## Reader" in result["final"]
+    assert any("time budget ended before the leader" in warning
+               for warning in result["warnings"])
 
 
 def test_late_worker_events_are_ignored_after_the_run_ends():
@@ -1057,6 +1522,21 @@ def test_a_member_can_be_planned_with_no_tools():
     assert coordinator._members[0].tools == []
 
 
+def test_an_explicit_no_tools_grant_is_not_overridden_by_the_task_text():
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-no-tools-write", goal="write", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"},
+               {"id": "file.write", "type": "file.write"}],
+        allow_write=True, limits=LIMITS,
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "write the report", "tools": ["none"],
+         "writes": ["reports"]},
+    ])
+    coordinator._build_members(specs)
+    assert coordinator._members[0].tools == []
+
+
 def test_os_access_lets_a_writer_use_the_workspace_without_a_scope():
     coordinator = SwarmCoordinator(
         gateway=SwarmGateway(), swarm_id="swarm-os-write", goal="save notes", model="fake",
@@ -1125,11 +1605,11 @@ def test_member_observation_repeats_the_blackboard_only_when_it_changes():
     member = coordinator._members[0]
     coordinator._member_messages(member, "work", [])
 
-    assert "unchanged" in coordinator._member_observation(member, "work")
+    assert "Blackboard" not in coordinator._member_observation(member, "work")
     coordinator._blackboard.write("a1", "finding.new", {"ok": True})
     changed = coordinator._member_observation(member, "work")
-    assert "finding.new" in changed and "unchanged" not in changed
-    assert "unchanged" in coordinator._member_observation(member, "work")
+    assert "finding.new" in changed and "Blackboard now" in changed
+    assert "Blackboard" not in coordinator._member_observation(member, "work")
 
 
 def test_member_prompt_does_not_repeat_shared_results_from_the_blackboard():
@@ -1634,3 +2114,556 @@ def test_the_run_result_and_snapshot_report_context_usage():
     snapshot = coordinator.snapshot()
     assert snapshot["context"]["capacity"] == 40_000
     assert snapshot["context_items"] >= 1
+
+
+def test_peer_digest_ranks_results_against_the_members_task():
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-peer-rank", goal="fix the bug",
+        model="fake", tools=[], limits=SwarmLimits(max_prompt_chars=1_000),
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "trace the retry helper"},
+        {"id": "a2", "task": "check styling"},
+        {"id": "a3", "task": "check the retry backoff"},
+        {"id": "a4", "task": "check docs"},
+        {"id": "a5", "task": "check tests"},
+    ])
+    coordinator._build_members(specs)
+    viewer = coordinator._members[0]
+    coordinator._members[1].output = "CSS variables look consistent."
+    retry = coordinator._members[2]
+    retry.output = "Retry helper lives in backoff.py and retries forever."
+    coordinator._members[3].output = "README describes setup."
+    coordinator._members[4].output = "Suite covers parser."
+
+    digest = coordinator._peer_digest(viewer, limit=2, chars=60)
+    lines = digest.splitlines()
+    assert len(lines) == 2
+    assert "a3" in lines[0] and "retry" in lines[0].lower()
+
+    coordinator._members[4].output = retry.output
+    deduped = coordinator._peer_digest(viewer, limit=4, chars=80)
+    assert deduped.count("Retry helper lives") == 1
+
+
+def test_a_member_recovers_from_an_empty_final():
+    class EmptyFinalGateway(SwarmGateway):
+        def __init__(self):
+            super().__init__()
+            self.empty = False
+
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "You are one member of the swarm" in system:
+                if not self.empty:
+                    self.empty = True
+                    return {"reply": '{"final": ""}', "usage": {}}
+                return {"reply": '{"final": "recovered findings"}', "usage": {}}
+            return super().chat(config)
+
+    events = []
+    coordinator = SwarmCoordinator(
+        gateway=EmptyFinalGateway(), swarm_id="swarm-empty-final", goal="answer",
+        model="fake", tools=[], limits=LIMITS,
+        on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    result = coordinator.run(agents=[{"id": "a1", "task": "answer"}],
+                             strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True, result.get("error")
+    assert result["agents"][0]["output"] == "recovered findings"
+    assert any(kind == "swarm_agent_status" and "empty final" in fields.get("message", "")
+               for kind, fields in events)
+
+
+def test_a_member_recovers_from_an_empty_reply():
+    class EmptyReplyGateway(SwarmGateway):
+        def __init__(self):
+            super().__init__()
+            self.empty = False
+
+        def chat(self, config):
+            system = config["messages"][0]["content"]
+            if "You are one member of the swarm" in system:
+                self.calls.append(copy.deepcopy(config))
+                if not self.empty:
+                    self.empty = True
+                    return {"reply": "", "usage": {}}
+                return {"reply": '{"final": "recovered findings"}', "usage": {}}
+            return super().chat(config)
+
+    gateway = EmptyReplyGateway()
+    events = []
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-empty-reply", goal="answer",
+        model="fake", tools=[], limits=LIMITS,
+        on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    result = coordinator.run(agents=[{"id": "a1", "task": "answer"}],
+                             strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True, result.get("error")
+    assert result["agents"][0]["output"] == "recovered findings"
+    assert any(kind == "swarm_agent_status" and "empty reply" in fields.get("message", "")
+               for kind, fields in events)
+    # The correction turn must not send an empty assistant message: strict
+    # backends reject it, which would turn one bad reply into a failed run.
+    assert gateway.calls
+    for call in gateway.calls:
+        assert all(message["content"] for message in call["messages"]
+                   if message["role"] == "assistant")
+
+
+def test_a_retried_swarm_turn_keeps_native_tools():
+    class RetryGateway:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, config):
+            self.calls.append(copy.deepcopy(config))
+            if len(self.calls) == 1:
+                return {"reply": "", "finish_reason": "length",
+                        "usage": {"completion_tokens": 1}}
+            return {"reply": '{"final": "ok"}', "usage": {}}
+
+    gateway = RetryGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-tools-retry", goal="answer", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"}],
+        limits=SwarmLimits(max_seconds=20),
+    )
+    reply, _usage = coordinator._complete(
+        "fake", [{"role": "user", "content": "read x"}], temperature=0.2,
+        max_tokens=100, label="a1", phase="work", with_tools=True,
+    )
+    assert reply == '{"final": "ok"}'
+    assert len(gateway.calls) == 2
+    assert gateway.calls[0]["tools"] == gateway.calls[1]["tools"]
+    assert [tool["id"] for tool in gateway.calls[1]["tools"]] == ["file.read"]
+
+
+def test_a_context_offset_past_the_end_is_reported_without_charging_the_pool():
+    limits = SwarmLimits(max_prompt_chars=1_000, max_context_chars=5_000,
+                         max_agent_context_chars=5_000, max_context_item_chars=1_000,
+                         max_memory_chars=10_000)
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-offset", goal="answer", model="fake",
+        tools=[], limits=limits,
+    )
+    specs = coordinator._normalise_agents([{"id": "a1", "task": "read"}])
+    coordinator._build_members(specs)
+    member = coordinator._members[0]
+    coordinator._blackboard.write("a1", "finding.short", "abcdef")
+
+    answer = coordinator._member_context(
+        member, {"action": "get", "key": "finding.short", "offset": 999})
+    assert "past the end" in answer and "6 characters" in answer
+    assert coordinator._context_pool.used("a1") == 0
+
+
+def test_review_prompt_shows_the_target_output_once():
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-review-once", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_prompt_chars=2_000),
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "first"},
+        {"id": "a2", "task": "second"},
+        {"id": "a3", "task": "third"},
+    ])
+    coordinator._build_members(specs)
+    target, reviewer = coordinator._members[0], coordinator._members[1]
+    target.output = "UNIQUE TARGET OUTPUT"
+
+    messages = coordinator._review_messages(
+        reviewer, target, {"focus": "accuracy"}, 1)
+    combined = "\n".join(str(item["content"]) for item in messages)
+    assert combined.count("UNIQUE TARGET OUTPUT") == 1
+
+
+def test_a_review_keeps_the_members_work_summary():
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-review-summary", goal="answer",
+        model="fake", tools=[], limits=SwarmLimits(max_prompt_chars=2_000),
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "first"},
+        {"id": "a2", "task": "second"},
+    ])
+    coordinator._build_members(specs)
+    first, second = coordinator._members
+    first.output = "the first result"
+    second.output = "the second result"
+    second.summary = "second work summary"
+
+    coordinator._finish_member(second, "review text", "review", True)
+    assert second.summary == "second work summary"
+
+    coordinator._run_member_review_only(second, first, {"focus": "accuracy"}, 1)
+    assert second.summary == "second work summary"
+
+
+def test_pipeline_prompt_does_not_repeat_a_previous_stage():
+    coordinator = SwarmCoordinator(
+        gateway=SwarmGateway(), swarm_id="swarm-pipeline-once", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_prompt_chars=2_000),
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "first stage"},
+        {"id": "a2", "task": "second stage"},
+    ])
+    coordinator._build_members(specs)
+    coordinator.strategy = "pipeline"
+    first, second = coordinator._members
+    first.output = "STAGE-ONE-OUTPUT"
+
+    system, user = coordinator._member_messages(second, "work", [])
+    assert "STAGE-ONE-OUTPUT" in user["content"]
+    assert "STAGE-ONE-OUTPUT" not in system["content"]
+
+
+def test_run_starts_a_fresh_time_budget_and_accepts_string_usage():
+    class FinalGateway:
+        def chat(self, config):
+            return {"reply": '{"final": "ok"}',
+                    "usage": {"prompt_tokens": "2", "completion_tokens": 1.0}}
+
+    coordinator = SwarmCoordinator(
+        gateway=FinalGateway(), swarm_id="swarm-deadline", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1, max_steps=2, max_rounds=0,
+                                     max_seconds=20, max_reviews=0),
+        dry_run=True,
+    )
+    coordinator.deadline = time.monotonic() - 60  # created long before start
+    result = coordinator.run(agents=[{"id": "a1", "task": "answer"}],
+                             strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True
+    assert result["agents"][0]["output"] == "ok"
+    assert result["agents"][0]["usage"]["prompt_tokens"] == 2
+
+
+def test_native_tools_never_exceed_the_member_grant():
+    class CaptureGateway:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, config):
+            self.calls.append(config)
+            return {"reply": '{"final": "ok"}', "usage": {}}
+
+    gateway = CaptureGateway()
+    coordinator = SwarmCoordinator(
+        gateway=gateway, swarm_id="swarm-tools", goal="answer", model="fake",
+        tools=[{"id": "file.read", "type": "file.read"},
+               {"id": "file.write", "type": "file.write"}],
+        allow_write=True, limits=SwarmLimits(max_agents=1, max_steps=2, max_rounds=0),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer",
+                         tools=["file.read"])
+    messages = [{"role": "user", "content": "go"}]
+
+    coordinator._complete("fake", messages, temperature=0, max_tokens=10, label="a1",
+                          phase="work", member=member, with_tools=True)
+    assert [tool["id"] for tool in gateway.calls[-1]["tools"]] == ["file.read"]
+
+    member.tools = ["file.read", "file.write"]
+    coordinator._complete("fake", messages, temperature=0, max_tokens=10, label="a1",
+                          phase="review", member=member, with_tools=True)
+    assert [tool["id"] for tool in gateway.calls[-1]["tools"]] == ["file.read"]
+
+    member.tools = []
+    coordinator._complete("fake", messages, temperature=0, max_tokens=10, label="a1",
+                          phase="work", member=member, with_tools=True)
+    assert "tools" not in gateway.calls[-1]
+
+
+def test_a_large_streamed_burst_keeps_every_character():
+    class BurstGateway:
+        def stream(self, config, cancel):
+            yield {"type": "delta", "text": "x" * 10_000}
+            yield {"type": "done", "reply": '{"final": "ok"}', "usage": {}}
+
+    events = []
+    coordinator = SwarmCoordinator(
+        gateway=BurstGateway(), swarm_id="swarm-burst", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1, max_steps=1, max_rounds=0),
+        on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer")
+    coordinator._complete("fake", [{"role": "user", "content": "go"}],
+                          temperature=0, max_tokens=20, label="a1", phase="work",
+                          member=member)
+    streamed = "".join(fields.get("text", "") for kind, fields in events
+                       if kind == "swarm_agent_delta")
+    assert streamed == "x" * 10_000
+
+
+def test_absolute_or_escaping_write_scopes_are_rejected():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-scope", goal="answer", model="fake",
+        allow_write=True, limits=SwarmLimits(max_agents=2),
+    )
+    assert coordinator._clean_scope("/etc/passwd") == ""
+    assert coordinator._clean_scope("C:\\secret") == ""
+    assert coordinator._clean_scope("src/../secret") == ""
+    assert coordinator._clean_scope("./src/app.py") == "src/app.py"
+    assert coordinator._clean_scope("*") == "*"
+    specs = coordinator._normalise_agents([
+        {"id": "a1", "task": "write a file", "writes": ["/etc/passwd"]},
+    ])
+    assert specs[0]["writes"] == []
+    assert any("outside the workspace" in warning for warning in coordinator.warnings)
+
+
+def test_compaction_keeps_earlier_context_handles():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-compact", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1, max_prompt_chars=600,
+                           max_context_chars=20_000, max_agent_context_chars=5_000),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer")
+    messages = [{"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "task"}]
+    for _ in range(10):
+        messages += [{"role": "assistant", "content": "a" * 120},
+                     {"role": "user", "content": "u" * 120}]
+    coordinator._compact_messages(messages, member, max_tokens=500)
+    ledger = next(item for item in messages
+                  if str(item["content"]).startswith(COMPACTED_PREFIX))
+    first_handles = CONTEXT_HANDLE.findall(ledger["content"])
+    assert first_handles
+
+    for _ in range(10):
+        messages += [{"role": "assistant", "content": "b" * 120},
+                     {"role": "user", "content": "v" * 120}]
+    coordinator._compact_messages(messages, member, max_tokens=500)
+    ledger = next(item for item in messages
+                  if str(item["content"]).startswith(COMPACTED_PREFIX))
+    assert set(first_handles) <= set(CONTEXT_HANDLE.findall(ledger["content"]))
+
+
+def test_repeated_empty_replies_recover_through_the_wrap_up():
+    class EmptyGateway:
+        def chat(self, config):
+            if "Tool budget reached" in str(config["messages"][-1].get("content") or ""):
+                return {"reply": '{"final": "recovered"}', "usage": {}}
+            return {"reply": "", "usage": {}}
+
+    coordinator = SwarmCoordinator(
+        gateway=EmptyGateway(), swarm_id="swarm-empty-reply", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1, max_steps=3, max_rounds=0,
+                                     max_seconds=20, max_reviews=0),
+        dry_run=True,
+    )
+    result = coordinator.run(agents=[{"id": "a1", "task": "answer"}],
+                             strategy="map_reduce", rounds=0)
+
+    assert result["ok"] is True
+    assert result["agents"][0]["status"] == "done"
+    assert result["agents"][0]["output"] == "recovered"
+    assert any("repeated empty replies" in warning for warning in result["warnings"])
+
+
+def test_empty_replies_never_become_fake_findings():
+    class AlwaysEmpty:
+        def chat(self, config):
+            return {"reply": "", "usage": {}}
+
+    coordinator = SwarmCoordinator(
+        gateway=AlwaysEmpty(), swarm_id="swarm-empty-fallback", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1, max_steps=2, max_rounds=0,
+                                     max_seconds=20, max_reviews=0),
+        dry_run=True,
+    )
+    result = coordinator.run(agents=[{"id": "a1", "task": "answer"}],
+                             strategy="map_reduce", rounds=0)
+    agent = result["agents"][0]
+
+    assert result["ok"] is False
+    assert agent["status"] == "failed"
+    assert "Your reply was empty" not in (agent["output"] or "")
+    assert "Your final answer was empty" not in (agent["output"] or "")
+    assert "No final answer" in (agent["output"] or "")
+
+
+def test_member_ids_cannot_shadow_channel_participants():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-reserved", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=6),
+    )
+    specs = coordinator._normalise_agents([
+        {"id": "leader", "task": "one"},
+        {"id": "all", "task": "two"},
+        {"id": "operator", "task": "three"},
+    ])
+    ids = [spec["id"] for spec in specs]
+    assert len(ids) == 3 and len(set(ids)) == 3
+    assert not set(ids) & RESERVED_MEMBER_IDS
+    assert sum("reserved" in warning for warning in coordinator.warnings) == 3
+
+
+def test_a_context_read_without_an_action_defaults_to_get():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-context-default", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer")
+    handle = coordinator._context_bank.put(member.id, "tool", "stored result", "hello world")
+    reply = coordinator._member_context(member, {"op": "context", "handle": handle})
+    assert "hello world" in reply
+    assert "not supported" not in reply
+
+
+def test_malformed_tool_parameters_do_not_break_the_prompt():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-tool-params", goal="answer", model="fake",
+        tools=[{"id": "file.read", "type": "file.read",
+                "params": ["not-a-field", {"key": "path"}]}],
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer",
+                         tools=["file.read"])
+    assert "Input keys: path" in coordinator._tool_lines(member)
+    specs = coordinator._normalise_agents([
+        {"id": "a2", "task": "read", "tools": [{"id": "file.read"}]},
+    ])
+    assert specs[0]["tools"] == ["file.read"]
+
+
+def test_a_revision_prompt_includes_the_previous_answer():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-revise-prompt", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer",
+                         output="OLD ANSWER", version=2)
+    feedback = [{"reviewer": "a2", "score": 3, "issues": ["missing proof"],
+                 "suggestions": ["cite the source"]}]
+    _system, user = coordinator._member_messages(member, "revise", feedback)
+    assert "OLD ANSWER" in user["content"]
+    assert "missing proof" in user["content"]
+
+
+def test_an_edit_that_changes_a_file_is_recorded_as_changed():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-changed-files", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1),
+    )
+    coordinator._observe_changes({"path": "index.html", "changed": True, "replacements": 2})
+    coordinator._observe_changes({"path": "same.html", "changed": False, "replacements": 0})
+    coordinator._observe_changes({"path": "old.html", "deleted": True})
+    assert coordinator.changed_files == ["index.html", "old.html"]
+
+
+def test_a_parallel_plan_gives_dependents_their_prerequisite_output():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-dependent-prior", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=2),
+    )
+    first = SwarmMember(id="a1", label="A1", role="reader", task="collect",
+                        output="PRIOR RESULT", status="done")
+    dependent = SwarmMember(id="a2", label="A2", role="checker", task="check",
+                            depends_on=["a1"])
+    independent = SwarmMember(id="a3", label="A3", role="reader", task="other")
+    coordinator._members = [first, dependent, independent]
+    coordinator._by_id = {member.id: member for member in coordinator._members}
+    coordinator.strategy = "map_reduce"
+
+    _system, user = coordinator._member_messages(dependent, "work", [])
+    assert "Previous stages to build on" in user["content"]
+    assert "PRIOR RESULT" in user["content"]
+
+    _system, user = coordinator._member_messages(independent, "work", [])
+    assert "PRIOR RESULT" not in user["content"]
+
+
+def test_a_finish_after_cancellation_does_not_rewrite_the_member():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-late-finish", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer",
+                         status="cancelled")
+    coordinator.status = "cancelled"
+    coordinator._finish_member(member, "late output", "work", True)
+    assert member.status == "cancelled" and member.output == ""
+    with pytest.raises(SwarmCancelled):
+        coordinator._check_cancel()
+
+
+def test_a_json_object_without_a_usable_action_gets_a_correction():
+    coordinator = SwarmCoordinator(
+        gateway=None, swarm_id="swarm-empty-action", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer")
+    final, results = coordinator._member_actions(member, "work", {"unexpected": 1}, {}, 1)
+    assert final is None
+    assert results and "no usable action" in results[0]
+
+
+def test_a_truncated_reply_is_reported_in_warnings():
+    class TruncatedGateway:
+        def chat(self, config):
+            return {"reply": '{"final": "partial"}', "finish_reason": "length",
+                    "usage": {"completion_tokens": 20}}
+
+    coordinator = SwarmCoordinator(
+        gateway=TruncatedGateway(), swarm_id="swarm-truncated", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    reply, usage = coordinator._complete(
+        "fake", [{"role": "user", "content": "go"}], temperature=0,
+        max_tokens=20, label="leader", phase="work")
+
+    assert reply == '{"final": "partial"}'
+    assert usage["completion_tokens"] == 40  # both attempts are counted
+    assert any("output limit" in warning for warning in coordinator.warnings)
+
+
+def test_a_truncated_reply_survives_an_empty_retry():
+    class EmptyRetry:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, config):
+            self.calls += 1
+            if self.calls == 1:
+                return {"reply": "partial answer", "finish_reason": "length",
+                        "usage": {"completion_tokens": 20}}
+            return {"reply": "", "usage": {}}
+
+    coordinator = SwarmCoordinator(
+        gateway=EmptyRetry(), swarm_id="swarm-partial-retry", goal="answer", model="fake",
+        limits=SwarmLimits(max_agents=1),
+    )
+    reply, usage = coordinator._complete(
+        "fake", [{"role": "user", "content": "go"}], temperature=0,
+        max_tokens=20, label="a1", phase="work", empty_ok=True)
+
+    assert reply == "partial answer"
+    assert usage["completion_tokens"] == 20
+    assert any("partial reply" in warning for warning in coordinator.warnings)
+
+
+def test_reasoning_chunks_emit_one_status_not_a_flood():
+    class ReasoningGateway:
+        def stream(self, config, cancel):
+            for _ in range(20):
+                yield {"type": "reasoning", "text": "thinking"}
+            yield {"type": "done", "reply": '{"final": "ok"}', "usage": {}}
+
+    events = []
+    coordinator = SwarmCoordinator(
+        gateway=ReasoningGateway(), swarm_id="swarm-reasoning", goal="answer", model="fake",
+        tools=[], limits=SwarmLimits(max_agents=1),
+        on_event=lambda kind, **fields: events.append((kind, fields)),
+    )
+    member = SwarmMember(id="a1", label="A", role="researcher", task="answer")
+    coordinator._complete("fake", [{"role": "user", "content": "go"}],
+                          temperature=0, max_tokens=20, label="a1", phase="work",
+                          member=member)
+    reasoning = [fields for kind, fields in events
+                 if kind == "swarm_agent_status" and "reasoning" in fields.get("message", "")]
+    assert len(reasoning) == 1

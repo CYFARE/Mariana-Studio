@@ -106,6 +106,11 @@
       this.pinned = false;
       this.hover = null;
       this.geometry = null;
+      this._seriesSource = null;
+      this._seriesStage = null;
+      this._seriesValue = null;
+      this._decimated = {};
+      this._gpuFailed = false;
 
       this.title = h("h3", { text: "Training loss" });
       this.stageGroup = h("div", { class: "segmented hidden", role: "group", "aria-label": "Training stage" });
@@ -143,6 +148,9 @@
       if (window.ResizeObserver) new ResizeObserver(() => this.draw()).observe(this.canvas);
       Studio.on("theme", () => this.draw());
       this.refresh();
+      if (Studio.accelerate) {
+        Studio.accelerate.warmup().then(() => this.draw());
+      }
     }
 
     /* metrics: { points: [[stage, step, loss]], validation: [[stage, step, loss]] } */
@@ -164,8 +172,26 @@
     }
 
     series() {
+      if (this._seriesSource === this.metrics && this._seriesStage === this.stage) {
+        return this._seriesValue;
+      }
       const pick = rows => rows.filter(row => row[0] === this.stage).map(row => [row[1], row[2]]);
-      return { training: pick(this.metrics.points), validation: pick(this.metrics.validation) };
+      this._seriesSource = this.metrics;
+      this._seriesStage = this.stage;
+      this._seriesValue = { training: pick(this.metrics.points), validation: pick(this.metrics.validation) };
+      return this._seriesValue;
+    }
+
+    decimateLine(label, points, minStep, maxStep, bins) {
+      const cached = this._decimated[label];
+      if (cached && cached.source === points && cached.bins === bins
+          && cached.minStep === minStep && cached.maxStep === maxStep) {
+        return cached.points;
+      }
+      const next = Studio.accelerate
+        ? Studio.accelerate.decimate(points, minStep, maxStep, bins) : points;
+      this._decimated[label] = { source: points, bins, minStep, maxStep, points: next };
+      return next;
     }
 
     refresh() {
@@ -253,16 +279,29 @@
         training: token("--series-1"), validation: token("--series-2"), grid: token("--chart-grid"),
         text: token("--subtle"), surface: token("--panel"), cursor: token("--border-bright"),
       };
-      const all = training.concat(validation);
-      const steps = all.map(point => point[0]);
-      let minStep = Math.min(...steps);
-      let maxStep = Math.max(...steps);
+      /* One pass avoids the argument limit of Math.min(...array) on long runs. */
+      let minStep = Infinity;
+      let maxStep = -Infinity;
+      let minValue = Infinity;
+      let maxValue = -Infinity;
+      for (const point of training) {
+        if (point[0] < minStep) minStep = point[0];
+        if (point[0] > maxStep) maxStep = point[0];
+        if (point[1] < minValue) minValue = point[1];
+        if (point[1] > maxValue) maxValue = point[1];
+      }
+      for (const point of validation) {
+        if (point[0] < minStep) minStep = point[0];
+        if (point[0] > maxStep) maxStep = point[0];
+        if (point[1] < minValue) minValue = point[1];
+        if (point[1] > maxValue) maxValue = point[1];
+      }
+      if (!Number.isFinite(minStep) || !Number.isFinite(minValue)) return;
       if (minStep === maxStep) {
         minStep -= 1;
         maxStep += 1;
       }
-      const values = all.map(point => point[1]);
-      const ticks = niceTicks(Math.min(...values), Math.max(...values));
+      const ticks = niceTicks(minValue, maxValue);
       const low = ticks[0];
       const high = ticks[ticks.length - 1];
       const plotWidth = width - PADDING.left - PADDING.right;
@@ -271,19 +310,67 @@
       const y = value => PADDING.top + (1 - (value - low) / (high - low)) * plotHeight;
       this.geometry = { x, y, minStep, maxStep, plotWidth, training, validation };
 
+      const bins = Math.max(2, Math.min(8192, Math.floor(plotWidth)));
+      const lineTraining = this.decimateLine("training", training, minStep, maxStep, bins);
+      const lineValidation = validation.length
+        ? this.decimateLine("validation", validation, minStep, maxStep, bins) : validation;
+      const toPixels = points => points.map(point => [x(point[0]), y(point[1])]);
+
+      let gpuCanvas = null;
+      if (Studio.accelerate && !this._gpuFailed) {
+        const commands = ticks.map(tick => ({
+          points: [[PADDING.left, y(tick)], [width - PADDING.right, y(tick)]],
+          color: colors.grid, width: 1,
+        }));
+        commands.push({ points: toPixels(lineTraining), color: colors.training, width: 2 });
+        if (lineValidation.length) {
+          commands.push({ points: toPixels(lineValidation), color: colors.validation, width: 2 });
+        }
+        gpuCanvas = Studio.accelerate.drawGpu(width, height, commands, ratio);
+        if (gpuCanvas) {
+          try {
+            context.drawImage(gpuCanvas, 0, 0, width, height);
+          } catch (error) {
+            this._gpuFailed = true;
+            gpuCanvas = null;
+          }
+        }
+      }
+
+      if (!gpuCanvas) {
+        context.strokeStyle = colors.grid;
+        context.lineWidth = 1;
+        for (const tick of ticks) {
+          const position = Math.round(y(tick)) + 0.5;
+          context.beginPath();
+          context.moveTo(PADDING.left, position);
+          context.lineTo(width - PADDING.right, position);
+          context.stroke();
+        }
+        const line = (points, color) => {
+          context.strokeStyle = color;
+          context.lineWidth = 2;
+          context.lineJoin = "round";
+          context.lineCap = "round";
+          context.beginPath();
+          points.forEach((point, index) => {
+            const px = x(point[0]);
+            const py = y(point[1]);
+            if (index === 0) context.moveTo(px, py);
+            else context.lineTo(px, py);
+          });
+          context.stroke();
+        };
+        line(lineTraining, colors.training);
+        if (lineValidation.length) line(lineValidation, colors.validation);
+      }
+
       context.font = `12px ${token("--font-sans") || "sans-serif"}`;
-      context.lineWidth = 1;
-      context.strokeStyle = colors.grid;
       context.fillStyle = colors.text;
       context.textAlign = "right";
       context.textBaseline = "middle";
       for (const tick of ticks) {
-        const position = Math.round(y(tick)) + 0.5;
-        context.beginPath();
-        context.moveTo(PADDING.left, position);
-        context.lineTo(width - PADDING.right, position);
-        context.stroke();
-        context.fillText(formatLoss(tick), PADDING.left - 8, position);
+        context.fillText(formatLoss(tick), PADDING.left - 8, Math.round(y(tick)) + 0.5);
       }
       context.textBaseline = "top";
       const stepTicks = niceTicks(minStep, maxStep, Math.max(2, Math.min(6, Math.floor(plotWidth / 90))))
@@ -293,18 +380,6 @@
         context.fillText(format.compact(tick), x(tick), height - PADDING.bottom + 8);
       });
 
-      const line = (points, color) => {
-        context.strokeStyle = color;
-        context.lineWidth = 2;
-        context.lineJoin = "round";
-        context.lineCap = "round";
-        context.beginPath();
-        points.forEach((point, index) => {
-          if (index === 0) context.moveTo(x(point[0]), y(point[1]));
-          else context.lineTo(x(point[0]), y(point[1]));
-        });
-        context.stroke();
-      };
       const marker = (point, color, radius = 4) => {
         context.beginPath();
         context.arc(x(point[0]), y(point[1]), radius + 2, 0, Math.PI * 2);
@@ -315,9 +390,6 @@
         context.fillStyle = color;
         context.fill();
       };
-
-      line(training, colors.training);
-      if (validation.length) line(validation, colors.validation);
       if (this.hover !== null && training[this.hover]) {
         const point = training[this.hover];
         const position = Math.round(x(point[0])) + 0.5;

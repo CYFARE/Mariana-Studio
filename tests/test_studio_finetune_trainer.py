@@ -9,7 +9,9 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from mariana.studio.finetune.trainer import TrainerError, compute_loss, load_config
 from tests.helpers import ROOT, make_tiny_transformer
 
 pytest.importorskip("transformers")
@@ -87,6 +89,46 @@ def test_lora_run_reports_progress_and_writes_adapter_and_merged_model(tmp_path,
     with torch.no_grad():
         assert torch.allclose(adapted(tokens).logits, merged, atol=1e-4)
     assert not list(output.parent.glob(".tuned.*"))  # no staging folder is left behind
+
+
+def test_chunked_loss_matches_one_shot_cross_entropy(base):
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(base).eval()
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, 300, (2, 16))
+    labels = input_ids.clone()
+    labels[0, :4] = -100
+    attention = torch.ones_like(input_ids)
+    loss, supervised = compute_loss(
+        model, {"input_ids": input_ids, "attention_mask": attention, "labels": labels},
+        False, torch.device("cpu"), torch.float32, 5)
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention).logits[:, :-1].float()
+    expected = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1),
+        ignore_index=-100, reduction="sum") / supervised
+    assert supervised == int((labels[:, 1:] != -100).sum())
+    assert torch.allclose(loss, expected, atol=1e-4)
+
+
+def test_job_config_accepts_low_vram_settings(tmp_path):
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps({
+        "base": "b", "output": "o", "quantization": "4bit", "auto_memory": False,
+        "max_tokens": 123_456, "parameters": 7_000_000_000,
+    }), encoding="utf-8")
+    config = load_config(str(job))
+    assert config["quantization"] == "4bit" and config["auto_memory"] is False
+    assert config["max_tokens"] == 123_456 and config["parameters"] == 7_000_000_000
+
+    job.write_text(json.dumps({"base": "b", "output": "o", "quantization": "3bit"}), encoding="utf-8")
+    with pytest.raises(TrainerError, match="quantization"):
+        load_config(str(job))
+    job.write_text(json.dumps({"base": "b", "output": "o", "method": "full",
+                               "quantization": "8bit"}), encoding="utf-8")
+    with pytest.raises(TrainerError, match="LoRA"):
+        load_config(str(job))
 
 
 def test_full_and_last_layer_methods(tmp_path, base, corpus):

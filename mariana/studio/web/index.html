@@ -111,7 +111,7 @@
 
     <div class="main">
       <header class="topbar">
-        <button id="shell-menu" class="icon-button menu-button" type="button" aria-label="Open navigation"><svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg></button>
+        <button id="shell-menu" class="icon-button menu-button" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar"><svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg></button>
         <div class="topbar-title">
           <h1 id="shell-title">Mariana Studio</h1>
           <p id="shell-subtitle"></p>
@@ -119,7 +119,7 @@
         <div class="topbar-actions">
           <button id="shell-command" class="command-button" type="button" aria-label="Search and commands"><svg class="icon small" aria-hidden="true"><use href="#i-search"/></svg><span>Search or jump to…</span><kbd id="shell-command-key">Ctrl K</kbd></button>
           <button id="jobs-button" class="icon-button jobs-button" type="button" aria-label="Jobs" aria-haspopup="dialog" aria-expanded="false" title="Jobs"><svg class="icon" aria-hidden="true"><use href="#i-jobs"/></svg><span id="jobs-count" class="jobs-count hidden">0</span></button>
-          <button id="theme-toggle" class="icon-button" type="button" aria-label="Switch colour theme" title="Switch colour theme"><svg class="icon" aria-hidden="true"><use id="theme-icon" href="#i-sun"/></svg></button>
+          <button id="theme-toggle" class="icon-button" type="button" aria-label="Choose colour theme" title="Choose colour theme"><svg class="icon" aria-hidden="true"><use id="theme-icon" href="#i-sun"/></svg></button>
         </div>
       </header>
 
@@ -266,10 +266,12 @@
   <script src="/js/components.js"></script>
   <script src="/js/swarm.js"></script>
   <script src="/js/providers.js"></script>
+  <script src="/js/accelerate.js"></script>
   <script src="/js/training-viz.js"></script>
   <script src="/js/highlight.js"></script>
   <script src="/js/editor.js"></script>
-  <script src="/js/jobs.js"></script>
+  <script src="/js/symbols.js"></script>
+  <script src="/js/jobs.js"></script>""
   <script src="/js/voice.js"></script>
   <script src="/js/dependencies.js"></script>
   <script src="/js/updates.js"></script>

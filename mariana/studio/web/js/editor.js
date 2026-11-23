@@ -152,6 +152,9 @@
     let rendered = { first: -1, last: -1, content: -1, decor: -1, language: "", scrollLeft: -1, scrollTop: -1 };
     let currentLine = 0;
     let brackets = [];
+    // Scrolling repaints the visible range; bracket matching only changes with
+    // the text, grammar or selection, so those three values key the cache.
+    let bracketKey = "";
     let tabMovesFocus = false;
     let languageLabel = String(options.language || "");
     let grammarId = "text";
@@ -160,6 +163,7 @@
       open: false, replace: false, query: "", matches: [], index: -1,
       invalid: false, truncated: false, caseSensitive: false, regex: false, byLine: new Map(),
     };
+    let findTimer = null;
     let findBar = null;
     let findInput = null;
     let findCount = null;
@@ -199,13 +203,20 @@
 
     /* -- line index and lexer checkpoints ------------------------------------ */
 
-    function rebuildIndex() {
+    function rebuildIndex(previous = input.value) {
       const value = input.value;
       const result = [0];
+      let firstDiff = -1;
+      const maximum = Math.min(previous.length, value.length);
       for (let index = 0; index < value.length; index += 1) {
+        if (firstDiff < 0 && index < maximum && value.charCodeAt(index) !== previous.charCodeAt(index)) {
+          firstDiff = index;
+        }
         if (value.charCodeAt(index) === 10) result.push(index + 1);
       }
+      if (firstDiff < 0 && previous.length !== value.length) firstDiff = maximum;
       starts = result;
+      return firstDiff;
     }
 
     function lineCount() {
@@ -267,18 +278,14 @@
       return state;
     }
 
-    function invalidateAfterEdit() {
-      const value = input.value;
-      const previous = lastValue;
-      let prefix = 0;
-      const maximum = Math.min(previous.length, value.length);
-      while (prefix < maximum && previous.charCodeAt(prefix) === value.charCodeAt(prefix)) prefix += 1;
-      if (prefix !== previous.length || prefix !== value.length) {
-        invalidateFrom(lineOf(prefix).index);
+    function applyEdit(previous) {
+      const firstDiff = rebuildIndex(previous);
+      if (firstDiff >= 0) {
+        invalidateFrom(lineOf(firstDiff).index);
         contentVersion += 1;
         gutterDirty = true;
       }
-      lastValue = value;
+      lastValue = input.value;
     }
 
     /* -- measurement, gutter and highlighting -------------------------------- */
@@ -451,6 +458,9 @@
     }
 
     function updateBrackets() {
+      const key = `${contentVersion}:${grammarId}:${input.selectionStart}:${input.selectionEnd}`;
+      if (key === bracketKey) return;
+      bracketKey = key;
       const next = [];
       if (input.selectionStart === input.selectionEnd) {
         const value = input.value;
@@ -547,10 +557,18 @@
       });
     }
 
+    /* Re-measure after a font or zoom change; the cached line height, character
+       width and virtualised window are all invalid then. */
+    function refreshMetrics() {
+      measured = false;
+      gutterDirty = true;
+      rendered.content = -1;
+      paint(true);
+    }
+
     function emitInput() {
-      rebuildIndex();
-      invalidateAfterEdit();
-      if (find.open) refreshFind({ select: false });
+      applyEdit(lastValue);
+      if (find.open) scheduleFindRefresh();
       schedulePaint(false);
       if (!silent && options.onChange) options.onChange(input.value);
     }
@@ -815,6 +833,23 @@
       schedulePaint(false);
     }
 
+    function scheduleFindRefresh() {
+      // Scanning the whole buffer on every keystroke makes typing in a large
+      // file stall; the find bar tolerates one refresh per 120 ms.
+      clearTimeout(findTimer);
+      findTimer = setTimeout(() => {
+        findTimer = null;
+        if (find.open && findInput) refreshFind({ select: false });
+      }, 120);
+    }
+
+    function flushFindRefresh() {
+      if (findTimer === null) return;
+      clearTimeout(findTimer);
+      findTimer = null;
+      if (find.open && findInput) refreshFind({ select: false });
+    }
+
     function refreshFind(settings = {}) {
       if (!find.open || !findInput) return;
       find.query = findInput.value;
@@ -851,6 +886,7 @@
         openFind(false);
         return;
       }
+      flushFindRefresh();
       if (!find.matches.length) {
         refreshFind({ select: false });
         if (!find.matches.length) return;
@@ -878,6 +914,7 @@
 
     function replaceCurrent() {
       if (!find.open || readOnly) return;
+      flushFindRefresh();
       if (find.index < 0 || find.index >= find.matches.length) {
         refreshFind({ select: true });
         if (find.index < 0) return;
@@ -889,7 +926,9 @@
     }
 
     function replaceAll() {
-      if (!find.open || readOnly || !find.matches.length) return;
+      if (!find.open || readOnly) return;
+      flushFindRefresh();
+      if (!find.matches.length) return;
       const value = input.value;
       let cursor = 0;
       let next = "";
@@ -1035,6 +1074,8 @@
 
     function closeFind(restore) {
       find.open = false;
+      clearTimeout(findTimer);
+      findTimer = null;
       find.replace = false;
       find.matches = [];
       find.index = -1;
@@ -1478,6 +1519,7 @@
         paint(true);
       },
       focus() { input.focus(); },
+      refreshMetrics,
       openFind(replace) { openFind(Boolean(replace)); },
       goToLineDialog: goToLinePrompt,
       closeFind(restore) { closeFind(restore !== false); },
@@ -1501,6 +1543,8 @@
       destroy() {
         if (observer) observer.disconnect();
         observer = null;
+        clearTimeout(findTimer);
+        findTimer = null;
         if (typeof window.removeEventListener === "function") window.removeEventListener("resize", onWindowResize);
         if (frame !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
         frame = null;

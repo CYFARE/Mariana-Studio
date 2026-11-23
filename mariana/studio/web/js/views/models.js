@@ -5,6 +5,7 @@
   const { $, h, api, format } = Studio;
   const state = { featured: null, runtimes: {}, endpoints: [], settings: null };
   let tabs;
+  let lastTab = "library";
 
   function refreshCatalog(force = false) {
     if (!Studio.models.loaded) {
@@ -51,6 +52,19 @@
     });
   }
 
+  let libraryTimer = 0;
+  let librarySourceKey = "";
+  let libraryKey = "";
+
+  /* Filter typing used to rebuild every card and the source <select> per key. */
+  function scheduleLibrary() {
+    if (libraryTimer) return;
+    libraryTimer = setTimeout(() => {
+      libraryTimer = 0;
+      renderLibrary();
+    }, 120);
+  }
+
   function renderLibrary() {
     const query = $("models-search").value.trim().toLowerCase();
     const source = $("models-source").value;
@@ -65,16 +79,40 @@
     const totals = new Map();
     for (const entry of Studio.models.list) totals.set(entry.source, (totals.get(entry.source) || 0) + 1);
     const sources = Array.from(new Set(Studio.models.list.map(entry => entry.source)));
-    Studio.ui.selectOptions($("models-source"), [["", `All sources (${Studio.models.list.length})`], ...sources.map(name => {
+    const sourceValues = [["", `All sources (${Studio.models.list.length})`], ...sources.map(name => {
       const entry = Studio.models.list.find(item => item.source === name);
       return [name, `${entry.source_label} (${totals.get(name)})`];
-    })], source);
+    })];
+    const sourceKey = JSON.stringify(sourceValues);
+    if (sourceKey !== librarySourceKey) {
+      librarySourceKey = sourceKey;
+      Studio.ui.selectOptions($("models-source"), sourceValues, source);
+    }
+    const key = `${Studio.models.sequence}|${query}|${source}|${capability}|${entries.length}|${Studio.models.list.length}`;
+    if (key === libraryKey) return;
+    libraryKey = key;
     const list = Studio.ui.render($("models-list"));
     if (!entries.length) {
+      const filtered = Boolean(query || source || capability);
       list.append(h("div", { class: "span-all" }, Studio.ui.empty({
-        icon: "models", title: Studio.models.list.length ? "No models match" : "No models found",
-        text: Studio.models.list.length ? "Clear the filters or refresh discovery." : "Download an open model, add an endpoint, or start Ollama.",
-        actions: [Studio.ui.button("Discover models", { kind: "primary", onclick: () => tabs.select("discover") })],
+        icon: "models",
+        title: filtered ? "No models match" : "No models found",
+        text: filtered
+          ? "Clear the filters to see the whole library again."
+          : "Download an open model, add an endpoint, or start Ollama.",
+        actions: filtered ? [
+          Studio.ui.button("Clear filters", { kind: "primary", onclick: () => {
+            $("models-search").value = "";
+            $("models-source").value = "";
+            $("models-capability").value = "";
+            libraryKey = "";
+            renderLibrary();
+            $("models-search").focus();
+          } }),
+        ] : [
+          Studio.ui.button("Discover models", { kind: "primary", onclick: () => tabs.select("discover") }),
+          Studio.ui.button("Add endpoint", { onclick: () => { tabs.select("endpoints"); endpointDialog(); } }),
+        ],
       })));
       return;
     }
@@ -291,6 +329,7 @@
     glyph: "models", hint: "Local, remote and downloadable models",
     init() {
       tabs = Studio.ui.tabs($("models-tabs"), name => {
+        lastTab = name;
         if (name !== "runtimes") return;
         if (!Object.keys(state.runtimes).length) {
           Studio.ui.render($("runtimes-list"), h("div", { class: "span-all" }, Studio.ui.loading("Detecting model runtimes…")));
@@ -298,7 +337,7 @@
         }
         loadRuntimes().catch(error => Studio.toast(error.message, "error"));
       });
-      $("models-search").addEventListener("input", renderLibrary);
+      $("models-search").addEventListener("input", scheduleLibrary);
       $("models-source").addEventListener("change", renderLibrary);
       $("models-capability").addEventListener("change", renderLibrary);
       $("models-refresh").addEventListener("click", event => Studio.run(async () => {
@@ -311,12 +350,14 @@
       Studio.on("job:download", job => { if (job.status === "completed") refreshCatalog(true); });
     },
     async activate(parameters) {
-      tabs.select(parameters.tab || "library", false);
+      const tab = parameters.tab || lastTab;
+      lastTab = tab;
+      tabs.select(tab, false);
       await Promise.all([
         refreshCatalog(false),
         state.featured ? Promise.resolve() : api("/api/models/featured").then(data => { state.featured = data; renderDiscover(); }),
       ]);
-      if (parameters.tab === "discover") renderDiscover();
+      if (tab === "discover") renderDiscover();
       if (parameters.add === "1") endpointDialog();
     },
   });

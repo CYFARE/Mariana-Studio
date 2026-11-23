@@ -11,6 +11,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import os
+import platform
 import re
 import sys
 import threading
@@ -24,6 +25,7 @@ from .errors import BadRequestError, UnavailableError
 REQUIREMENTS_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_SECONDS = 15.0
 _NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_MARKER = re.compile(r"^(platform_system|sys_platform|os_name)\s*(==|!=)\s*[\"']([^\"']+)[\"']$")
 _EXTERNALLY_MANAGED = (
     "externally-managed-environment",
     "externally managed environment",
@@ -51,6 +53,27 @@ GROUPS = (
 _BY_ID = {group.id: group for group in GROUPS}
 
 
+def _marker_applies(marker: str) -> bool:
+    """Evaluate the simple platform markers used by Mariana's requirements files.
+
+    Unsupported expressions stay installable rather than silently dropping a
+    dependency.  This keeps the status list honest on macOS, where bitsandbytes
+    is intentionally not applicable.
+    """
+    marker = marker.strip()
+    match = _MARKER.fullmatch(marker)
+    if not match:
+        return True
+    subject, operator, expected = match.groups()
+    actual = {
+        "platform_system": platform.system(),
+        "sys_platform": sys.platform,
+        "os_name": os.name,
+    }[subject]
+    same = str(actual).lower() == expected.lower()
+    return same if operator == "==" else not same
+
+
 def _packages(path: Path) -> tuple[list[dict], str]:
     """Parse one requirements file into distributions, or ``( [], error )``."""
     if not path.is_file():
@@ -59,6 +82,9 @@ def _packages(path: Path) -> tuple[list[dict], str]:
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         text = raw.split("#", 1)[0].strip()
         if not text or text.startswith("-"):
+            continue
+        _, separator, marker = text.partition(";")
+        if separator and not _marker_applies(marker):
             continue
         match = _NAME.match(text)
         if not match:

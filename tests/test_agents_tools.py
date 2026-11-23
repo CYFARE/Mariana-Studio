@@ -52,6 +52,51 @@ def test_file_root_override_edits_atomically_and_refuses_ambiguity(tmp_path):
         run(tmp_path, "file.read", {"path": "../outside.txt"})
 
 
+def test_file_edit_refuses_to_corrupt_non_utf8_bytes(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    path = project / "latin1.txt"
+    path.write_bytes(b"caf\xe9\n")
+
+    with pytest.raises(ToolError, match="not UTF-8"):
+        run(tmp_path, "file.edit", {"path": "latin1.txt", "old": "caf", "new": "tea"})
+    assert path.read_bytes() == b"caf\xe9\n"
+
+
+def test_file_read_reports_the_last_included_line_and_the_continuation(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "long.py").write_text(
+        "".join(f"value_{index} = {index}  # " + "x" * 80 + "\n" for index in range(1, 201)),
+        encoding="utf-8",
+    )
+
+    first = run(tmp_path, "file.read", {"path": "long.py"})
+    assert first["start_line"] == 1 and first["total_lines"] == 200
+    assert first["end_line"] == first["content"].count("\n")
+    assert first["end_line"] < 200 and first["truncated"] is True
+    assert first["next_start_line"] == first["end_line"] + 1
+
+    second = run(tmp_path, "file.read", {
+        "path": "long.py", "start_line": first["next_start_line"],
+    })
+    assert second["start_line"] == first["next_start_line"]
+    assert second["end_line"] >= second["start_line"]
+    assert second["content"].startswith(f"value_{second['start_line']} = ")
+
+
+def test_file_read_marks_one_line_that_exceeds_the_character_budget(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "minified.js").write_text("x" * 5_000 + "\n", encoding="utf-8")
+
+    result = run(tmp_path, "file.read", {"path": "minified.js"})
+    assert result["content_cut_midline"] is True
+    assert len(result["content"]) < 5_000
+    assert result["end_line"] == 1 and "next_start_line" not in result
+    assert "hint" in result
+
+
 def test_search_tree_and_manifest_are_scoped(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

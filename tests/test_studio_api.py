@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from mariana.workspace import chat_files_path
 from tests.helpers import (
     mock_provider,
     read_events,
@@ -61,8 +62,10 @@ def test_ide_opens_a_folder_in_place_over_http(api):
 def test_amp_protocol_workflow(api):
     _, base, _ = api
     protocol = request(base + "/api/agents/protocol")
-    assert protocol["protocol"] == "AMP" and protocol["version"] == "1.7"
-    assert protocol["aml_version"] == "1.6"
+    assert protocol["protocol"] == "AMP" and protocol["version"] == "1.10"
+    assert "assistant_delta" in protocol["event_types"]
+    assert "reasoning_delta" in protocol["event_types"]
+    assert protocol["aml_version"] == "1.8"
     assert protocol["tool_calling"]["formats"] == ["json", "dsml", "native"]
     assert "swarm" in protocol["node_types"]
     assert protocol["swarm"]["node_type"] == "swarm"
@@ -225,6 +228,12 @@ def test_conversations_settings_and_browsing(api):
     assert len(request(base + f"/api/chats/{created['id']}", big, method="PUT")["chat"]["messages"]) == 5
     assert request(base + "/api/chats")["chats"][0]["messages"] == 5
     assert request(base + f"/api/chats/{created['id']}")["chat"]["id"] == created["id"]
+    workspace = chat_files_path(root, created["id"], create=True)
+    (workspace / "index.html").write_text("<!DOCTYPE html><title>Hi</title>", encoding="utf-8")
+    preview = request(base + f"/api/chats/{created['id']}/file?path=index.html")["file"]
+    assert preview["kind"] == "text" and preview["content"].startswith("<!DOCTYPE html>")
+    status, error = request_error(base + f"/api/chats/{created['id']}/file?path=../settings.json")
+    assert status == 400 and "outside the conversation workspace" in error["error"]
     assert request(base + f"/api/chats/{created['id']}", method="DELETE")["deleted"] is True
     assert request_error(base + f"/api/chats/{created['id']}")[0] == 404
     assert request_error(base + "/api/chats/..%2F..%2Fsettings")[0] == 404
@@ -368,6 +377,7 @@ def test_system_overview_and_route_index(api):
     index = {(route["method"], route["path"]) for route in routes}
     assert {("POST", "/api/chat/stream"), ("GET", "/api/models"), ("POST", "/api/finetune/start"),
             ("POST", "/api/agents/{id}/runs"), ("POST", "/v1/chat/completions"),
+            ("GET", "/api/chats/{id}/file"),
             ("PUT", "/api/settings"), ("GET", "/api/jobs/events"),
             ("GET", "/api/system/events")} <= index
     assert all(route["summary"] for route in routes), [r for r in routes if not r["summary"]]

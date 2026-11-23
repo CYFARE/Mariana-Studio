@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from mariana.agents import aml
+from mariana.agents import aml, runtime
 from mariana.agents.aml import (
     ExpressionError,
     evaluate_expression,
@@ -45,6 +45,22 @@ class ScriptedGateway:
         self.calls.append(copy.deepcopy(config))  # the runtime keeps appending to its message list
         reply = self.replies.pop(0) if self.replies else '{"final": "script exhausted"}'
         return {"reply": reply, "usage": {"prompt_tokens": 3, "completion_tokens": 2}, "elapsed": 0.01}
+
+
+class FallbackGateway(ScriptedGateway):
+    """Fail one model id and answer normally on the fallback."""
+
+    def __init__(self, broken="primary", reply="backup answer"):
+        super().__init__(models=(broken, "backup"))
+        self.broken = broken
+        self.reply = reply
+
+    def chat(self, config):
+        self.calls.append(copy.deepcopy(config))
+        if config["model"] == self.broken:
+            raise ValueError(f"{self.broken} is offline")
+        return {"reply": self.reply, "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                "elapsed": 0.01}
 
 
 class StreamingGateway(ScriptedGateway):
@@ -149,7 +165,7 @@ def test_templates_and_validation():
     assert "missing ability" in " ".join(validate_agent(bad_ability)["errors"])
     legacy = minimal_agent()
     legacy["aml"] = "1.0"
-    assert validate_agent(legacy)["ok"] and validate_agent(legacy)["agent"]["aml"] == "1.6"
+    assert validate_agent(legacy)["ok"] and validate_agent(legacy)["agent"]["aml"] == "1.8"
 
 
 def test_validation_issues_name_the_node_and_field():
@@ -417,6 +433,222 @@ def test_ai_agent_node_plans_and_batches_tool_calls(tmp_path):
     assert "Tool results:" in gateway.calls[2]["messages"][-1]["content"]
 
 
+def test_ai_agent_node_retries_a_temporary_read_failure(tmp_path, monkeypatch):
+    gateway = ScriptedGateway([
+        '{"tool": "read", "input": {"path": "x.txt"}}',
+        '{"final": "Recovered."}',
+    ])
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("connection timed out")
+        return {"path": "x.txt", "content": "hello"}
+
+    monkeypatch.setattr(runtime, "execute_ability", flaky)
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "solve", "type": "agent", "data": {
+            "abilities": ["read"], "max_iterations": 4,
+        }}, output="{{ nodes.solve.text }}")
+        manager.save_agent(minimal_agent("retrying", nodes=nodes, edges=edges, abilities=[
+            {"id": "read", "type": "file.read"},
+        ]))
+        final = finished(manager, manager.create_run("retrying", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered."
+    assert len(calls) == 2
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert len(results) == 1 and results[0]["attempts"] == 2 and results[0]["ok"] is True
+    assert any(event["type"] == "log" and "Retrying read" in event.get("message", "")
+               for event in final["events"])
+
+
+def test_ai_agent_node_hints_against_identical_repeated_calls(tmp_path, monkeypatch):
+    gateway = ScriptedGateway([
+        '{"tool": "echo", "input": {"value": 1}}',
+        '{"tool": "echo", "input": {"value": 1}}',
+        '{"tool": "echo", "input": {"value": 1}}',
+        '{"final": "Done."}',
+    ])
+    monkeypatch.setattr(runtime, "execute_ability",
+                        lambda *args, **kwargs: {"value": kwargs.get("value", 1)})
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "solve", "type": "agent", "data": {
+            "abilities": ["echo"], "max_iterations": 6,
+        }}, output="{{ nodes.solve.text }}")
+        manager.save_agent(minimal_agent("looping", nodes=nodes, edges=edges, abilities=[
+            {"id": "echo", "type": "math.eval"},
+        ]))
+        final = finished(manager, manager.create_run("looping", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert len(results) == 3
+    assert "repeated the same tool call" in results[-1]["output"]["hint"]
+
+
+def test_a_flow_agent_compacts_old_tool_rounds(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "AGENT_CONTEXT_CHARS", 3_000)
+    monkeypatch.setattr(runtime, "execute_ability",
+                        lambda *args, **kwargs: {"path": "x.txt", "content": "x" * 2_000})
+    gateway = ScriptedGateway([
+        '{"tool": "read", "input": {"path": "x.txt"}}',
+        '{"tool": "read", "input": {"path": "x.txt"}}',
+        '{"tool": "read", "input": {"path": "x.txt"}}',
+        '{"tool": "read", "input": {"path": "x.txt"}}',
+        '{"final": "Done."}',
+    ])
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "solve", "type": "agent", "data": {
+            "abilities": ["read"], "max_iterations": 6,
+        }}, output="{{ nodes.solve.text }}")
+        manager.save_agent(minimal_agent("compacting", nodes=nodes, edges=edges, abilities=[
+            {"id": "read", "type": "file.read"},
+        ]))
+        final = finished(manager, manager.create_run(
+            "compacting", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    messages = gateway.calls[3]["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[2]["content"].startswith(runtime.COMPACTED_AGENT_PREFIX)
+    assert "read" in messages[2]["content"]
+    observations = [item for item in messages
+                    if "Tool result for read" in str(item.get("content"))]
+    assert len(observations) == 2  # the oldest round was replaced by the ledger
+
+
+def test_a_streaming_model_node_emits_live_deltas(tmp_path):
+    class DeltaGateway(ScriptedGateway):
+        def stream(self, config, cancelled=None):
+            self.calls.append(copy.deepcopy(config))
+            yield {"type": "start"}
+            yield {"type": "reasoning", "text": "Planning."}
+            yield {"type": "delta", "text": "Hello "}
+            yield {"type": "delta", "text": "world"}
+            yield {"type": "done", "reply": "Hello world",
+                   "usage": {"prompt_tokens": 2, "completion_tokens": 2}}
+
+    gateway = DeltaGateway()
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "answer", "type": "llm",
+                              "data": {"prompt": "Say hello"}},
+                             output="{{ nodes.answer }}")
+        manager.save_agent(minimal_agent("streaming", nodes=nodes, edges=edges))
+        final = finished(manager, manager.create_run("streaming", {"input": {}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    deltas = [event for event in final["events"] if event["type"] == "assistant_delta"]
+    assert "".join(event["text"] for event in deltas) == "Hello world"
+    assert all(event["node"] == "answer" for event in deltas)
+    reasoning = [event for event in final["events"] if event["type"] == "reasoning_delta"]
+    assert "".join(event["text"] for event in reasoning) == "Planning."
+
+
+def test_ai_agent_node_recovers_from_an_empty_reply(tmp_path):
+    gateway = ScriptedGateway(["", '{"final": "Recovered."}'])
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "answer", "type": "agent",
+                              "data": {"max_iterations": 4}},
+                             output="{{ nodes.answer.text }}")
+        manager.save_agent(minimal_agent("empty-reply", nodes=nodes, edges=edges))
+        final = finished(manager, manager.create_run(
+            "empty-reply", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered."
+    assert any(event["type"] == "log" and "empty reply" in event.get("message", "")
+               for event in final["events"])
+
+
+def test_ai_agent_node_recovers_from_an_empty_final(tmp_path):
+    gateway = ScriptedGateway(['{"final": ""}', '{"final": "Recovered."}'])
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "answer", "type": "agent",
+                              "data": {"max_iterations": 4}},
+                             output="{{ nodes.answer.text }}")
+        manager.save_agent(minimal_agent("empty-final", nodes=nodes, edges=edges))
+        final = finished(manager, manager.create_run(
+            "empty-final", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered."
+    assert any(event["type"] == "log" and "empty answer" in event.get("message", "")
+               for event in final["events"])
+
+
+def test_live_deltas_keep_every_character_of_a_large_burst(tmp_path):
+    text = "x" * 5_000
+
+    class BurstGateway(ScriptedGateway):
+        def stream(self, config, cancelled=None):
+            self.calls.append(copy.deepcopy(config))
+            yield {"type": "delta", "text": text}
+            yield {"type": "done", "reply": text,
+                   "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    manager = AgentManager(tmp_path, BurstGateway())
+    try:
+        nodes, edges = chain({"id": "answer", "type": "llm",
+                              "data": {"prompt": "Write"}},
+                             output="{{ nodes.answer }}")
+        manager.save_agent(minimal_agent("burst", nodes=nodes, edges=edges))
+        final = finished(manager, manager.create_run("burst", {"input": {}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    deltas = [event for event in final["events"] if event["type"] == "assistant_delta"]
+    assert len(deltas) == 2
+    assert "".join(event["text"] for event in deltas) == text
+
+
+def test_ai_agent_node_repairs_a_malformed_action(tmp_path):
+    gateway = ScriptedGateway([
+        'I will call the clock: ```json\n{"tool": clock, "input": {}}\n```',
+        '{"final": "Recovered."}',
+    ])
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({"id": "solve", "type": "agent", "data": {
+            "abilities": ["clock"], "max_iterations": 4,
+        }}, output="{{ nodes.solve.text }}")
+        manager.save_agent(minimal_agent("repairing", nodes=nodes, edges=edges, abilities=[
+            {"id": "clock", "type": "time.now"},
+        ]))
+        final = finished(manager, manager.create_run(
+            "repairing", {"input": {"message": "go"}})["id"])
+    finally:
+        manager.close()
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered."
+    assert len(gateway.calls) == 2
+    assert "did not contain a tool call" in gateway.calls[1]["messages"][-1]["content"]
+    assert any(event["type"] == "log" and "empty" in event.get("message", "")
+               for event in final["events"])
+
+
 def test_ai_agent_node_plain_answers_exhaustion_and_test_mode(tmp_path):
     def run_with(replies, **payload):
         gateway = ScriptedGateway(replies)
@@ -493,6 +725,126 @@ def test_llm_json_format_fails_with_an_actionable_error(tmp_path):
     assert "asked for JSON" in final["error"] and "format to text" in final["error"]
 
 
+def test_assert_node_blocks_a_false_contract(tmp_path):
+    manager = AgentManager(tmp_path, ScriptedGateway())
+    try:
+        nodes, edges = chain(
+            {"id": "check", "type": "assert", "data": {
+                "expression": "contains(input.message, 'ok')",
+                "message": "Message must contain ok; expression was {{ expression }}",
+            }},
+            output="{{ input.message }}",
+        )
+        manager.save_agent(minimal_agent("guard", nodes=nodes, edges=edges))
+        bad = finished(manager, manager.create_run(
+            "guard", {"input": {"message": "nope"}})["id"])
+        good = finished(manager, manager.create_run(
+            "guard", {"input": {"message": "ok"}})["id"])
+    finally:
+        manager.close()
+
+    assert bad["status"] == "failed"
+    assert "Assertion failed at check" in bad["error"]
+    assert "Message must contain ok" in bad["error"]
+    assert good["status"] == "completed" and good["output"] == "ok"
+
+    broken = minimal_agent("broken-assert", nodes=[
+        {"id": "start", "type": "start"},
+        {"id": "check", "type": "assert", "data": {"expression": "contains("}},
+        {"id": "end", "type": "end"},
+    ], edges=[{"from": "start", "to": "check"}, {"from": "check", "to": "end"}])
+    result = validate_agent(broken)
+    assert result["ok"] is False
+    assert any(issue["field"] == "expression" for issue in result["issues"])
+
+
+def test_validate_node_reports_schema_paths_and_warn_mode(tmp_path):
+    schema = {
+        "type": "object", "required": ["title", "items"],
+        "properties": {
+            "title": {"type": "string", "minLength": 3},
+            "items": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    }
+
+    def document(agent_id, payload, mode="fail"):
+        nodes, edges = chain(
+            {"id": "data", "type": "transform", "data": {
+                "template": payload, "format": "json",
+            }},
+            {"id": "check", "type": "validate", "data": {
+                "target": "{{ nodes.data.value }}", "schema": schema, "mode": mode,
+            }},
+            output="{{ nodes.check.valid }}",
+        )
+        return minimal_agent(agent_id, nodes=nodes, edges=edges)
+
+    manager = AgentManager(tmp_path, ScriptedGateway())
+    try:
+        manager.save_agent(document("valid-json", '{"title":"Report","items":["a"]}'))
+        good = finished(manager, manager.create_run("valid-json", {})["id"])
+
+        manager.save_agent(document("bad-json", '{"title":"Report"}'))
+        bad = finished(manager, manager.create_run("bad-json", {})["id"])
+
+        manager.save_agent(document("warn-json", '{"title":"Report"}', mode="warn"))
+        warned = finished(manager, manager.create_run("warn-json", {})["id"])
+    finally:
+        manager.close()
+
+    assert good["status"] == "completed" and good["output"] is True
+    assert bad["status"] == "failed"
+    assert "missing required property 'items'" in bad["error"]
+    assert warned["status"] == "completed" and warned["output"] is False
+    validation = [event for event in warned["events"] if event["type"] == "validation"]
+    assert validation and validation[0]["ok"] is False and validation[0]["mode"] == "warn"
+
+    unsupported = document("unsupported-schema", '{"title":"Report"}')
+    unsupported["nodes"][2]["data"]["schema"] = {"type": "object", "$ref": "#/x"}
+    result = validate_agent(unsupported)
+    assert result["ok"] is False
+    assert "unsupported keyword" in " ".join(result["errors"])
+
+
+def test_llm_and_agent_nodes_fall_back_when_the_primary_model_fails(tmp_path):
+    gateway = FallbackGateway(reply="backup answer")
+    manager = AgentManager(tmp_path, gateway)
+    try:
+        nodes, edges = chain({
+            "id": "think", "type": "llm",
+            "data": {"model": "primary", "fallback_model": "backup", "prompt": "go"},
+        }, output="{{ nodes.think.text }}")
+        manager.save_agent(minimal_agent("fallback-llm", nodes=nodes, edges=edges))
+        llm = finished(manager, manager.create_run("fallback-llm", {})["id"])
+
+        nodes, edges = chain({
+            "id": "think", "type": "agent",
+            "data": {"model": "primary", "fallback_model": "backup", "goal": "answer"},
+        }, output="{{ nodes.think.text }}")
+        manager.save_agent(minimal_agent("fallback-agent", nodes=nodes, edges=edges))
+        agent = finished(manager, manager.create_run("fallback-agent", {})["id"])
+    finally:
+        manager.close()
+
+    assert llm["status"] == "completed" and llm["output"] == "backup answer"
+    assert agent["status"] == "completed" and agent["output"] == "backup answer"
+    models = [call["model"] for call in gateway.calls]
+    assert models[0] == "primary" and models[1] == "backup"
+    logs = [event.get("message", "") for event in llm["events"] if event["type"] == "log"]
+    assert any("falling back to backup" in message for message in logs)
+    assert any(call["model"] == "backup" for call in gateway.calls)
+
+    same = minimal_agent("same-fallback", nodes=[
+        {"id": "start", "type": "start"},
+        {"id": "think", "type": "llm", "data": {
+            "model": "primary", "fallback_model": "primary", "prompt": "go"}},
+        {"id": "end", "type": "end"},
+    ], edges=[{"from": "start", "to": "think"}, {"from": "think", "to": "end"}])
+    assert any("same as its main model" in warning
+               for warning in validate_agent(same)["warnings"])
+
+
 def test_initial_variables_are_available_before_the_first_node(manager):
     agent = minimal_agent("vars")
     agent["vars"] = {"greeting": "hi", "count": 2, "nested": {"enabled": True}}
@@ -542,6 +894,32 @@ def test_finish_is_idempotent_so_a_late_reply_cannot_reopen_a_run():
     run.finish("cancelled", error="stop")
     run.finish("completed", output="late")
     assert run.status == "cancelled" and run.output is None
+
+
+def test_a_waiter_never_sees_finished_without_the_terminal_event():
+    run = LiveRun("run-terminal", minimal_agent(), {})
+    run.start()
+    seen: list[str] = []
+    done = threading.Event()
+
+    def watch():
+        while True:
+            pending, finished = run.wait_events(0, timeout=5)
+            seen.extend(event["type"] for event in pending)
+            if finished:
+                done.set()
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    run.finish("completed", output="done")
+
+    assert done.wait(5)
+    watcher.join(5)
+    assert seen[-1] == "run_completed"
+    # A late worker event must not land after the terminal event either.
+    run.event("log", message="late worker")
+    assert [event["type"] for event in run.snapshot()["events"]][-1] == "run_completed"
 
 
 def test_cancel_stops_a_streaming_model_call(tmp_path):
@@ -795,7 +1173,12 @@ def test_swarm_node_validates_and_runs_in_test_mode(manager):
             {"id": "start", "type": "start"},
             {"id": "team", "type": "swarm", "data": {
                 "goal": "{{ input.message }}", "strategy": "peer_review", "rounds": 1,
-                "agents": [{"task": "read the sandbox"}],
+                "criteria": "read the file\ncite the path", "effort": "high",
+                "reflection": False,
+                "agents": [{"id": "reader", "task": "read the sandbox",
+                            "depends_on": [], "plan": ["open the file"]},
+                           {"id": "checker", "task": "check the reader",
+                            "depends_on": ["reader"]}],
             }},
             {"id": "end", "type": "end", "data": {"output": "{{ nodes.team.text }}"}},
         ],
@@ -816,16 +1199,20 @@ def test_swarm_node_validates_and_runs_in_test_mode(manager):
     assert final["output"] == "[test mode] hello"
     swarm = manager.get_swarm(run["id"])
     assert swarm["status"] == "completed" and swarm["strategy"] == "peer_review"
+    assert swarm["success_criteria"] == ["read the file", "cite the path"]
+    assert final["output"] and final["nodes"]["team"] == "ok"
     with pytest.raises(ValueError, match="not active"):
         manager.inject_swarm_message(run["id"], {"text": "stop"})
 
 
 def test_protocol_metadata_is_complete_for_the_designer(manager):
     protocol = manager.protocol_metadata()
-    assert protocol["protocol"] == "AMP" and protocol["version"] == "1.7"
-    assert protocol["aml_version"] == "1.6"
+    assert protocol["protocol"] == "AMP" and protocol["version"] == "1.10"
+    assert protocol["aml_version"] == "1.8"
     assert protocol["tool_calling"]["formats"] == ["json", "dsml", "native"]
     assert "openai-compatible" in protocol["tool_calling"]["native_backends"]
+    assert "validation" in protocol["event_types"]
+    assert "model_fallback" in protocol["guardrails"]
     assert set(protocol["node_types"]) == set(aml.NODE_TYPES) >= {"agent", "human", "foreach", "swarm"}
     allowed = set(protocol["field_types"])
     for name, node in protocol["node_types"].items():
@@ -853,6 +1240,13 @@ def test_protocol_metadata_is_complete_for_the_designer(manager):
     assert "peer_review" in swarm["strategies"] and "message" in swarm["message_kinds"]
     assert {"plan", "say", "memory", "review", "final"} <= set(swarm["member_protocol"])
     assert {"swarm_start", "swarm_review", "swarm_message"} <= set(protocol["event_types"])
+    assert "swarm_agent_plan" in protocol["event_types"]
+    assert "retries" in swarm["reliability"] and "plan_check" in swarm["reliability"]
+    assert "depends_on" in swarm["leader_protocol"]["plan"]
+    assert "success_criteria" in swarm["leader_protocol"]["plan"]
+    defaults = protocol["node_types"]["swarm"]["defaults"]
+    assert defaults["criteria"] == "" and defaults["reflection"] is True
+    assert defaults["effort"] == ""
     assert {"/api/agents/runs/{run_id}/swarm",
             "/api/agents/runs/{run_id}/swarm/messages"} <= paths
 

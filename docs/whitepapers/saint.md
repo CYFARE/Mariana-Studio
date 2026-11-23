@@ -1,6 +1,6 @@
 # SAINT: structured, adaptive, hierarchical, reinforced thought
 
-**Whitepaper · Mariana v2.3.1 · 2026-11-20**
+**Whitepaper · Mariana v2.3.2 · 2026-11-20**
 
 | | |
 | --- | --- |
@@ -474,7 +474,7 @@ ablations needed to test whether the structure actually helps.
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.1},
+  version     = {2.3.2},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/saint.md}
 }
 ```

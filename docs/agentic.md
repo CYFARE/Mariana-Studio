@@ -7,9 +7,9 @@
 Mariana Studio's **Agents** workspace is a visual and programmatic automation suite.
 It has two public specifications:
 
-- [Agent Management Language (AML) v1.6](../mariana/agents/specs/AML.md) — the
+- [Agent Management Language (AML) v1.8](../mariana/agents/specs/AML.md) — the
   portable agent/flow document.
-- [Agent Management Protocol (AMP) v1.7](../mariana/agents/specs/AMP.md) — the
+- [Agent Management Protocol (AMP) v1.10](../mariana/agents/specs/AMP.md) — the
   HTTP/JSON protocol for creating, validating, running, testing, debugging and
   scheduling AML agents.
 
@@ -57,10 +57,61 @@ agents, steps, rounds, time, messages, shared memory, write access and the
 run-wide context pool (`max_context_chars`, `max_agent_context_chars`,
 `max_context_item_chars`) for every swarm in that document. Members borrow from
 that pool when they need more of a long file or a peer result, and long content
-remains readable behind `ctx-…` handles after compaction. A member that is still
+remains readable behind `ctx-…` handles after compaction. A request is charged
+only for the slice it actually returns, and an offset at or past the end is
+reported without touching the pool. Peer digests are ranked against the member's
+own task, identical results are sent once, and a result already shown in full (a
+review target, or an earlier pipeline stage) is not repeated. A review records
+its own feedback and keeps the member's work summary. A member that is still
 researching when it reaches its step budget gets one bounded extension, so a long
 coding or news task is not cut off mid-search; the run's time budget still caps
 the work.
+
+The swarm inspector also exposes **Acceptance criteria**, **Reasoning effort**
+and **Self-check unfinished plans**. The leader derives testable criteria when
+none are supplied, gives every member a short plan, and may order members with
+`depends_on`; independent members run together while dependent waves wait.
+Members update their plans as they work, and a member that tries to finish with
+open steps gets one chance to complete or justify them. After a review round the
+leader reports open gaps, which feed the next revision and the synthesis. The
+swarm card shows each plan, the criteria and any gap that remained. When a run
+ends without a leader synthesis (the time budget or a leader failure), Chat
+replies with a compact report instead of the raw member hand-offs: the outcome,
+one headline per agent that delivered, the agents that did not finish, and a
+pointer to the card. The card keeps every full hand-off behind its agent row and
+lists run notes in a collapsible section. Files a swarm writes are added to
+Chat's preview panel; when automatic previews are on, the last previewable file
+opens as soon as the run finishes, so a built page, design or image is visible
+without selecting it by hand.
+
+Tool calls are reliability-checked in `agent`, `swarm` and the IDE coding loop.
+A read-only failure that looks temporary (timeout, connection reset, rate limit,
+5xx) is retried once; writes are never retried. Deterministic failures come
+back with a short recovery hint, an unknown tool id gets a closest-match
+suggestion, and a third identical call is called out explicitly. These rules are
+published under `swarm.reliability` in AMP discovery.
+
+An `agent` node keeps its own history bounded. After about 24,000 characters it
+replaces the oldest tool rounds with a ledger naming the tools already called and
+keeps the goal and newest observations verbatim. An empty reply gets a
+correction turn. A reply that looks like an action but cannot be parsed, or a
+JSON object with no tool call, plan or final answer (including an empty
+`{"final": ""}`), gets up to two correction turns instead of being returned as
+the answer. Correction turns never append an empty assistant message, so a
+strict provider does not reject the retry.
+
+Run events are ordered. The terminal `run_<status>` event is appended under the
+same lock that flips the final status, so a client that sees the run finish also
+sees its terminal event, and late worker events are dropped instead of landing
+after it.
+
+Streaming `llm` and `agent` nodes publish coalesced `assistant_delta` and
+`reasoning_delta` events (AMP 1.10). The Agents **Run & events** panel uses them
+for its **Live output** pane, hides token deltas from the event log by default,
+and keeps the full JSON behind each row's **Details** disclosure. The same
+deltas feed a one-line live preview on the flow canvas node and the swarm card,
+with character count, streaming rate and first-delta latency. Chat uses the same
+affordances for its live turn row and reasoning panel.
 
 The **New agent** button offers the short starting paths: describe the agent in
 plain language, use a working template, import AML, or start blank. The same
@@ -108,6 +159,7 @@ An agent is a directed flowchart:
 
 - exactly one `start` node and at least one `end` node;
 - `llm`, `agent` (an LLM that picks abilities itself), `tool`, `condition`,
+  `assert` (a guardrail), `validate` (structured-output schema check),
   `transform`, `delay`, `human` (approval or input), `subagent`, `foreach`,
   `memory`, and `note` nodes;
 - edges with an optional `true` / `false` branch;
@@ -115,12 +167,24 @@ An agent is a directed flowchart:
   SQLite, CSV/TSV, Git inspection, memory, math, time, diagnostics, and opt-in
   shell);
 - optional top-level `vars` for initial values and `format: "json"` on `llm`
-  nodes for parsed structured replies;
+  nodes for parsed structured replies; `fallback_model` on `llm` and `agent`
+  nodes keeps a run alive when a provider fails;
 - a durable schedule (`interval`, `cron`, or `once`).
 
 Runs, run events, memory, sandbox files, and schedule state live in
 `agent-workspace/`. Add that directory to backups if you want to preserve
 automations.
+
+**Guardrails.** An `assert` node evaluates the same safe expression language as
+a condition and fails the run with an explicit message when the expression is
+false. A `validate` node checks the previous output (or a rendered target)
+against a documented JSON Schema subset — types, required fields, properties,
+arrays, enums, numeric/length bounds, patterns and `anyOf` — and can either
+stop the node or continue in warn mode with `valid` and `errors` available to a
+condition. Unknown schema keywords are rejected instead of silently ignored.
+Both are read-only and work in dry-run mode, so a flow can be tested without
+side effects. `llm` and `agent` nodes may also set `fallback_model`; a provider
+failure is logged and the call is retried on the fallback model.
 
 While a run is active, `GET /api/agents/runs/{run_id}/events?since=<seq>` streams
 complete snapshots as server-sent events. The Agents view uses it; a script can

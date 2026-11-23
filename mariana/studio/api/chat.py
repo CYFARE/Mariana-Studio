@@ -89,6 +89,12 @@ def read_chat(app, request):
     return {"chat": app.chats.get(request.params["id"])}
 
 
+@router.get("/api/chats/{id}/file")
+def read_chat_file(app, request):
+    """Read a file the conversation workspace holds, for the preview panel."""
+    return {"file": app.chat_swarm.read_file(request.params["id"], request.arg("path"))}
+
+
 @router.put("/api/chats/{id}")
 def update_chat(app, request):
     """Replace the given fields of a conversation."""

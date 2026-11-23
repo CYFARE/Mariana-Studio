@@ -12,7 +12,7 @@ authors:
   - name: "Mariana contributors"
 repository-code: "https://github.com/CYFARE/Mariana"
 license: AGPL-3.0-only
-version: "2.3.1"
+version: "2.3.2"
 keywords:
   - language-model
   - diffusion

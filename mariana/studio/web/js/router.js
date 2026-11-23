@@ -83,6 +83,11 @@
       $("shell-subtitle").textContent = view.subtitle || "";
       document.title = view.title ? `${view.title} · Mariana Studio` : "Mariana Studio";
       $("app").classList.remove("menu-open");
+      const menu = $("shell-menu");
+      if (menu) {
+        menu.setAttribute("aria-expanded", "false");
+        menu.setAttribute("aria-label", "Open navigation");
+      }
 
       try {
         if (!view.ready) {

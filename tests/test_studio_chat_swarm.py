@@ -13,11 +13,16 @@ from mariana.studio.chat_swarm import (
     WEB_TOOLS,
     WRITE_TOOLS,
     ChatSwarm,
+    _digest,
+    _done,
     _event_value,
     _executor,
+    _reply_text,
+    _summary,
     _tool_definitions,
 )
-from mariana.studio.errors import BadRequestError, ConflictError
+from mariana.studio.errors import BadRequestError, ConflictError, NotFoundError
+from mariana.workspace import chat_files_path
 from tests.test_agents_swarm import SwarmGateway
 
 
@@ -55,6 +60,111 @@ def chat_config(**overrides) -> dict:
         "system_prompt": "Be concise.",
     }
     return {**config, **overrides}
+
+
+def assembled_result() -> dict:
+    """A timed-out swarm whose leader never synthesised; members wrote raw hand-offs."""
+    return {
+        "ok": True,
+        "assembled": True,
+        "timed_out": True,
+        "final": "> The time budget ended before the leader could synthesise this run.\n\n"
+                 "## Feed Collector\n\n" + "raw hand-off " * 500,
+        "agents": [
+            {"id": "feeds", "label": "Feed Collector", "status": "done",
+             "output": ("RETRIEVAL RESULT — India headlines, 22 Nov 2026 (IST).\n\n"
+                        "TOP CANDIDATES (ranked by significance):\n\n"
+                        "    Hyderabad on high alert after an email warns of attacks\n"
+                        "        Hindustan Times — https://example.test/a\n")},
+            {"id": "web", "label": "Web Collector", "status": "done",
+             "output": ("PATHS USED\n\nTOP 5 (ranked by significance)\n\n"
+                        "    1. Rahul Gandhi calls RSS-BJP 'greedy, casteist male "
+                        "chauvinists'; BJP says 'Don't need lectures' — Times Now, "
+                        "22 Nov 2026 22:50 IST.\n")},
+            {"id": "verify", "label": "Verifier & Ranker", "status": "failed",
+             "output": "", "error": "Work budget exhausted before completion"},
+        ],
+    }
+
+
+def test_an_assembled_swarm_reply_is_a_readable_report(tmp_path):
+    result = assembled_result()
+    summary = _summary(result)
+    request = ChatSwarm(tmp_path, ChatGateway()).prepare(chat_config())
+    payload = _done(request, result, summary)
+    reply = payload["reply"]
+
+    assert summary["assembled"] is True
+    assert reply.startswith("**Time limit reached.** 2 of 3 agents delivered findings "
+                            "before the deadline; the leader ran out of time")
+    assert "**Delivered**" in reply
+    assert "**Feed Collector** — Hyderabad on high alert after an email warns of attacks" in reply
+    assert "**Web Collector** — Rahul Gandhi calls RSS-BJP" in reply
+    assert "Times Now" not in reply
+    assert "**Not delivered**" in reply
+    assert "**Verifier & Ranker** — Work budget exhausted before completion" in reply
+    assert "agent card below" in reply and "Research depth" in reply
+    assert len(reply) < 1_500
+    assert "notice" not in payload
+
+
+def test_a_synthesised_reply_is_used_unchanged():
+    assert _reply_text({"final": "merged answer", "assembled": False}) == "merged answer"
+    assert _reply_text({"final": "", "assembled": False}) == "The swarm produced no output."
+
+
+def test_the_handoff_digest_prefers_a_headline():
+    assert _digest("") == ""
+    assert _digest("A short finding.\n\nMore detail.") == "A short finding."
+    assert _digest("## Findings\n\n- The first result\n- A second result") == "The first result"
+    assert _digest("TOP 3\n\n1. A headline long enough to be useful — Source, 22 Nov") == (
+        "A headline long enough to be useful")
+
+
+def test_conversation_workspace_files_can_be_previewed(tmp_path):
+    service = ChatSwarm(tmp_path, ChatGateway())
+    workspace = chat_files_path(tmp_path, "chat-abcdef", create=True)
+    (workspace / "index.html").write_text(
+        "<!DOCTYPE html><title>Home</title><style>body{color:#111}</style>", encoding="utf-8")
+    (workspace / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+    (workspace / "data.bin").write_bytes(b"\x00\x01\x02")
+    (workspace / "long.txt").write_text("x" * 250_000, encoding="utf-8")
+
+    page = service.read_file("chat-abcdef", "index.html")
+    assert page["name"] == "index.html" and page["kind"] == "text"
+    assert page["language"] == "html" and page["mime"] == "text/html"
+    assert page["content"].startswith("<!DOCTYPE html>") and page["truncated"] is False
+    assert isinstance(page["version"], int) and page["version"] > 0
+
+    image = service.read_file("chat-abcdef", "photo.png")
+    assert image["kind"] == "image"
+    assert image["data_url"].startswith("data:image/png;base64,")
+
+    long_file = service.read_file("chat-abcdef", "long.txt")
+    assert len(long_file["content"]) == 200_000 and long_file["truncated"] is True
+
+    with pytest.raises(BadRequestError, match="binary"):
+        service.read_file("chat-abcdef", "data.bin")
+    with pytest.raises(BadRequestError, match="outside the conversation workspace"):
+        service.read_file("chat-abcdef", "../secret.txt")
+    with pytest.raises(BadRequestError, match="Invalid conversation id"):
+        service.read_file("../etc", "passwd")
+    with pytest.raises(NotFoundError, match="no workspace files"):
+        service.read_file("chat-zzzzzz", "index.html")
+    with pytest.raises(NotFoundError, match="File not found"):
+        service.read_file("chat-abcdef", "missing.html")
+
+
+def test_a_synthesised_run_keeps_one_short_note(tmp_path):
+    request = ChatSwarm(tmp_path, ChatGateway()).prepare(chat_config())
+    summary = {"warnings": ["first warning", "second warning"],
+               "changed_files": ["a.py"]}
+    payload = _done(request, {"final": "answer", "assembled": False}, summary)
+    assert payload["notice"] == "first warning (+1 more in the agent card) · Files changed: a.py"
+
+    assembled = _done(request, {"final": "raw", "assembled": True, "timed_out": True},
+                      {"warnings": ["late"], "changed_files": []})
+    assert "notice" not in assembled
 
 
 def test_sse_payloads_are_finite_and_bounded():
@@ -100,7 +210,7 @@ def test_prepare_validates_and_bounds_a_chat_swarm(tmp_path):
         ({"messages": "nope"}, "messages must be a list"),
         ({"strategy": "magic"}, "strategy must be one of"),
         ({"max_agents": 99}, "max_agents must be between 1 and 6"),
-        ({"max_steps": 0}, "max_steps must be between 1 and 12"),
+        ({"max_steps": 0}, "max_steps must be between 1 and 24"),
         ({"rounds": 3}, "rounds must be between 0 and 2"),
         ({"max_seconds": 5}, "max_seconds must be between"),
         ({"leader_model": "missing"}, "Model not found"),
@@ -112,6 +222,15 @@ def test_prepare_validates_and_bounds_a_chat_swarm(tmp_path):
 
     leader = service.prepare(chat_config(leader_model="leader"))
     assert leader.leader_model == "leader"
+
+    extended = service.prepare(chat_config(max_seconds=1800, max_steps=24))
+    assert extended.limits.max_seconds == 1800.0 and extended.limits.max_steps == 24
+    for patch, message in (
+        ({"max_seconds": 1801}, "max_seconds must be between"),
+        ({"max_steps": 25}, "max_steps must be between"),
+    ):
+        with pytest.raises(BadRequestError, match=message):
+            service.prepare({**chat_config(), **patch})
 
 
 def test_stream_runs_a_tool_less_swarm_and_ends_with_the_synthesis(tmp_path):

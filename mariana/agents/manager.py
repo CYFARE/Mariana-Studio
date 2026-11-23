@@ -569,7 +569,7 @@ class AgentManager:
     def protocol_metadata(self) -> dict:
         return {
             "protocol": "AMP",
-            "version": "1.7",
+            "version": "1.10",
             "aml_version": aml.AML_VERSION,
             "tool_calling": {
                 "formats": ["json", "dsml", "native"],
@@ -577,6 +577,12 @@ class AgentManager:
                 "fallback": "prompted JSON",
                 "note": ("Every format uses the same allow-list, sandbox and "
                          "tool_call/tool_result events."),
+            },
+            "guardrails": {
+                "assert": "A safe expression must be true; message explains the failure.",
+                "validate": "A bounded JSON schema subset validates structured output; "
+                            "mode fail stops the node, mode warn exposes valid/errors.",
+                "model_fallback": "llm and agent nodes accept fallback_model for provider failures.",
             },
             "transport": "HTTP/JSON",
             "base_path": "/api/agents",
@@ -639,12 +645,14 @@ class AgentManager:
             "run_statuses": ["queued", "running", "paused", "completed", "failed", "cancelled"],
             "event_types": [
                 "run_started", "node_started", "node_input", "node_finished", "node_failed",
+                "assistant_delta", "reasoning_delta",
                 "tool_call", "tool_result", "plan", "input_requested", "input_received",
-                "input_timeout", "breakpoint", "resumed", "log", "run_completed", "run_failed",
-                "run_cancelled",
+                "input_timeout", "breakpoint", "resumed", "log", "validation",
+                "run_completed", "run_failed", "run_cancelled",
                 "swarm_start", "swarm_plan", "swarm_leader", "swarm_round",
                 "swarm_agent_start", "swarm_agent_step", "swarm_agent_delta",
-                "swarm_agent_status", "swarm_agent_tool", "swarm_agent_end",
+                "swarm_agent_status", "swarm_agent_tool", "swarm_agent_plan",
+                "swarm_agent_end",
                 "swarm_message", "swarm_memory", "swarm_review", "swarm_context", "swarm_end",
             ],
             "swarm": {
@@ -655,12 +663,14 @@ class AgentManager:
                 "policy": dict(aml.DEFAULT_SWARM),
                 "limits": aml.DEFAULT_SWARM,
                 "leader_protocol": {
-                    "plan": '{"strategy", "rounds", "agents": [{"id", "label", "role", '
-                            '"task", "instruction", "tools", "writes", "read_only", '
-                            '"context_chars"}], "notes"}',
+                    "plan": '{"strategy", "rounds", "success_criteria", "agents": '
+                            '[{"id", "label", "role", "task", "instruction", "tools", '
+                            '"writes", "read_only", "context_chars", "depends_on", '
+                            '"plan"}], "notes"}',
                     "reviews": '{"reviews": [{"reviewer", "target", "focus"}], "reason"}',
-                    "continue": '{"continue": true|false, "reason"}',
-                    "synthesis": '{"final", "summary", "warnings", "confidence"}',
+                    "continue": '{"continue": true|false, "reason", "gaps": ["..."]}',
+                    "synthesis": '{"final", "summary", "warnings", "unmet_criteria", '
+                                  '"confidence"}',
                 },
                 "member_protocol": {
                     "tool": '{"tool": "<id>", "input": {...}}',
@@ -675,6 +685,19 @@ class AgentManager:
                     "plan": '{"plan": [{"text", "status"}]}',
                     "final": '{"final": "<complete findings>"}',
                 },
+                "reliability": {
+                    "retries": "Read-only tool failures with a temporary error are retried once; "
+                               "writes are never retried automatically.",
+                    "duplicates": "A repeated identical call earns an explicit hint instead of a loop.",
+                    "plan_check": "A member that finishes with open plan steps is asked once to "
+                                  "complete or justify them; the node disables this with reflection=false.",
+                    "time_budget": "Tool rounds stop at the work deadline (the last 10% of "
+                                   "max_seconds, at least 5 s and at most 90 s); members answer "
+                                   "from the work already collected, peer review and later "
+                                   "waves are skipped, and the leader still synthesises. A run "
+                                   "that reaches the hard deadline returns partial work with "
+                                   "timed_out=true instead of failing.",
+                },
                 "context": {
                     "pool": "Run-wide extra prompt characters members may borrow",
                     "grant": "Granted only while the pool has free space; released when a phase ends",
@@ -686,7 +709,8 @@ class AgentManager:
                 "events": [
                     "swarm_start", "swarm_plan", "swarm_leader", "swarm_round",
                     "swarm_agent_start", "swarm_agent_step", "swarm_agent_delta",
-                    "swarm_agent_status", "swarm_agent_tool", "swarm_agent_end",
+                    "swarm_agent_status", "swarm_agent_tool", "swarm_agent_plan",
+                    "swarm_agent_end",
                     "swarm_message", "swarm_memory", "swarm_review", "swarm_context", "swarm_end",
                 ],
                 "security": {

@@ -75,7 +75,7 @@ class FinetuneService:
         planned = self.plan(config)
         if planned["engine"] == "hf":
             if not planned["ready"]:
-                raise ModelError(planned["base"]["requirement"])
+                raise ModelError(planned.get("requirement") or planned["base"]["requirement"])
             return self.training.start_external(planned["config"])
         job_config = dict(planned["config"])
         job_config["smart"] = False

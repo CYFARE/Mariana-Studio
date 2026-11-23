@@ -19,7 +19,10 @@
     const onchange = value => {
       state.values[key] = value;
       invalidate();
-      if (key === "method") renderFields();
+      if (key === "method") {
+        if (value !== "lora") state.values.quantization = "none";
+        renderFields();
+      }
     };
     if (type === "checkbox") return Studio.form.check({ key, label, value: state.values[key], onchange });
     return Studio.form.field({
@@ -36,9 +39,13 @@
     for (const [name, preset] of Object.entries(state.info.presets || {})) {
       root.append(h("button", { type: "button", class: `option-card${state.preset === name ? " selected" : ""}`, "aria-pressed": String(state.preset === name), onclick: () => {
         state.preset = name;
-        Object.assign(state.values, { steps: preset.steps, lr: preset.lr, warmup: preset.warmup, grad_accum: preset.grad_accum });
-        if (state.info.engine === "hf") state.values.method = preset.method;
-        else state.values.freeze = preset.freeze;
+        for (const key of ["steps", "lr", "warmup", "grad_accum", "batch", "quantization", "gradient_checkpointing", "merge", "lora_r", "lora_alpha"]) {
+          if (preset[key] !== undefined) state.values[key] = preset[key];
+        }
+        if (state.info.engine === "hf") {
+          state.values.method = preset.method;
+          state.values.quantization = preset.quantization || (preset.method === "lora" ? "auto" : "none");
+        } else state.values.freeze = preset.freeze;
         renderPresets(); renderFields(); invalidate();
       } }, h("strong", { text: preset.label }), h("span", { class: "muted small", text: preset.description })));
     }
@@ -55,9 +62,13 @@
     advanced.append(field("warmup", "Warmup steps", "number", { min: 0 }), field("eval_every", "Evaluate every N steps", "number", { min: 1 }),
       field("device", "Device", "select", { values: [["auto", "Auto"], ["cuda", "CUDA"], ["cpu", "CPU"], ["xpu", "XPU"], ["mps", "MPS"]] }));
     if (hf) {
-      advanced.append(field("block_size", "Context tokens", "number", { min: 16 }), field("precision", "Precision", "select", { values: [["auto", "Auto"], ["bf16", "BFloat 16"], ["fp32", "Float 32"]] }),
+      advanced.append(field("block_size", "Context tokens", "number", { min: 16 }), field("precision", "Precision", "select", { values: [["auto", "Auto"], ["bf16", "BFloat 16"], ["fp16", "Float 16 (older GPUs)"], ["fp32", "Float 32"]] }),
         field("train_on", "Loss on", "select", { values: [["assistant", "Assistant turns only"], ["all", "Every token"]] }),
-        field("gradient_checkpointing", "Gradient checkpointing (uses less memory)", "checkbox"));
+        field("gradient_checkpointing", "Gradient checkpointing (uses less memory)", "checkbox"),
+        field("auto_memory", "Auto-tune batch and precision for this GPU", "checkbox"),
+        field("max_tokens", "Training token cap", "number", { min: 1000 }),
+        field("max_examples", "Training example cap", "number", { min: 1 }));
+      if (state.values.method === "lora") advanced.append(field("quantization", "Quantization", "select", { values: [["auto", "Auto (4-bit when needed)"], ["none", "None"], ["4bit", "4-bit QLoRA (low VRAM)"], ["8bit", "8-bit"]] }));
       if (state.values.method === "lora") advanced.append(field("lora_r", "LoRA rank", "number", { min: 1 }), field("lora_alpha", "LoRA alpha", "number", { min: 1 }),
         field("lora_dropout", "LoRA dropout", "number", { min: 0, max: 0.9 }), field("lora_targets", "LoRA target layers", "select", { values: [["auto", "Auto"], ["attention", "Attention"], ["all-linear", "All linear layers"]] }),
         field("merge", "Also save a merged model", "checkbox"));
@@ -79,16 +90,23 @@
       const preset = info.presets[state.preset];
       state.values = {
         method: preset.method || "full", freeze: preset.freeze || "full", steps: preset.steps, lr: preset.lr, warmup: preset.warmup,
-        grad_accum: preset.grad_accum, batch: info.engine === "hf" ? 4 : 8, eval_every: Math.max(10, Math.min(100, preset.steps)), device: "auto",
-        block_size: Math.min(512, info.ctx_len || 512), precision: "auto", train_on: "assistant", gradient_checkpointing: false,
-        lora_r: preset.lora_r || 16, lora_alpha: 32, lora_dropout: 0.05, lora_targets: "auto", trainable_layers: 2, merge: true,
+        grad_accum: preset.grad_accum, batch: info.engine === "hf" ? (preset.batch || 4) : 8, eval_every: Math.max(10, Math.min(100, preset.steps)), device: "auto",
+        block_size: Math.min(512, info.ctx_len || 512), precision: "auto", train_on: "assistant",
+        gradient_checkpointing: Boolean(preset.gradient_checkpointing),
+        quantization: preset.quantization || "auto", auto_memory: true,
+        max_tokens: 20000000, max_examples: 500000,
+        lora_r: preset.lora_r || 16, lora_alpha: preset.lora_alpha || 32, lora_dropout: 0.05, lora_targets: "auto", trainable_layers: 2,
+        merge: preset.merge === undefined ? true : Boolean(preset.merge),
       };
       if (!state.nameTouched || !$("finetune-name").value) $("finetune-name").value = info.default_name;
       Studio.ui.render($("finetune-base-info"), Studio.ui.kv([
         ["Architecture", info.architecture], ["Parameters", info.parameters ? format.parameters(info.parameters) : null],
         ["Context", info.ctx_len ? `${format.number(info.ctx_len)} ${info.ctx_unit}` : null], ["Layers", info.layers],
         ["Chat template", info.engine === "hf" ? (info.chat_template ? "Yes" : "No; User / Assistant fallback") : null],
-      ]), info.requirement ? Studio.ui.callout("warning", info.requirement) : null);
+      ]), info.requirement ? Studio.ui.callout("warning", info.requirement) : null,
+      info.engine === "hf" && info.quantization_ready === false
+        ? Studio.ui.callout("info", "Install bitsandbytes to use 4-bit QLoRA on a 6-8 GB GPU: pip install -r requirements-finetune.txt")
+        : null);
       $("finetune-engine").textContent = info.engine === "hf" ? "Hugging Face" : "Mariana native";
       $("finetune-plan").disabled = false;
       $("finetune-start").disabled = false;
@@ -428,6 +446,7 @@
         pause: "finetune-pause", cancel: "finetune-cancel", chat: "finetune-chat",
       });
       state.tabs = Studio.ui.tabs($("finetune-tabs"), name => {
+        state.lastTab = name;
         if (name === "discovery") loadDiscovery().catch(error => Studio.toast(error.message, "error"));
       });
       $("finetune-plan").disabled = true;
@@ -457,7 +476,10 @@
     },
     async activate(parameters) {
       if (parameters.base) state.nameTouched = false;
-      const tab = parameters.tab === "discovery" ? "discovery" : "setup";
+      const tab = parameters.tab === "discovery" ? "discovery"
+        : parameters.tab === "setup" ? "setup"
+          : parameters.base ? "setup" : state.lastTab || "setup";
+      state.lastTab = tab;
       if (state.tabs) state.tabs.select(tab, false);
       if (!state.info) Studio.ui.render($("finetune-base-info"), Studio.ui.loading("Loading base models…"));
       try {

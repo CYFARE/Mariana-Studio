@@ -28,6 +28,7 @@
         <div class="tabs ide-sidebar-tabs" role="tablist" aria-label="IDE explorer">
           <button type="button" role="tab" data-tab="files" aria-controls="ide-files-panel" aria-selected="true">Files</button>
           <button type="button" role="tab" data-tab="search" aria-controls="ide-search-panel" aria-selected="false">Search</button>
+          <button type="button" role="tab" data-tab="outline" aria-controls="ide-outline-panel" aria-selected="false">Outline</button>
           <button type="button" role="tab" data-tab="sessions" aria-controls="ide-sessions-panel" aria-selected="false">Chats</button>
         </div>
         <div id="ide-files-panel" role="tabpanel" class="ide-panel">
@@ -45,6 +46,12 @@
           </div>
           <div id="ide-search-results" class="ide-search-results"></div>
         </div>
+        <div id="ide-outline-panel" role="tabpanel" class="ide-panel hidden">
+          <div class="row">
+            <input id="ide-outline-filter" type="search" aria-label="Filter symbols" placeholder="Filter symbols…">
+          </div>
+          <div id="ide-outline" class="ide-outline" role="group" aria-label="Symbols in the active file"></div>
+        </div>
         <div id="ide-sessions-panel" role="tabpanel" class="ide-panel hidden">
           <div class="row">
             <button id="ide-new-session" class="button small" type="button">New chat</button>
@@ -61,11 +68,13 @@
 
       <div id="ide-editor-column" class="ide-editor-column">
         <div id="ide-file-tabs" class="ide-file-tabs" role="tablist" aria-label="Open files"></div>
+        <nav id="ide-breadcrumbs" class="ide-breadcrumbs hidden" aria-label="File path"></nav>
         <div id="ide-view-bar" class="ide-view-bar hidden" role="toolbar" aria-label="File view"></div>
         <div id="ide-file-notice" class="ide-file-notice hidden" role="status"></div>
         <div id="ide-editor-host" class="ide-editor-host" role="tabpanel" aria-label="Editor"></div>
         <footer class="ide-statusbar">
           <span id="ide-status-file" class="truncate muted">No file open</span>
+          <span id="ide-status-position" class="muted tiny"></span>
           <span class="spacer"></span>
           <span id="ide-status-mode" class="badge">Edit</span>
           <span id="ide-status-shell" class="badge">Shell off</span>
@@ -99,6 +108,8 @@
           <div class="row between wrap">
             <div id="ide-context" class="ide-context muted tiny"></div>
             <div class="row">
+              <button id="ide-use-selection" class="icon-button small" type="button" aria-label="Insert editor selection"
+                title="Insert the editor selection into the task"></button>
               <button id="ide-context-add" class="button small ghost" type="button" title="Pin files or folders to the agent context">Pin context</button>
               <button id="ide-context-manage" class="icon-button small" type="button" aria-label="Manage agent context" title="Manage agent context"></button>
             </div>

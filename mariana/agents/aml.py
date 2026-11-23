@@ -1,4 +1,4 @@
-"""Agent Management Language (AML) v1.3.
+"""Agent Management Language (AML) v1.8.
 
 AML is a portable JSON (or YAML, when PyYAML is available) document that
 describes an agent as a directed flowchart plus abilities, schedules and run
@@ -20,8 +20,10 @@ import re
 import time
 from datetime import datetime, timedelta
 
-AML_VERSION = "1.6"
-SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6")
+from .schema import schema_errors
+
+AML_VERSION = "1.8"
+SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8")
 MAX_DOCUMENT_BYTES = 1_000_000
 
 FIELD_TYPES = (
@@ -33,6 +35,10 @@ _MODEL_FIELDS = [
      "help": "Leave empty to use the agent's default model."},
     {"key": "system", "label": "System prompt", "type": "template", "rows": 3},
 ]
+_FALLBACK_FIELD = {
+    "key": "fallback_model", "label": "Fallback model", "type": "model",
+    "help": "Used when the main model call fails. Empty disables the fallback.",
+}
 _SAMPLING_FIELDS = [
     {"key": "temperature", "label": "Temperature", "type": "number", "min": 0, "max": 5, "step": 0.1},
     {"key": "max_tokens", "label": "Max tokens", "type": "number", "min": 1, "max": 131072, "step": 1},
@@ -69,6 +75,7 @@ NODE_TYPES = {
              "options": [["text", "Text"], ["json", "JSON value"]],
              "help": "JSON adds a parsed value under output.json and fails the node when the reply is not JSON."},
             *_SAMPLING_FIELDS,
+            _FALLBACK_FIELD,
         ],
     },
     "agent": {
@@ -83,6 +90,7 @@ NODE_TYPES = {
             {"key": "max_iterations", "label": "Max tool rounds", "type": "number",
              "min": 1, "max": 40, "step": 1},
             *_SAMPLING_FIELDS,
+            _FALLBACK_FIELD,
         ],
     },
     "swarm": {
@@ -95,9 +103,15 @@ NODE_TYPES = {
              "help": "Empty uses the member model. The leader plans, decides and synthesises."},
             {"key": "goal", "label": "Swarm goal", "type": "template", "rows": 5,
              "help": "The task the whole swarm must complete. Empty uses the previous node's output."},
+            {"key": "goal", "label": "Swarm goal", "type": "template", "rows": 5,
+             "help": "The task the whole swarm must complete. Empty uses the previous node's output."},
+            {"key": "criteria", "label": "Acceptance criteria", "type": "template", "rows": 3,
+             "help": "Optional checks the final answer must satisfy, one per line. Empty lets "
+                     "the leader derive testable criteria from the goal."},
             {"key": "agents", "label": "Member tasks", "type": "json", "rows": 6,
              "help": "Optional JSON list of {id, label, role, task, instruction, tools, writes, "
-                     "read_only, context_chars}. Empty lets the leader choose the team."},
+                     "read_only, context_chars, depends_on, plan}. Empty lets the leader choose "
+                     "the team and its plan."},
             {"key": "tools", "label": "Abilities members may use", "type": "abilities",
              "help": "None selected means every ability granted to this agent."},
             {"key": "strategy", "label": "Strategy", "type": "select",
@@ -105,6 +119,14 @@ NODE_TYPES = {
             {"key": "rounds", "label": "Feedback rounds", "type": "number",
              "min": 0, "max": 4, "step": 1,
              "help": "Each round adds peer review and a revision by the reviewed members."},
+            {"key": "effort", "label": "Reasoning effort", "type": "select",
+             "options": [["", "Provider default"], ["low", "Low"], ["medium", "Medium"],
+                         ["high", "High"]],
+             "help": "Ask models that support it to think longer while planning, working and "
+                     "synthesising. Empty sends no reasoning override."},
+            {"key": "reflection", "label": "Self-check unfinished plans", "type": "boolean",
+             "help": "Ask a member once to finish or justify plan steps that are still open "
+                     "before it returns its answer."},
             {"key": "max_agents", "label": "Max agents", "type": "number",
              "min": 1, "max": 8, "step": 1},
             {"key": "max_steps", "label": "Max model rounds per agent", "type": "number",
@@ -133,6 +155,31 @@ NODE_TYPES = {
         "fields": [{"key": "expression", "label": "Expression", "type": "expression", "rows": 3,
                     "help": "For example: contains(lower(last.text), 'urgent'). "
                             "Read input, last, vars and nodes.<id>."}],
+    },
+    "assert": {
+        "label": "Assert", "category": "logic", "icon": "✓",
+        "description": "Fail the run when a safe expression is false; a guardrail for a contract.",
+        "fields": [
+            {"key": "expression", "label": "Must be true", "type": "expression", "rows": 3,
+             "help": "For example: contains(last.text, 'Sources') or len(last.json.items) > 0."},
+            {"key": "message", "label": "Failure message", "type": "template", "rows": 2,
+             "help": "Explains what failed. {{ expression }} and {{ value }} are available."},
+        ],
+    },
+    "validate": {
+        "label": "Validate JSON", "category": "logic", "icon": "☑",
+        "description": "Check a value against a small JSON schema and stop or warn on mismatch.",
+        "fields": [
+            {"key": "target", "label": "Value", "type": "template", "rows": 2,
+             "help": "Empty checks the previous node's output."},
+            {"key": "schema", "label": "JSON schema", "type": "json", "rows": 8,
+             "help": "Supports type, required, properties, additionalProperties, items, "
+                     "enum, const, anyOf, minimum, maximum, minLength, maxLength, "
+                     "minItems, maxItems and pattern."},
+            {"key": "mode", "label": "On invalid data", "type": "select",
+             "options": [["fail", "Fail the node"], ["warn", "Continue with errors"]],
+             "help": "Warn mode exposes valid and errors on the node output for a condition."},
+        ],
     },
     "transform": {
         "label": "Transform", "category": "logic", "icon": "⇄",
@@ -283,7 +330,8 @@ ABILITY_TYPES = {
              "min": 1, "max": 1000000, "step": 1},
             {"key": "end_line", "label": "Last line", "type": "number",
              "min": 1, "max": 1000000, "step": 1,
-             "help": "Defaults to 200 lines from start_line."},
+             "help": "Defaults to 200 lines or about 3,600 characters; the result "
+                     "reports next_start_line when more remain."},
         ],
     },
     "file.write": {
@@ -431,15 +479,18 @@ DEFAULT_NODE_DATA = {
     "start": {},
     "end": {"output": "{{ last }}"},
     "llm": {"model": "", "system": "", "prompt": "", "format": "text",
-            "temperature": 0.7, "max_tokens": 512},
+            "temperature": 0.7, "max_tokens": 512, "fallback_model": ""},
     "agent": {"model": "", "system": "", "goal": "", "abilities": [], "max_iterations": 6,
-              "temperature": 0.3, "max_tokens": 1024},
+              "temperature": 0.3, "max_tokens": 1024, "fallback_model": ""},
     "swarm": {"model": "", "leader_model": "", "system": "", "goal": "",
-              "agents": [], "tools": [], "strategy": "auto", "rounds": 1,
+              "criteria": "", "agents": [], "tools": [], "strategy": "auto", "rounds": 1,
+              "effort": "", "reflection": True,
               "max_agents": 4, "max_steps": 6, "max_seconds": 240,
               "write": False, "memory": True, "ipc": True},
     "tool": {"ability": "", "input": {}},
     "condition": {"expression": "true"},
+    "assert": {"expression": "true", "message": ""},
+    "validate": {"target": "", "schema": {"type": "object"}, "mode": "fail"},
     "transform": {"template": "", "format": "text", "assign": {}},
     "delay": {"seconds": 1},
     "human": {"prompt": "", "kind": "approve", "choices": [], "default": "", "timeout": 3600},
@@ -766,6 +817,29 @@ def validate_agent(document: dict, known_agent_ids: set[str] | None = None) -> d
                 evaluate_expression(str(data.get("expression") or "true"), sample, lenient=True)
             except Exception as failure:  # noqa: BLE001
                 error(f"Condition node {node_id}: {failure}", node=node_id, field="expression")
+        if node_type == "assert":
+            try:
+                sample = _sample_context()
+                sample["nodes"] = {
+                    other: {"text": "", "result": False, "value": None, "output": ""} for other in nodes
+                }
+                sample["vars"] = {"example": True}
+                evaluate_expression(str(data.get("expression") or "true"), sample, lenient=True)
+            except Exception as failure:  # noqa: BLE001
+                error(f"Assert node {node_id}: {failure}", node=node_id, field="expression")
+        if node_type == "validate":
+            mode = str(data.get("mode") or "fail")
+            if mode not in {"fail", "warn"}:
+                error(f"Validate node {node_id} mode must be fail or warn",
+                      node=node_id, field="mode")
+            schema = data.get("schema")
+            if not isinstance(schema, dict):
+                error(f"Validate node {node_id} needs a JSON schema object",
+                      node=node_id, field="schema")
+            else:
+                for issue in schema_errors(schema):
+                    error(f"Validate node {node_id} schema: {issue}",
+                          node=node_id, field="schema")
         if node_type == "delay":
             try:
                 if not 0 <= float(data.get("seconds", 0)) <= 300:
@@ -809,6 +883,15 @@ def validate_agent(document: dict, known_agent_ids: set[str] | None = None) -> d
                         node=node_id, field="abilities")
         if node_type == "swarm":
             _validate_swarm_node(node, data, ability_types, policy, error, warning)
+        if node_type in {"llm", "agent"}:
+            fallback = data.get("fallback_model")
+            if not isinstance(fallback, str):
+                error(f"Node {node_id} fallback_model must be a model id string",
+                      node=node_id, field="fallback_model")
+            elif fallback.strip() and fallback.strip() == str(
+                    data.get("model") or agent.get("model") or "").strip():
+                warning(f"Node {node_id} fallback_model is the same as its main model and "
+                        "will not be used", node=node_id, field="fallback_model")
         if node_type in {"llm", "agent", "swarm"} and not agent["model"] and not str(data.get("model") or ""):
             label = {"llm": "LLM", "agent": "AI agent", "swarm": "Swarm"}[node_type]
             warning(f"{label} node {node_id} has no model; the run will use the first available chat model",
@@ -895,9 +978,13 @@ def _validate_swarm_node(node: dict, data: dict, ability_types: dict[str, str], 
                         "by the document's swarm policy", node=node_id, field=key)
         except (TypeError, ValueError):
             error(f"Swarm node {node_id} {key} must be a number", node=node_id, field=key)
-    for key in ("write", "memory", "ipc"):
+    for key in ("write", "memory", "ipc", "reflection"):
         if key in data and not isinstance(data[key], bool):
             error(f"Swarm node {node_id} {key} must be true or false", node=node_id, field=key)
+    effort = str(data.get("effort") or "")
+    if effort not in {"", "low", "medium", "high"}:
+        error(f"Swarm node {node_id} effort must be empty, low, medium or high",
+              node=node_id, field="effort")
     tools = data.get("tools") or []
     if not isinstance(tools, list):
         error(f"Swarm node {node_id} tools must be a list of ability ids",
@@ -943,6 +1030,18 @@ def _validate_swarm_node(node: dict, data: dict, ability_types: dict[str, str], 
             if not str(item.get("task") or item.get("goal") or "").strip():
                 error(f"Swarm node {node_id} agent {index + 1} needs a task",
                       node=node_id, field="agents")
+            depends_on = item.get("depends_on")
+            if depends_on is not None:
+                if (not isinstance(depends_on, list)
+                        or any(not isinstance(dep, str) for dep in depends_on)):
+                    error(f"Swarm node {node_id} agent {index + 1} depends_on must be a "
+                          "list of agent ids", node=node_id, field="agents")
+                elif item.get("id") and str(item["id"]) in depends_on:
+                    error(f"Swarm node {node_id} agent {index + 1} cannot depend on itself",
+                          node=node_id, field="agents")
+            if "plan" in item and not isinstance(item["plan"], (list, dict)):
+                warning(f"Swarm node {node_id} agent {index + 1} plan should be a step list",
+                        node=node_id, field="agents")
         else:
             error(f"Swarm node {node_id} agent {index + 1} must be a task string or an object",
                   node=node_id, field="agents")

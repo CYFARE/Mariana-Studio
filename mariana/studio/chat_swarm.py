@@ -13,7 +13,9 @@ stored with the reply so the agent card survives a reload.
 
 from __future__ import annotations
 
+import base64
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -27,11 +29,15 @@ from ..agents.aml import ABILITY_TYPES, SWARM_STRATEGIES
 from ..agents.swarm import SwarmCoordinator, SwarmLimits, snapshot_due
 from ..agents.tools import execute_ability
 from ..workspace import chat_files_path, ensure_workspace
-from .errors import BadRequestError, ConflictError
+from .errors import BadRequestError, ConflictError, NotFoundError
 from .validation import choice, flag, number, text
 
 DEFAULTS = SwarmLimits()
 MAX_CONCURRENT_SWARMS = 3
+# Long web research needs a bigger ceiling than the old five minutes.  These are
+# the hard bounds; the UI exposes them as Standard, Deep research and Extended.
+MAX_RESEARCH_SECONDS = 1_800.0
+MAX_RESEARCH_STEPS = 24
 MAX_MESSAGES = 40
 MAX_MESSAGE_CHARS = 24_000
 MAX_GOAL_CHARS = 12_000
@@ -42,8 +48,16 @@ MAX_WARNINGS = 8
 MAX_EVENT_DEPTH = 12
 MAX_EVENT_ITEMS = 200
 MAX_EVENT_STRING = 20_000
+# The preview panel holds one file source at a time; keep the read bounded.
+MAX_PREVIEW_BYTES = 1_000_000
+MAX_PREVIEW_CHARS = 200_000
+MAX_PREVIEW_IMAGE_BYTES = 2_000_000
 _END = object()
 _CHAT_ID = re.compile(r"chat-[a-z0-9]{6,32}")
+_TOP_HEADING = re.compile(
+    r"^(?:top|key|main|lead|headlines?|findings|results?)\b", re.IGNORECASE)
+_DIGEST_PREFIX = re.compile(r"^[#>*_•\s-]+")
+_DIGEST_MARKER = re.compile(r"^(?:[-*•]|\d+[.)])\s+")
 READ_TOOLS = (
     "file.list", "file.tree", "file.read", "file.search", "code.diagnostics",
     "csv.read", "time.now",
@@ -155,9 +169,9 @@ class ChatSwarm:
                      if chat_id and tools else None)
         strategy = choice(config, "strategy", "auto", SWARM_STRATEGIES)
         max_agents = number(config, "max_agents", 4, 1, DEFAULTS.max_agents)
-        max_steps = number(config, "max_steps", 10, 1, 12)
+        max_steps = number(config, "max_steps", 10, 1, MAX_RESEARCH_STEPS)
         rounds = number(config, "rounds", 1, 0, DEFAULTS.max_rounds)
-        max_seconds = number(config, "max_seconds", 300.0, 20.0, DEFAULTS.max_seconds, float)
+        max_seconds = number(config, "max_seconds", 300.0, 20.0, MAX_RESEARCH_SECONDS, float)
         limits = SwarmLimits(
             max_agents=max_agents,
             max_steps=max_steps,
@@ -196,6 +210,75 @@ class ChatSwarm:
             web=wants_web,
             os_access=os_access,
         )
+
+    def read_file(self, chat_id: str, relative: str) -> dict:
+        """Read one file from a conversation workspace for the Chat preview panel.
+
+        The response is a small, bounded preview record: UTF-8 text or source,
+        or a data URL for a bitmap image.  The path is resolved inside the
+        conversation workspace, so a request cannot escape it.
+        """
+        chat_id = str(chat_id or "")
+        if not _CHAT_ID.fullmatch(chat_id):
+            raise BadRequestError("Invalid conversation id; open the conversation again")
+        root = chat_files_path(self.root, chat_id, create=False).resolve()
+        if not root.is_dir():
+            raise NotFoundError("This conversation has no workspace files yet")
+        raw = str(relative or "").strip().replace("\\", "/")
+        if not raw:
+            raise BadRequestError("A file path is required")
+        if "\x00" in raw:
+            raise BadRequestError("That path contains an invalid character")
+        path = (root / raw).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise BadRequestError(
+                "That path is outside the conversation workspace; use a relative path") from None
+        if not path.is_file():
+            raise NotFoundError(f"File not found: {raw}")
+        try:
+            stat = path.stat()
+        except OSError:
+            raise NotFoundError(f"File not found: {raw}") from None
+        size = stat.st_size
+        name = path.name
+        suffix = path.suffix.lower().lstrip(".")
+        mime = mimetypes.guess_type(name)[0] or "text/plain"
+        bitmap = mime.startswith("image/") and mime != "image/svg+xml"
+        record = {
+            "path": path.relative_to(root).as_posix(),
+            "name": name,
+            "bytes": size,
+            "version": stat.st_mtime_ns,
+            "mime": mime,
+            "language": suffix,
+            "kind": "image" if bitmap else "text",
+            "truncated": False,
+        }
+        if bitmap:
+            if size > MAX_PREVIEW_IMAGE_BYTES:
+                raise BadRequestError(
+                    f"{name} is {size // 1_000_000} MB; image previews load up to "
+                    f"{MAX_PREVIEW_IMAGE_BYTES // 1_000_000} MB")
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                raise BadRequestError(f"{name} could not be read; try again") from None
+            record["data_url"] = (f"data:{mime};base64,"
+                                  + base64.b64encode(payload).decode("ascii"))
+            return record
+        try:
+            payload = path.read_bytes()[:MAX_PREVIEW_BYTES]
+        except OSError:
+            raise BadRequestError(f"{name} could not be read; try again") from None
+        if b"\x00" in payload[:4096]:
+            raise BadRequestError(
+                f"{name} is binary; the Chat preview shows text, code and images")
+        content = payload.decode("utf-8", errors="replace")
+        record["content"] = content[:MAX_PREVIEW_CHARS]
+        record["truncated"] = size > len(payload) or len(content) > MAX_PREVIEW_CHARS
+        return record
 
     # -- streaming -------------------------------------------------------
     def stream(self, config: dict | ChatSwarmRequest,
@@ -538,13 +621,88 @@ def _briefing(history: list[dict], system_prompt: str,
     return "\n\n".join(sections)[:MAX_BRIEFING_CHARS]
 
 
+def _digest(value: str, limit: int = 240) -> str:
+    """One-line gist of an agent hand-off: its headline, not its whole log."""
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    start = 0
+    for index, line in enumerate(lines):
+        if _TOP_HEADING.match(_DIGEST_PREFIX.sub("", line)):
+            start = index + 1
+            break
+    candidate = ""
+    for line in lines[start:]:
+        cleaned = _DIGEST_MARKER.sub("", _DIGEST_PREFIX.sub("", line)).strip()
+        if not cleaned or set(cleaned) <= set("-=—_* "):
+            continue
+        candidate = cleaned
+        break
+    if not candidate:
+        candidate = " ".join(lines)
+    candidate = " ".join(candidate.split())
+    headline, separator, _rest = candidate.partition(" — ")
+    if separator and len(headline) >= 32:
+        candidate = headline
+    if len(candidate) > limit:
+        cut = candidate[:limit]
+        space = cut.rfind(" ")
+        if space > limit // 2:
+            cut = cut[:space]
+        candidate = cut.rstrip(" ,;:.-") + "…"
+    return candidate
+
+
+def _reply_text(result: dict) -> str:
+    """The assistant reply: a clean report when the leader could not synthesise."""
+    final = str(result.get("final") or "").strip()
+    if not result.get("assembled"):
+        return final or "The swarm produced no output."
+    agents = [item for item in result.get("agents") or [] if isinstance(item, dict)]
+    delivered = [item for item in agents if str(item.get("output") or "").strip()]
+    missing = [item for item in agents if not str(item.get("output") or "").strip()]
+    timed_out = bool(result.get("timed_out"))
+    outcome = ("**Time limit reached.**" if timed_out
+               else "**The leader could not synthesise this run.**")
+    if agents:
+        noun = "agent" if len(agents) == 1 else "agents"
+        count = f"{len(delivered)} of {len(agents)} {noun} delivered findings"
+        lead = (f"{outcome} {count} before the deadline; the leader ran out of time "
+                "to combine them." if timed_out else
+                f"{outcome} {count}.")
+    else:
+        lead = outcome
+    lines = [lead]
+    if delivered:
+        lines += ["", "**Delivered**"]
+        for item in delivered:
+            label = " ".join(str(item.get("label") or item.get("id") or "Agent").split())[:80]
+            digest = _digest(str(item.get("output") or ""))
+            lines.append(f"- **{label}** — {digest or 'delivered findings'}")
+    if missing:
+        lines += ["", "**Not delivered**"]
+        for item in missing:
+            label = " ".join(str(item.get("label") or item.get("id") or "Agent").split())[:80]
+            reason = " ".join(str(item.get("error") or "").split())[:200]
+            if not reason:
+                reason = ("no output before the deadline" if timed_out
+                          else "no findings were recorded")
+            lines.append(f"- **{label}** — {reason}")
+    lines += ["", "Each agent's hand-off and sources are in the agent card below."]
+    lines.append(("Raise Research depth in Settings for a longer run, or ask a follow-up "
+                  "to continue from this work."
+                  if timed_out else
+                  "Ask a follow-up to have these findings compiled."))
+    return "\n".join(lines)
+
+
 def _done(request: ChatSwarmRequest, result: dict, summary: dict) -> dict:
     """The terminal event Chat's reply path understands."""
     usage = dict(result.get("usage") or {})
     elapsed = float(result.get("elapsed") or 0.0)
     completion = int(usage.get("completion_tokens") or 0)
     payload = {
-        "reply": str(result.get("final") or "The swarm produced no output."),
+        "reply": _reply_text(result),
         "kind": "Swarm",
         "model": request.model,
         "model_name": request.model_name,
@@ -555,15 +713,20 @@ def _done(request: ChatSwarmRequest, result: dict, summary: dict) -> dict:
     }
     if completion and elapsed > 0:
         payload["tokens_per_second"] = completion / elapsed
-    warnings = [str(item).strip() for item in result.get("warnings") or [] if str(item).strip()]
+    warnings = [str(item).strip() for item in summary.get("warnings") or []
+                if str(item).strip()]
     notes = []
-    if warnings:
-        notes.append("Swarm notes: " + "; ".join(warnings[:MAX_WARNINGS]))
+    if warnings and not result.get("assembled"):
+        first = warnings[0]
+        note = first if len(first) <= 180 else first[:177].rstrip(" ,;:.") + "…"
+        if len(warnings) > 1:
+            note += f" (+{len(warnings) - 1} more in the agent card)"
+        notes.append(note)
     changed = [str(item) for item in summary.get("changed_files") or [] if item]
     if changed:
         notes.append("Files changed: " + ", ".join(changed[:8]))
     if notes:
-        payload["notice"] = " · ".join(notes)[:600]
+        payload["notice"] = " · ".join(notes)[:400]
     return payload
 
 
@@ -628,6 +791,7 @@ def _summary(result: dict) -> dict:
         "leader": result.get("leader"),
         "model": result.get("model"),
         "summary": str(result.get("summary") or "")[:1_000],
+        "assembled": bool(result.get("assembled")),
         "agents": agents,
         "reviews": reviews,
         "messages": int(result.get("messages") or 0),
@@ -638,6 +802,7 @@ def _summary(result: dict) -> dict:
         "context_items": int(result.get("context_items") or 0),
         "usage": dict(result.get("usage") or {}),
         "elapsed": result.get("elapsed") or 0.0,
+        "timed_out": bool(result.get("timed_out")),
         "warnings": [str(item)[:400] for item in (result.get("warnings") or [])[:MAX_WARNINGS]],
         "changed_files": [str(item)[:400]
                           for item in (result.get("changed_files") or [])[:20]],

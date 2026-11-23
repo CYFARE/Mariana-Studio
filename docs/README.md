@@ -27,8 +27,10 @@ See [`whitepapers/`](whitepapers/) for the index and citation details.
 | [export.md](export.md) | GGUF, ONNX and safetensors export, plus llama.cpp, Ollama and ONNX Runtime runners. |
 | [update.md](update.md) | CLI and Studio update checks against GitHub releases, the git fast-forward, and restart rules. |
 | [low-vram.md](low-vram.md) | External-disk Common Corpus run with MoE + MTP + SAINT on an 8 GB GPU. |
+| [low-vram-finetuning.md](low-vram-finetuning.md) | QLoRA, fp16, auto batch sizing and large-dataset caps for fine-tuning on 6-8 GB GPUs. |
 | [agentic.md](agentic.md) | Studio Agents workspace, AML/AMP quick loop, and security. |
 | [ide.md](ide.md) | The coding workspace and its `/api/ide` protocol. |
+| [web-acceleration.md](web-acceleration.md) | Optional WebGPU/WASM chart acceleration, the static asset cache, and how to rebuild `chart.wasm`. |
 | [../architecture.txt](../architecture.txt) | The full implemented DRV-LM architecture tree. |
 | [../README_training.md](../README_training.md) | Training quickstart and Studio training workflow. |
 

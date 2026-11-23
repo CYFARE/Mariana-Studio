@@ -1,10 +1,10 @@
 # AML and AMP: a portable language and protocol for local agent automation
 
-**Whitepaper · Mariana v2.3.1 · 2026-11-20**
+**Whitepaper · Mariana v2.3.2 · 2026-11-20**
 
 | | |
 | --- | --- |
-| Status | Implemented; AML 1.6 and AMP 1.7 |
+| Status | Implemented; AML 1.8 and AMP 1.10 |
 | Canonical specifications | [`mariana/agents/specs/AML.md`](../../mariana/agents/specs/AML.md), [`mariana/agents/specs/AMP.md`](../../mariana/agents/specs/AMP.md) |
 | Guide | [agentic.md](../agentic.md) |
 | Live specifications | `GET /api/agents/spec/aml`, `GET /api/agents/spec/amp` |
@@ -74,7 +74,7 @@ name, nodes, and edges:
 
 ```json
 {
-  "aml": "1.6",
+  "aml": "1.8",
   "kind": "agent",
   "id": "daily-digest",
   "name": "Daily digest",
@@ -347,22 +347,34 @@ below.
 
 ### 4.5 The swarm extension
 
-A swarm node is a bounded, leader-driven run. The leader plans the team and
-strategy, members work in parallel or in a pipeline, exchange addressed
-messages, share a run-scoped blackboard, and review each other when feedback
-rounds are configured. The leader synthesizes the final answer.
+A swarm node is a bounded, leader-driven run. The leader plans the team, its
+success criteria, each member's short plan and any dependency edges. Members
+whose dependencies are unfinished wait; each ready wave runs concurrently, or
+all members run in order under the pipeline strategy. Members exchange
+addressed messages, share a run-scoped blackboard, and review each other when
+feedback rounds are configured. The leader synthesizes the final answer and
+reports criteria it could not verify. Plans are persisted in the snapshot and
+result, and a member that finishes with open steps is asked once to complete or
+justify them.
 
 The protocol exposes the swarm snapshot at
 `GET /api/agents/runs/{run_id}/swarm`, including the leader, members, message
-log, blackboard, reviews, changed files, usage, and the dynamic context pool.
+log, blackboard, reviews, plans, success criteria, gaps, changed files, usage,
+and the dynamic context pool.
 Operator messages can be queued for the leader with
 `POST /api/agents/runs/{run_id}/swarm/messages`; the text is plain data, never a
 tool call.
 
 The runtime also shares knowledge without waiting for a request: it seeds the
-blackboard with the goal and plan, publishes completed member results, and adds
-a peer-results digest plus team tasks to every member prompt. Duplicate plan
-tasks are dropped with a warning.
+blackboard with the goal, criteria, dependencies and plans, publishes completed
+member results, and adds a peer-results digest plus team tasks to every member
+prompt. Duplicate plan tasks are dropped with a warning.
+
+Tool execution is defensive in agent, swarm and IDE coding loops. Read-only
+calls that fail with a temporary error are retried once; writes are never
+retried because a timed-out write may already have landed. Deterministic
+failures return an actionable hint, an unknown tool id is matched against the
+granted ids, and a repeated identical call receives an explicit anti-loop hint.
 
 ### 4.6 Tool calling
 
@@ -494,9 +506,9 @@ behind them.
 
 ## References
 
-1. Mariana. *Agent Management Language (AML) v1.6.*
+1. Mariana. *Agent Management Language (AML) v1.8.*
    [`mariana/agents/specs/AML.md`](../../mariana/agents/specs/AML.md).
-2. Mariana. *Agent Management Protocol (AMP) v1.7.*
+2. Mariana. *Agent Management Protocol (AMP) v1.10.*
    [`mariana/agents/specs/AMP.md`](../../mariana/agents/specs/AMP.md).
 3. Mariana. *Agents in Mariana Studio: AML and AMP.*
    [`docs/agentic.md`](../agentic.md).
@@ -513,7 +525,7 @@ behind them.
   author      = {{Mariana contributors}},
   institution = {Mariana},
   year        = {2026},
-  version     = {2.3.1},
+  version     = {2.3.2},
   url         = {https://github.com/CYFARE/Mariana/blob/main/docs/whitepapers/aml-amp.md}
 }
 ```

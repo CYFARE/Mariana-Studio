@@ -41,13 +41,25 @@
 
   const SWARM_DEFAULTS = {
     strategy: "auto", max_agents: 4, rounds: 0, ipc: true, memory: true,
-    max_steps: 10, max_seconds: 300,
+    depth: "deep", max_steps: 16, max_seconds: 900,
   };
   const TOOL_DEFAULTS = { files: true, write: false, web: true };
   const SWARM_STRATEGIES = [
     ["auto", "Automatic"], ["map_reduce", "Map & reduce"], ["peer_review", "Peer review"],
     ["debate", "Debate"], ["pipeline", "Pipeline"],
   ];
+  /* One preset controls both bounds. Tokens are bounded mainly by rounds; the
+     time budget lets slow web fetches finish instead of cutting the team off. */
+  const SWARM_DEPTHS = [
+    ["standard", "Standard · 5 min · 10 rounds"],
+    ["deep", "Deep research · 15 min · 16 rounds"],
+    ["extended", "Extended · 30 min · 24 rounds"],
+  ];
+  const SWARM_DEPTH_VALUES = {
+    standard: { max_steps: 10, max_seconds: 300 },
+    deep: { max_steps: 16, max_seconds: 900 },
+    extended: { max_steps: 24, max_seconds: 1800 },
+  };
 
   let layout = null;
 
@@ -70,7 +82,8 @@
     tools: readTools(),
     autoPreview: Studio.store.get("chat-auto-preview", true) !== false,
     budgetCache: null,
-    preview: { open: false, selected: null, view: "preview", closedIds: new Set(), count: 0, rendered: "" },
+    preview: { open: false, selected: null, view: "preview", closedIds: new Set(), count: 0,
+      rendered: "", workspace: new Map() },
     voiceStatus: null,
     voice: null,
     voiceState: "idle",
@@ -85,13 +98,22 @@
       const number = Number(value);
       return Number.isFinite(number) ? Math.max(low, Math.min(high, Math.round(number))) : fallback;
     };
+    const seconds = bounded(saved.max_seconds, SWARM_DEFAULTS.max_seconds, 20, 1800);
+    /* Saved options from before the preset existed always had the old hidden
+       five-minute default; those migrate to Deep research. A longer custom value
+       keeps its closest preset instead of being reset. */
+    const depth = Object.prototype.hasOwnProperty.call(SWARM_DEPTH_VALUES, saved.depth)
+      ? saved.depth
+      : seconds > 300 ? (seconds >= 1200 ? "extended" : "deep") : SWARM_DEFAULTS.depth;
+    const budget = SWARM_DEPTH_VALUES[depth];
     return {
       strategy: SWARM_STRATEGIES.some(([value]) => value === saved.strategy)
         ? saved.strategy : SWARM_DEFAULTS.strategy,
+      depth,
       max_agents: bounded(saved.max_agents, SWARM_DEFAULTS.max_agents, 1, 6),
       rounds: bounded(saved.rounds, SWARM_DEFAULTS.rounds, 0, 2),
-      max_steps: bounded(saved.max_steps, SWARM_DEFAULTS.max_steps, 10, 12),
-      max_seconds: bounded(saved.max_seconds, SWARM_DEFAULTS.max_seconds, 20, 300),
+      max_steps: budget.max_steps,
+      max_seconds: budget.max_seconds,
       ipc: saved.ipc !== false,
       memory: saved.memory !== false,
     };
@@ -133,7 +155,7 @@
     const options = state.swarmOptions;
     $("chat-mode-solo").title = "One model answers directly · faster and cheaper";
     $("chat-mode-swarm").title = `${swarm ? "Swarm mode is on (default)" : "Use a team of agents (default)"}`
-      + ` · up to ${options.max_agents} agents · `
+      + ` · up to ${options.max_agents} agents · ${Math.round(options.max_seconds / 60)} min · `
       + (options.rounds === 0
         ? "no peer-review rounds"
         : `${options.rounds} feedback round${options.rounds === 1 ? "" : "s"}`)
@@ -201,28 +223,101 @@
     return state.chats;
   }
 
+  let chatListTimer = 0;
+
+  /* Typing in the sidebar search used to rebuild every row per keystroke.
+     Repaint at most once per 120ms; the final value is always rendered. */
+  function scheduleChatList() {
+    if (chatListTimer) return;
+    chatListTimer = setTimeout(() => {
+      chatListTimer = 0;
+      renderChatList();
+    }, 120);
+  }
+
+  let chatListState = { docId: "", search: "", minute: -1, chats: [] };
+
+  let chatRowCache = new Map();
+  let chatListEmpty = "";
+
+  function chatRowKey(chat, active, minute) {
+    return `${active ? 1 : 0}|${minute}|${chat.title}|${chat.preview || ""}|${chat.model_name || ""}|${chat.pinned ? 1 : 0}|${chat.updated || ""}`;
+  }
+
+  function chatRow(chat, active, minute) {
+    const key = chatRowKey(chat, active, minute);
+    const cached = chatRowCache.get(chat.id);
+    if (cached && cached.key === key && cached.element.isConnected) return cached.element;
+    const element = Studio.components.listRow({
+      className: "chat-list-item",
+      active,
+      title: `${chat.pinned ? "Pinned · " : ""}${chat.title}`,
+      subtitle: chat.preview || chat.model_name || "No messages",
+      meta: format.ago(chat.updated),
+      onclick: () => {
+        setConversationList(false);
+        if (state.doc && state.doc.id === chat.id) return;
+        Studio.views.go("chat", { id: chat.id });
+      },
+    });
+    chatRowCache.set(chat.id, { key, element });
+    return element;
+  }
+
+  function setConversationList(open) {
+    const layoutElement = document.querySelector(".chat-layout");
+    if (!layoutElement) return;
+    layoutElement.classList.toggle("show-list", Boolean(open));
+    $("chat-conversations").setAttribute("aria-expanded", String(Boolean(open)));
+  }
+
   function renderChatList() {
-    const list = Studio.ui.render($("chat-list"));
+    const docId = state.doc ? state.doc.id : "";
+    const minute = Math.floor(Date.now() / 60000);
+    const previous = chatListState;
+    const unchanged = previous.docId === docId && previous.search === state.search
+      && previous.minute === minute && previous.chats.length === state.chats.length
+      && state.chats.every((chat, index) => {
+        const old = previous.chats[index];
+        return old && old.id === chat.id && old.title === chat.title
+          && old.preview === chat.preview && old.model_name === chat.model_name
+          && old.pinned === chat.pinned && old.updated === chat.updated;
+      });
+    if (unchanged) return;
+    chatListState = {
+      docId, search: state.search, minute,
+      chats: state.chats.map(chat => ({
+        id: chat.id, title: chat.title, preview: chat.preview,
+        model_name: chat.model_name, pinned: chat.pinned, updated: chat.updated,
+      })),
+    };
+    const list = $("chat-list");
     const query = state.search.toLowerCase();
     const chats = state.chats.filter(chat => !query || `${chat.title} ${chat.preview} ${chat.model_name}`.toLowerCase().includes(query));
     if (!chats.length) {
-      list.append(Studio.ui.empty({ compact: true, text: query ? "No conversations match." : "Start a new conversation." }));
+      const text = query ? "No conversations match." : "Start a new conversation.";
+      if (chatListEmpty !== text) {
+        chatListEmpty = text;
+        Studio.ui.render(list, Studio.ui.empty({ compact: true, text }));
+      }
       return;
     }
-    for (const chat of chats) {
-      list.append(Studio.components.listRow({
-        className: "chat-list-item",
-        active: Boolean(state.doc && state.doc.id === chat.id),
-        title: `${chat.pinned ? "Pinned · " : ""}${chat.title}`,
-        subtitle: chat.preview || chat.model_name || "No messages",
-        meta: format.ago(chat.updated),
-        onclick: () => {
-          const layoutElement = document.querySelector(".chat-layout");
-          if (layoutElement) layoutElement.classList.remove("show-list");
-          if (state.doc && state.doc.id === chat.id) return;
-          Studio.views.go("chat", { id: chat.id });
-        },
-      }));
+    chatListEmpty = "";
+    const desired = chats.map(chat => chatRow(chat, Boolean(docId && chat.id === docId), minute));
+    const existing = Array.from(list.children);
+    let keep = 0;
+    while (keep < existing.length && keep < desired.length && existing[keep] === desired[keep]) keep += 1;
+    if (keep < existing.length || keep < desired.length) {
+      for (let index = existing.length - 1; index >= keep; index -= 1) existing[index].remove();
+      if (keep < desired.length) {
+        const fragment = document.createDocumentFragment();
+        for (const element of desired.slice(keep)) fragment.append(element);
+        list.append(fragment);
+      }
+    }
+    if (chatRowCache.size > state.chats.length) {
+      const live = new Set(state.chats.map(chat => chat.id));
+      for (const id of [...chatRowCache.keys()]) if (!live.has(id)) chatRowCache.delete(id);
     }
   }
 
@@ -233,17 +328,187 @@
 
   function updateScrollButton() {
     const messages = $("chat-messages");
-    $("chat-scroll").classList.toggle("hidden", state.pinned || !messages.children.length);
+    const button = $("chat-scroll");
+    const hidden = state.pinned || !messages.children.length;
+    button.classList.toggle("hidden", hidden);
+    button.classList.toggle("streaming", !hidden && state.streaming);
+    button.textContent = !hidden && state.streaming ? "New output ↓" : "Jump to latest";
   }
+
+  let scrollFrame = 0;
 
   function scrollMessages(force = false) {
     if (!force && !state.pinned) return;
     state.pinned = true;
-    const messages = $("chat-messages");
-    requestAnimationFrame(() => {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      const messages = $("chat-messages");
       messages.scrollTop = messages.scrollHeight;
       updateScrollButton();
     });
+  }
+
+  /* Streaming deltas arrive token by token.  Re-parsing the whole reply as
+     Markdown for every token is quadratic, so coalesce the live paint to one
+     per ~80ms.  The authoritative final text is rendered by renderMessages()
+     when the stream ends, so nothing is lost if a paint is skipped. */
+  let liveTimer = 0;
+  let liveMessage = null;
+  let reasoningTimer = 0;
+  let reasoningMessage = null;
+  let liveClock = 0;
+  let liveStream = null;
+  const liveParts = new WeakMap();
+
+  function stopStream() {
+    if (state.abort) state.abort.abort();
+  }
+
+  function liveEntry(message) {
+    return message ? liveParts.get(message) || null : null;
+  }
+
+  /* The live row is created with the pending message so the reader sees a
+     state, an elapsed time and a stop control even before the first token. */
+  function streamLive(message) {
+    if (!message.pending || message.role !== "assistant" || message.swarm) return null;
+    const phase = h("strong", { class: "stream-phase", text: "Waiting for the model…" });
+    const metrics = h("span", { class: "stream-metrics muted tiny" });
+    const reasoningText = h("div", { class: "reasoning-live" });
+    const summary = h("summary", { text: "Thinking" });
+    const knownReasoning = message.reasoning_open !== undefined;
+    const reasoning = h("details", { class: "stream-reasoning hidden",
+      open: knownReasoning ? Boolean(message.reasoning_open) : false }, summary, reasoningText);
+    reasoning.addEventListener("toggle", () => {
+      message.reasoning_open = reasoning.open;
+      const entry = liveParts.get(message);
+      if (entry) entry.reasoningOpen = true;
+    });
+    if (message.reasoning) {
+      reasoning.classList.remove("hidden");
+      reasoningText.textContent = message.reasoning.slice(-4000);
+    }
+    const row = h("div", { class: "stream-live", "aria-live": "off" },
+      h("span", { class: "spinner", "aria-hidden": "true" }),
+      phase, metrics, h("span", { class: "grow" }),
+      Studio.ui.button("Stop", { small: true, kind: "danger", onclick: stopStream }));
+    liveParts.set(message, {
+      phase, metrics, reasoning, summary, reasoningText,
+      reasoningOpen: knownReasoning,
+    });
+    return h("div", { class: "stream-live-stack" }, row, reasoning);
+  }
+
+  function beginLive(message) {
+    if (!message) return;
+    if (liveStream && liveStream.message === message) return;
+    liveStream = { message, started: performance.now(), firstToken: 0, chars: 0 };
+    const entry = liveEntry(message);
+    if (entry) entry.phase.textContent = "Waiting for the model…";
+    if (!liveClock) liveClock = setInterval(paintLiveClock, 250);
+  }
+
+  function paintLiveClock() {
+    if (!liveStream) {
+      clearInterval(liveClock);
+      liveClock = 0;
+      return;
+    }
+    if (document.hidden) return;
+    paintLiveMetrics(liveStream.message);
+  }
+
+  function paintLiveMetrics(message) {
+    const entry = liveEntry(message);
+    const stream = liveStream && liveStream.message === message ? liveStream : null;
+    if (!entry || !stream) return;
+    const elapsed = Math.max(0, (performance.now() - stream.started) / 1000);
+    const parts = [`${elapsed.toFixed(1)}s`];
+    if (stream.firstToken) {
+      parts.push(`${((stream.firstToken - stream.started) / 1000).toFixed(1)}s first token`);
+      if (elapsed > 0.5 && stream.chars) {
+        const tokens = Studio.tokens && Studio.tokens.estimate
+          ? Studio.tokens.estimate(message.content, "tokens") : 0;
+        if (tokens) parts.push(`~${tokens.toLocaleString()} tok`);
+        if (tokens && elapsed > 1) parts.push(`~${Math.round(tokens / elapsed)} tok/s`);
+      }
+    }
+    entry.metrics.textContent = parts.join(" · ");
+  }
+
+  function endLive(message) {
+    if (message && liveStream && liveStream.message !== message) return;
+    liveStream = null;
+    if (liveClock) clearInterval(liveClock);
+    liveClock = 0;
+  }
+
+  function liveContentFor(message) {
+    if (!state.doc) return null;
+    const index = state.doc.messages.indexOf(message);
+    if (index < 0) return null;
+    const article = $("chat-messages").children[index];
+    return article ? article.querySelector(".message-content") : null;
+  }
+
+  function paintLiveReply(message) {
+    liveTimer = 0;
+    if (!message || message !== liveMessage) return;
+    const target = liveContentFor(message);
+    if (!target) return;
+    target.classList.add("streaming");
+    Studio.markdown.stream(target, message.content);
+    const entry = liveEntry(message);
+    if (entry) entry.phase.textContent = "Writing";
+    paintLiveMetrics(message);
+    scrollMessages();
+    updateScrollButton();
+  }
+
+  function scheduleLiveReply(message) {
+    liveMessage = message;
+    if (liveTimer || document.hidden) return;
+    /* Long replies cost more to scan; relax the cadence instead of letting a
+       50k-character answer compete with input and scrolling. */
+    const delay = message.content.length > 24000 ? 160 : 80;
+    liveTimer = setTimeout(() => paintLiveReply(message), delay);
+  }
+
+  function paintReasoning(message) {
+    reasoningTimer = 0;
+    if (!message || message !== reasoningMessage) return;
+    const entry = liveEntry(message);
+    if (!entry) return;
+    entry.reasoning.classList.remove("hidden");
+    if (!entry.reasoningOpen) {
+      entry.reasoning.open = true;
+      entry.reasoningOpen = true;
+    }
+    entry.reasoningText.textContent = message.reasoning.slice(-4000);
+    entry.reasoningText.scrollTop = entry.reasoningText.scrollHeight;
+    entry.summary.textContent = `Thinking · ${message.reasoning.length.toLocaleString()} chars`;
+    entry.phase.textContent = message.content ? "Writing" : "Thinking…";
+    scrollMessages();
+  }
+
+  function scheduleReasoning(message) {
+    reasoningMessage = message;
+    if (reasoningTimer || document.hidden) return;
+    reasoningTimer = setTimeout(() => paintReasoning(message), 100);
+  }
+
+  function cancelLiveReply() {
+    liveMessage = null;
+    reasoningMessage = null;
+    if (liveTimer) {
+      clearTimeout(liveTimer);
+      liveTimer = 0;
+    }
+    if (reasoningTimer) {
+      clearTimeout(reasoningTimer);
+      reasoningTimer = 0;
+    }
   }
 
   function resizeComposer() {
@@ -591,7 +856,10 @@
       refreshPreviewSelection();
       generate();
     } });
-    const cancel = Studio.ui.button("Cancel", { small: true, onclick: renderMessages });
+    const cancel = Studio.ui.button("Cancel", { small: true, onclick: () => {
+      messageCache.delete(message);
+      renderMessages();
+    } });
     const holder = h("div", { class: "message-content stack" }, area, h("div", { class: "row" }, save, cancel));
     const article = $("chat-messages").children[index];
     if (article) Studio.ui.render(article.querySelector(".message-content"), holder);
@@ -658,7 +926,7 @@
     }
   }
 
-  function messageElement(message, index) {
+  function messageElement(message, index, options = {}) {
     const article = h("article", { class: `message ${message.role}${message.error ? " error" : ""}` });
     const name = message.role === "user" ? "You" : message.role === "assistant" ? (message.model_name || state.doc.model_name || "Assistant") : "System";
     const meta = [];
@@ -666,27 +934,31 @@
     if (message.elapsed) meta.push(format.seconds(message.elapsed));
     if (message.usage && message.usage.completion_tokens !== undefined) meta.push(`${message.usage.completion_tokens} output tokens`);
     if (message.finish_reason && message.finish_reason !== "stop") meta.push(format.title(message.finish_reason));
-    article.append(h("div", { class: "message-head" }, h("strong", { text: name }),
-      h("span", { text: meta.join(" · ") }), messageActions(message, index)));
-    if (message.reasoning) {
-      article.append(h("details", { class: "message-reasoning" },
+    const head = h("div", { class: "message-head" }, h("strong", { text: name }),
+      h("span", { text: meta.join(" · ") }), messageActions(message, index));
+    article.append(head);
+    const live = streamLive(message);
+    if (live) article.append(live);
+    if (message.reasoning && !message.pending) {
+      article.append(h("details", { class: "message-reasoning", open: Boolean(message.reasoning_open) },
         h("summary", { text: "Reasoning" }), h("div", { text: message.reasoning })));
     }
     if ((message.attachments || []).length) article.append(messageAttachments(message.attachments, index));
+    const content = h("div", { class: `message-content${message.pending ? " streaming" : ""}` });
+    if (message.pending) content.setAttribute("aria-live", "off");
+    if (message.role === "assistant") {
+      const placeholder = state.streaming && index === state.doc.messages.length - 1
+        && !(message.swarm && message.pending) ? "…" : "";
+      Studio.markdown.into(content, message.content || placeholder, options.lazy ? { lazy: true } : undefined);
+      if (!message.pending && message.content) decorateCodeBlocks(content, message, index);
+    } else content.textContent = message.content || "";
+    article.append(content);
+    if (message.notice) article.append(h("div", { class: "help", text: message.notice }));
     if (message.swarm) {
       const swarmHolder = h("div", { class: "message-swarm" });
       Studio.swarm.render(swarmHolder, message.swarm, { live: Boolean(message.pending) });
       article.append(swarmHolder);
     }
-    const content = h("div", { class: "message-content" });
-    if (message.role === "assistant") {
-      const placeholder = state.streaming && index === state.doc.messages.length - 1
-        && !(message.swarm && message.pending) ? "…" : "";
-      Studio.markdown.into(content, message.content || placeholder);
-      if (!message.pending && message.content) decorateCodeBlocks(content, message, index);
-    } else content.textContent = message.content || "";
-    article.append(content);
-    if (message.notice) article.append(h("div", { class: "help", text: message.notice }));
     if (message.served_by) article.append(h("div", { class: "help", text: `Served by ${message.served_by}` }));
     if (message.error && !state.streaming && index === state.doc.messages.length - 1) {
       const retry = solo => () => {
@@ -710,18 +982,162 @@
     return article;
   }
 
+  let messageCache = new WeakMap();
+  let messageCacheDoc = null;
+
+  function messageMetrics(message) {
+    return [
+      message.tokens_per_second ? Number(message.tokens_per_second).toFixed(1) : "",
+      message.elapsed || "",
+      message.usage && message.usage.completion_tokens !== undefined ? message.usage.completion_tokens : "",
+      message.finish_reason || "",
+      message.model_name || "",
+      message.served_by || "",
+    ].join("|");
+  }
+
+  function attachmentsKey(message) {
+    return (message.attachments || []).map(item =>
+      `${item.id || ""}:${item.name || ""}:${item.size || 0}:${item.kind || ""}`).join("|");
+  }
+
+  function swarmKey(message) {
+    if (!message.swarm) return "";
+    const meta = message.swarm.meta || {};
+    return `${meta.status || ""}:${meta.finished ? 1 : 0}:${meta.ok ? 1 : 0}:${(message.swarm.agents || []).length}`;
+  }
+
+  function actionsKey(message, index) {
+    const last = state.doc && index === state.doc.messages.length - 1;
+    return `${state.streaming ? 1 : 0}|${message.role}|${message.content ? 1 : 0}|${last ? 1 : 0}`;
+  }
+
+  function messageTail(message, index) {
+    const last = state.doc && index === state.doc.messages.length - 1;
+    return Boolean(last && (state.streaming || message.error));
+  }
+
+  function messageCacheMatches(entry, message, index) {
+    return Boolean(entry)
+      && entry.index === index
+      && entry.docName === (state.doc ? state.doc.model_name || "" : "")
+      && entry.role === message.role
+      && entry.content === message.content
+      && entry.reasoning === (message.reasoning || "")
+      && entry.pending === Boolean(message.pending)
+      && entry.error === (message.error || "")
+      && entry.notice === (message.notice || "")
+      && entry.metrics === messageMetrics(message)
+      && entry.attachments === attachmentsKey(message)
+      && entry.swarm === swarmKey(message)
+      && entry.tail === messageTail(message, index);
+  }
+
+  function cacheMessage(message, index, element) {
+    messageCache.set(message, {
+      index, element,
+      docName: state.doc ? state.doc.model_name || "" : "",
+      role: message.role,
+      content: message.content,
+      reasoning: message.reasoning || "",
+      pending: Boolean(message.pending),
+      error: message.error || "",
+      notice: message.notice || "",
+      metrics: messageMetrics(message),
+      attachments: attachmentsKey(message),
+      swarm: swarmKey(message),
+      tail: messageTail(message, index),
+    });
+    element.__actionsKey = actionsKey(message, index);
+  }
+
+  /* Reconcile the message list by element identity: appending a turn only
+     touches the new article, and a finished stream rebuilds only the reply.
+     Without this, every send and every completed reply re-parsed the whole
+     conversation Markdown and re-highlighted all its code blocks. */
   function renderMessages(options = {}) {
     state.needsRender = false;
+    cancelLiveReply();
+    cancelSwarmCard();
     const messages = $("chat-messages");
     const wasPinned = state.pinned && nearBottom();
     const previousTop = messages.scrollTop;
-    const root = Studio.ui.render(messages);
-    if (!state.doc || !state.doc.messages.length) {
+    if (messageCacheDoc !== state.doc) {
+      messageCacheDoc = state.doc;
+      messageCache = new WeakMap();
+    }
+    const desired = [];
+    const reused = [];
+    if (state.doc && state.doc.messages.length) {
+      const eagerFrom = Math.max(0, state.doc.messages.length - 2);
+      state.doc.messages.forEach((message, index) => {
+        const entry = messageCache.get(message);
+        if (messageCacheMatches(entry, message, index)) {
+          desired.push(entry.element);
+          reused.push({ element: entry.element, message, index });
+        } else {
+          const element = messageElement(message, index, { lazy: index < eagerFrom });
+          cacheMessage(message, index, element);
+          desired.push(element);
+        }
+      });
+    }
+    if (!desired.length) {
+      Studio.ui.render(messages);
       const entry = currentModel();
-      root.append(Studio.ui.empty({ icon: "chat", title: entry ? `Chat with ${entry.name}` : "Choose a model",
-        text: entry && !entry.available ? entry.reason : "Messages are saved on this machine. Attach a file, ask for a design, or open the preview panel for code without leaving the chat." }));
+      if (!entry) {
+        const hasModels = Studio.models.list.some(model => model.capabilities.chat && model.available);
+        messages.append(Studio.ui.empty({
+          icon: "chat", title: "Choose a model",
+          text: hasModels
+            ? "Pick a chat model in the toolbar to start the conversation."
+            : "Add or download a chat model, or connect a provider to use one from elsewhere.",
+          actions: hasModels ? [
+            Studio.ui.button("Choose a model", { kind: "primary", onclick: () => $("chat-model").focus() }),
+            Studio.ui.button("Model settings", { onclick: () => $("chat-settings").click() }),
+          ] : [
+            Studio.ui.button("Find a model", { kind: "primary", onclick: () => Studio.views.go("models", { tab: "discover" }) }),
+            Studio.ui.button("Add an endpoint", { onclick: () => $("chat-provider").click() }),
+          ],
+        }));
+      } else if (!entry.available) {
+        messages.append(Studio.ui.empty({
+          icon: "alert", title: `${entry.name} is unavailable`,
+          text: entry.reason || "Start its runtime or choose another model.",
+          actions: [
+            Studio.ui.button("Choose another model", { kind: "primary", onclick: () => $("chat-model").focus() }),
+            Studio.ui.button("Model settings", { onclick: () => $("chat-settings").click() }),
+          ],
+        }));
+      } else {
+        messages.append(Studio.ui.empty({
+          icon: "chat", title: `Chat with ${entry.name}`,
+          text: "Messages are saved on this machine. Attach a file, ask for a design, or open the preview panel for code without leaving the chat.",
+          actions: [0, 2, 5].map(index => Studio.ui.button(PROMPTS[index][0], {
+            small: true, onclick: () => applyPrompt(PROMPTS[index][1]),
+          })),
+        }));
+      }
     } else {
-      state.doc.messages.forEach((message, index) => root.append(messageElement(message, index)));
+      const existing = Array.from(messages.children);
+      let keep = 0;
+      while (keep < existing.length && keep < desired.length && existing[keep] === desired[keep]) keep += 1;
+      if (keep < existing.length || keep < desired.length) {
+        for (let index = existing.length - 1; index >= keep; index -= 1) existing[index].remove();
+        if (keep < desired.length) {
+          const fragment = document.createDocumentFragment();
+          for (const element of desired.slice(keep)) fragment.append(element);
+          messages.append(fragment);
+        }
+      }
+      for (const item of reused) {
+        const key = actionsKey(item.message, item.index);
+        if (item.element.__actionsKey === key) continue;
+        item.element.__actionsKey = key;
+        const head = item.element.querySelector(".message-head");
+        const actions = head ? head.querySelector(".message-actions") : null;
+        if (actions) actions.replaceWith(messageActions(item.message, item.index));
+      }
     }
     updateHeader();
     if (options.keepScroll && !wasPinned) {
@@ -852,7 +1268,7 @@
     }
     const pieces = [entry.kind_label, entry.source_label];
     if (state.doc.pinned) pieces.push("pinned");
-    if (state.mode === "swarm") pieces.push(`swarm: ${state.swarmOptions.strategy.replace(/_/g, " ")}`);
+    if (state.mode === "swarm") pieces.push(`swarm: ${state.swarmOptions.strategy.replace(/_/g, " ")} · ${Math.round(state.swarmOptions.max_seconds / 60)} min`);
     pieces.push(`${live.attachments} attachment${live.attachments === 1 ? "" : "s"}`);
     if (live.window) pieces.push(`${format.compact(live.used)} / ${format.compact(live.window)} ${live.unit} (${format.percent(live.percent)})`);
     else pieces.push("context window unknown");
@@ -1033,7 +1449,39 @@
   /* -- artifact preview ----------------------------------------------------- */
   function allArtifacts() {
     const artifacts = state.doc ? Studio.artifacts.collect(state.doc.messages) : [];
-    return artifacts.concat(Studio.artifacts.fromAttachments(state.attachments, "draft", -1));
+    return artifacts.concat(
+      Studio.artifacts.fromAttachments(state.attachments, "draft", -1),
+      Array.from(state.preview.workspace.values()),
+    );
+  }
+
+  /* Files a swarm wrote live in the conversation workspace.  Fetch only the
+     paths named by a run (bounded), and cache each artifact by path. */
+  async function loadWorkspaceFiles(paths, options = {}) {
+    if (!state.doc || !state.doc.id) return [];
+    const chatId = state.doc.id;
+    const refresh = Boolean(options.refresh);
+    const unique = [...new Set((Array.isArray(paths) ? paths : [])
+      .map(path => String(path || "").trim()).filter(Boolean))];
+    const loaded = [];
+    for (const path of unique.slice(0, 8)) {
+      const cached = refresh ? null : state.preview.workspace.get(path);
+      if (cached) { loaded.push(cached); continue; }
+      if (refresh) state.preview.workspace.delete(path);
+      try {
+        const data = await api(`/api/chats/${encodeURIComponent(chatId)}/file`
+          + `?path=${encodeURIComponent(path)}`);
+        if (!state.doc || state.doc.id !== chatId) return loaded;
+        const artifact = Studio.artifacts.workspaceArtifact(data && data.file ? data.file : data);
+        if (artifact) {
+          state.preview.workspace.set(path, artifact);
+          loaded.push(artifact);
+        }
+      } catch (error) {
+        // A deleted, binary or oversized file simply has no preview.
+      }
+    }
+    return loaded;
   }
 
   function currentArtifact(artifacts) {
@@ -1164,13 +1612,14 @@
       : "Code, designs, diagrams and attachments from this conversation.";
     renderPreviewModes(selected);
     renderPreviewList(artifacts, selected);
-    const renderKey = selected ? `${selected.id}:${state.preview.view}` : "empty";
+    const renderKey = selected
+      ? `${selected.id}:${state.preview.view}:${selected.version || 0}` : "empty";
     const changed = renderKey !== state.preview.rendered;
     const body = $("chat-preview-body");
     if (!selected) {
       Studio.ui.render(body, Studio.ui.empty({
         compact: true, icon: "preview", title: "Nothing to preview yet",
-        text: "Ask for a design or code block, or attach an image. Previews also appear here from every reply in the conversation.",
+        text: "Ask for a design or code block, attach an image, or let a swarm write a file in the conversation workspace. Previews also appear here from every reply in the conversation.",
         actions: [
           Studio.ui.button("Attach a file", { small: true, kind: "primary", onclick: () => $("chat-file-input").click() }),
           Studio.ui.button(state.autoPreview ? "Turn off automatic previews" : "Open previews automatically", {
@@ -1378,6 +1827,9 @@
   function abandonGeneration() {
     const wasStreaming = state.streaming;
     state.runToken += 1;
+    cancelLiveReply();
+    endLive();
+    cancelSwarmCard();
     const controller = state.abort;
     state.abort = null;
     state.streaming = false;
@@ -1408,6 +1860,7 @@
     state.preview.closedIds = new Set();
     state.preview.view = "preview";
     state.preview.rendered = "";
+    state.preview.workspace = new Map();
     resetComposer();
     history.replaceState(null, "", `#/chat${Studio.query({ model: state.doc.model, new: "1" })}`);
     Studio.ui.fillModels($("chat-model"), { filter: entry => entry.capabilities.chat, value: state.doc.model, includeUnavailable: true });
@@ -1463,6 +1916,7 @@
     if (typeof document.title !== "string" || !document.title.trim()) document.title = "New chat";
     state.doc = document;
     state.preview.selected = null;
+    state.preview.workspace = new Map();
     resetComposer();
     const selected = Studio.ui.fillModels($("chat-model"), { filter: entry => entry.capabilities.chat, value: state.doc.model, includeUnavailable: true });
     if (selected && selected !== state.doc.model) {
@@ -1475,6 +1929,16 @@
     renderChatList();
     resizeComposer();
     renderPreview();
+    const written = [];
+    for (const message of state.doc.messages) {
+      const files = message.swarm && message.swarm.meta && message.swarm.meta.changedFiles;
+      if (Array.isArray(files)) written.push(...files);
+    }
+    if (written.length) {
+      loadWorkspaceFiles(written).then(() => {
+        if (state.doc && state.doc.id === id) refreshPreviewSelection();
+      });
+    }
   }
 
   function setStreaming(value) {
@@ -1505,45 +1969,71 @@
     Studio.swarm.applyEvent(message.swarm, event);
   }
 
-  let swarmFrame = 0;
+  let swarmTimer = 0;
   let swarmCardMessage = null;
 
-  /* Redraw only the card of the message being streamed; a full message render
+  function paintSwarmCard(message) {
+    if (!message || !state.doc || !message.swarm) return;
+    const index = state.doc.messages.indexOf(message);
+    const article = index < 0 ? null : $("chat-messages").children[index];
+    const holder = article ? article.querySelector(".message-swarm") : null;
+    if (!holder) return;
+    const active = document.activeElement && holder.contains(document.activeElement)
+      ? document.activeElement : null;
+    const section = active ? active.closest("details[data-swarm-key]") : null;
+    const focusKey = section ? section.getAttribute("data-swarm-key") : null;
+    const scrolls = new Map();
+    const pinned = new Map();
+    for (const node of holder.querySelectorAll("[data-swarm-output]")) {
+      const key = node.getAttribute("data-swarm-output");
+      scrolls.set(key, node.scrollTop);
+      pinned.set(key, node.scrollHeight - node.scrollTop - node.clientHeight < 24);
+    }
+    Studio.swarm.render(holder, message.swarm, { live: Boolean(message.pending) });
+    for (const node of holder.querySelectorAll("[data-swarm-output]")) {
+      const key = node.getAttribute("data-swarm-output");
+      if (pinned.get(key)) {
+        node.scrollTop = node.scrollHeight;
+      } else {
+        const top = scrolls.get(key);
+        if (top) node.scrollTop = top;
+      }
+    }
+    if (focusKey) {
+      const next = Array.from(holder.querySelectorAll("details[data-swarm-key]"))
+        .find(node => node.getAttribute("data-swarm-key") === focusKey);
+      const control = next ? next.querySelector("summary") : null;
+      if (control) control.focus({ preventScroll: true });
+    }
+    if (message.pending) scrollMessages();
+  }
+
+  /* Agent deltas can arrive dozens of times a second.  Redraw the card at most
+     ~8 times a second, immediately on a terminal event; a full message render
      would discard the reply Markdown the user is already reading. */
-  function scheduleSwarmCard(message) {
+  function scheduleSwarmCard(message, immediate = false) {
     swarmCardMessage = message;
-    if (swarmFrame) return;
-    swarmFrame = requestAnimationFrame(() => {
-      swarmFrame = 0;
+    if (immediate && swarmTimer) { clearTimeout(swarmTimer); swarmTimer = 0; }
+    if (immediate) {
       const target = swarmCardMessage;
       swarmCardMessage = null;
-      if (!target || !state.doc || !target.swarm) return;
-      const index = state.doc.messages.indexOf(target);
-      const article = index < 0 ? null : $("chat-messages").children[index];
-      const holder = article ? article.querySelector(".message-swarm") : null;
-      if (holder) {
-        const active = document.activeElement && holder.contains(document.activeElement)
-          ? document.activeElement : null;
-        const section = active ? active.closest("details[data-swarm-key]") : null;
-        const focusKey = section ? section.getAttribute("data-swarm-key") : null;
-        const scrolls = new Map();
-        for (const node of holder.querySelectorAll("[data-swarm-output]")) {
-          scrolls.set(node.getAttribute("data-swarm-output"), node.scrollTop);
-        }
-        Studio.swarm.render(holder, target.swarm, { live: Boolean(target.pending) });
-        for (const node of holder.querySelectorAll("[data-swarm-output]")) {
-          const top = scrolls.get(node.getAttribute("data-swarm-output"));
-          if (top) node.scrollTop = top;
-        }
-        if (focusKey) {
-          const next = Array.from(holder.querySelectorAll("details[data-swarm-key]"))
-            .find(node => node.getAttribute("data-swarm-key") === focusKey);
-          const control = next ? next.querySelector("summary") : null;
-          if (control) control.focus({ preventScroll: true });
-        }
-        if (target.pending) scrollMessages();
-      }
-    });
+      paintSwarmCard(target);
+      return;
+    }
+    if (swarmTimer) return;
+    swarmTimer = setTimeout(() => {
+      swarmTimer = 0;
+      const target = swarmCardMessage;
+      swarmCardMessage = null;
+      paintSwarmCard(target);
+    }, 120);
+  }
+
+  function cancelSwarmCard() {
+    swarmCardMessage = null;
+    if (!swarmTimer) return;
+    clearTimeout(swarmTimer);
+    swarmTimer = 0;
   }
 
   async function generateSwarm() {
@@ -1570,8 +2060,6 @@
     };
     target.messages.push(assistant);
     renderMessages();
-    const last = $("chat-messages").lastElementChild;
-    const live = last ? last.querySelector(".message-content") : null;
     setStreaming(true);
     const token = ++state.runToken;
     const controller = new AbortController();
@@ -1606,19 +2094,13 @@
             assistant.swarm.meta.error = assistant.error;
           }
           if (!ownsUi()) return;
-          if (event.type === "swarm_agent_delta") {
-            if (live && live.isConnected) {
-              // The agent card carries the live text; the reply area stays quiet
-              // until the leader synthesises an answer.
-              scrollMessages();
-            }
-          } else if (event.message) {
+          if (event.type !== "swarm_agent_delta" && event.message) {
             $("chat-stream-status").textContent = event.message;
           }
           if (event.type === "done" || event.type === "error") {
             $("chat-stream-status").textContent = "";
           }
-          scheduleSwarmCard(assistant);
+          scheduleSwarmCard(assistant, event.type === "done" || event.type === "error");
         },
       });
       if (!completed && !assistant.error && controller.signal.aborted) {
@@ -1646,6 +2128,7 @@
       }
     } finally {
       delete assistant.pending;
+      cancelSwarmCard();
       const current = ownsUi();
       if (current) {
         state.abort = null;
@@ -1671,14 +2154,25 @@
         return;
       }
       refreshPreviewSelection();
-      if (completed) {
-        if (state.voiceAuto && Studio.voice && Studio.voice.synthesisSupported()) {
+      const changed = assistant.swarm && Array.isArray(assistant.swarm.meta.changedFiles)
+        ? assistant.swarm.meta.changedFiles : [];
+      if (completed || changed.length) {
+        if (completed && state.voiceAuto && Studio.voice && Studio.voice.synthesisSupported()) {
           state.spokenMessage = Studio.voice.speak(assistant.content || "") ? assistant : null;
         }
-        const candidates = Studio.artifacts.messageArtifacts(assistant, assistantIndex)
-          .filter(item => !item.attachment);
-        const artifact = candidates.filter(item => item.previewable).pop() || candidates.pop();
-        autoPreviewArtifact(artifact);
+        const messageArtifact = () => {
+          const candidates = Studio.artifacts.messageArtifacts(assistant, assistantIndex)
+            .filter(item => !item.attachment);
+          autoPreviewArtifact(candidates.filter(item => item.previewable).pop() || candidates.pop());
+        };
+        const workspace = changed.length
+          ? await loadWorkspaceFiles(changed, { refresh: true }) : [];
+        if (!ownsUi()) return;
+        const written = workspace.filter(item => item.previewable).pop() || workspace.pop();
+        if (written) autoPreviewArtifact(written);
+        else if (completed) messageArtifact();
+        if (state.preview.open) renderPreview();
+        else refreshPreviewSelection();
       }
     }
   }
@@ -1700,8 +2194,8 @@
     const assistant = { role: "assistant", content: "", reasoning: "", model: entry.id, model_name: entry.name, pending: true };
     target.messages.push(assistant);
     renderMessages();
-    const live = $("chat-messages").lastElementChild && $("chat-messages").lastElementChild.querySelector(".message-content");
     setStreaming(true);
+    beginLive(assistant);
     const token = ++state.runToken;
     const controller = new AbortController();
     state.abort = controller;
@@ -1722,14 +2216,23 @@
           if (event.type === "status" && ownsUi()) $("chat-stream-status").textContent = event.message || "Preparing model…";
           if (event.type === "delta") {
             assistant.content += event.text || "";
-            if (ownsUi() && live && live.isConnected) {
-              Studio.markdown.into(live, assistant.content, { enhance: false });
-              scrollMessages();
+            if (ownsUi()) {
+              beginLive(assistant);
+              if (liveStream && liveStream.message === assistant) {
+                if (!liveStream.firstToken) liveStream.firstToken = performance.now();
+                liveStream.chars = assistant.content.length;
+              }
+              if ($("chat-stream-status").textContent) $("chat-stream-status").textContent = "";
+              scheduleLiveReply(assistant);
             }
           }
           if (event.type === "reasoning") {
             assistant.reasoning += event.text || "";
-            if (ownsUi()) $("chat-stream-status").textContent = "Reasoning…";
+            if (ownsUi()) {
+              beginLive(assistant);
+              $("chat-stream-status").textContent = "Reasoning…";
+              scheduleReasoning(assistant);
+            }
           }
           if (event.type === "error") {
             assistant.error = event.error || "Generation failed";
@@ -1758,6 +2261,8 @@
       }
     } finally {
       delete assistant.pending;
+      endLive(assistant);
+      cancelLiveReply();
       const current = ownsUi();
       if (current) {
         state.abort = null;
@@ -1920,6 +2425,10 @@
       type: "number", min: 0, max: 2, step: 1, value: state.swarmOptions.rounds,
       ariaLabel: "Swarm feedback rounds",
     });
+    const swarmDepth = Studio.form.control({
+      type: "select", options: SWARM_DEPTHS, value: state.swarmOptions.depth,
+      ariaLabel: "Swarm research depth",
+    });
     const swarmIpc = Studio.form.control({
       type: "checkbox", value: state.swarmOptions.ipc, ariaLabel: "Agents can message each other",
     });
@@ -1931,13 +2440,17 @@
       description: "Swarm is the default response mode: the leader plans a small team, members work in parallel and share findings, and only the leader's synthesis becomes the reply. Choose Solo in the chat header when one direct answer is enough.",
     }));
     body.append(Studio.ui.callout("info", "A swarm makes several model calls (plan, members, synthesis). Expect more tokens and a longer wait than a solo reply, especially with paid endpoints. Read-only file tools, public web and news retrieval are on by default; file editing is opt-in below, and shell commands appear only when the server owner enables OS access."));
-    body.append(h("div", { class: "form-grid three" },
-      Studio.ui.field("Strategy", swarmStrategy, "The leader may still choose a different shape."),
-      Studio.ui.field("Agents", swarmAgents, "Up to 6 members, each with its own task."),
-      Studio.ui.field("Feedback rounds", swarmRounds, "0 is a single pass; 1–2 add peer review and revision.")),
-      h("div", { class: "row wrap" },
-        h("label", { class: "check" }, swarmIpc, "Agents can message each other"),
-        h("label", { class: "check" }, swarmMemory, "Agents share a blackboard")));
+    body.append(h("div", { class: "form-grid" },
+      Studio.ui.field("Strategy", swarmStrategy,
+        "The leader may still choose a different shape. Pipeline is sequential; Map & reduce is faster for independent research."),
+      Studio.ui.field("Agents", swarmAgents, "Up to 6 members, each with its own task.")));
+    body.append(h("div", { class: "form-grid" },
+      Studio.ui.field("Feedback rounds", swarmRounds, "0 is a single pass; 1–2 add peer review and revision."),
+      Studio.ui.field("Research depth", swarmDepth,
+        "Longer budgets let slow web research finish. Tokens stay bounded by the rounds per agent.")));
+    body.append(h("div", { class: "row wrap" },
+      h("label", { class: "check" }, swarmIpc, "Agents can message each other"),
+      h("label", { class: "check" }, swarmMemory, "Agents share a blackboard")));
     const toolFiles = Studio.form.control({
       type: "checkbox", value: state.tools.files, ariaLabel: "Read files in the conversation workspace",
     });
@@ -1990,6 +2503,7 @@
         strategy: swarmStrategy.value,
         max_agents: swarmAgents.value,
         rounds: swarmRounds.value,
+        depth: swarmDepth.value,
         ipc: swarmIpc.checked,
         memory: swarmMemory.checked,
       });
@@ -2074,24 +2588,26 @@
     }
   }
 
+  function applyPrompt(text) {
+    const input = $("chat-input");
+    const existing = input.value;
+    if (existing.startsWith(text)) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      return;
+    }
+    input.value = existing.trim() ? `${text}${existing}` : text;
+    onComposerInput();
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+
   function openPrompts(anchor) {
     Studio.overlay.menu(anchor, [
       { heading: "Chat prompts" },
       ...PROMPTS.map(([label, text]) => ({
         label, icon: "sparkle",
-        onSelect: () => {
-          const input = $("chat-input");
-          const existing = input.value;
-          if (existing.startsWith(text)) {
-            input.focus();
-            input.setSelectionRange(input.value.length, input.value.length);
-            return;
-          }
-          input.value = existing.trim() ? `${text}${existing}` : text;
-          onComposerInput();
-          input.focus();
-          input.setSelectionRange(input.value.length, input.value.length);
-        },
+        onSelect: () => applyPrompt(text),
       })),
     ], { label: "Prompt presets", align: "end" });
   }
@@ -2099,7 +2615,7 @@
   function moreActions(anchor) {
     const doc = state.doc;
     Studio.overlay.menu(anchor, [
-      { label: "Conversations", icon: "chat", onSelect: () => document.querySelector(".chat-layout").classList.toggle("show-list") },
+      { label: "Conversations", icon: "chat", onSelect: () => setConversationList(!document.querySelector(".chat-layout").classList.contains("show-list")) },
       { label: "Preview panel", icon: "preview", hint: "Ctrl+Shift+P", onSelect: togglePreview },
       { label: state.autoPreview ? "Turn off automatic previews" : "Open previews automatically",
         icon: "preview", onSelect: () => setAutoPreview(!state.autoPreview) },
@@ -2155,6 +2671,12 @@
     title: "Chat", subtitle: "Persistent conversations with any local or remote model",
     glyph: "chat", hint: "Talk to any available model",
     init() {
+      /* A hidden tab still receives the stream; paint once it becomes visible. */
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden || !liveMessage) return;
+        if (liveTimer) { clearTimeout(liveTimer); liveTimer = 0; }
+        paintLiveReply(liveMessage);
+      });
       for (const [id, name] of Object.entries({
         "chat-attach": "paperclip", "chat-preview-toggle": "preview", "chat-voice": "mic",
         "chat-voice-auto": "volume", "chat-prompts": "sparkle", "chat-preview-copy": "copy",
@@ -2192,7 +2714,7 @@
       $("chat-mode-solo").addEventListener("click", () => setMode("solo"));
       $("chat-mode-swarm").addEventListener("click", () => setMode("swarm"));
       updateModeControls();
-      $("chat-stop").addEventListener("click", () => { if (state.abort) state.abort.abort(); });
+      $("chat-stop").addEventListener("click", stopStream);
       $("chat-input").addEventListener("keydown", event => {
         if (event.isComposing) return;
         if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
@@ -2224,13 +2746,31 @@
       }));
       $("chat-settings-close").addEventListener("click", () => $("chat-settings-dialog").close());
       $("chat-more").addEventListener("click", () => moreActions($("chat-more")));
-      $("chat-search").addEventListener("input", () => { state.search = $("chat-search").value.trim(); renderChatList(); });
+      $("chat-search").addEventListener("input", () => {
+        state.search = $("chat-search").value.trim();
+        scheduleChatList();
+      });
       $("chat-input").addEventListener("input", onComposerInput);
-      $("chat-messages").addEventListener("scroll", () => { state.pinned = nearBottom(); updateScrollButton(); });
+      $("chat-messages").addEventListener("scroll", () => { state.pinned = nearBottom(); updateScrollButton(); }, { passive: true });
       $("chat-scroll").addEventListener("click", () => scrollMessages(true));
+      $("chat-conversations").addEventListener("click", () => {
+        const layoutElement = document.querySelector(".chat-layout");
+        setConversationList(!layoutElement.classList.contains("show-list"));
+      });
+      $("chat-list-close").addEventListener("click", () => {
+        setConversationList(false);
+        $("chat-conversations").focus();
+      });
       $("chat-view").addEventListener("click", event => {
         const layoutElement = document.querySelector(".chat-layout");
-        if (layoutElement.classList.contains("show-list") && !event.target.closest(".chat-sidebar, #chat-more")) layoutElement.classList.remove("show-list");
+        if (layoutElement.classList.contains("show-list") && !event.target.closest(".chat-sidebar, #chat-more, #chat-conversations")) setConversationList(false);
+      });
+      $("chat-view").addEventListener("keydown", event => {
+        const layoutElement = document.querySelector(".chat-layout");
+        if (event.key === "Escape" && layoutElement.classList.contains("show-list")) {
+          setConversationList(false);
+          $("chat-conversations").focus();
+        }
       });
       $("chat-runtime").addEventListener("click", async event => {
         const result = await Studio.run(() => api("/api/models/runtimes/ollama/start", { body: {} }), event.currentTarget);
@@ -2415,6 +2955,8 @@
     deactivate() {
       state.activateToken += 1;
       state.loadToken += 1;
+      if (chatListTimer) { clearTimeout(chatListTimer); chatListTimer = 0; }
+      setConversationList(false);
       abandonGeneration();
       stopDictation(true);
       if (Studio.voice) Studio.voice.stopSpeaking();

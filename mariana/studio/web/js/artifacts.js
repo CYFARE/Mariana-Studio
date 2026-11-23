@@ -176,10 +176,40 @@
     return artifacts;
   }
 
+  /* A file the conversation workspace holds.  The shape mirrors the read-only
+     /api/chats/{id}/file response; a binary image arrives as a data URL. */
+  function workspaceArtifact(file) {
+    if (!file || !file.path) return null;
+    const artifact = attachmentArtifact({
+      id: `ws:${file.path}`,
+      name: file.name || file.path,
+      kind: file.kind === "image" ? "image" : "text",
+      text: file.content || "",
+      data_url: file.data_url || "",
+      mime: file.mime || "",
+      size: Number(file.bytes) || 0,
+      language: file.language || "",
+    }, "workspace", -1, 0);
+    if (artifact) artifact.version = Number(file.version) || 0;
+    return artifact;
+  }
+
+  const messageCache = new WeakMap();
+
   function messageArtifacts(message, index) {
     if (!message || message.pending) return [];
-    const artifacts = fromAttachments(message.attachments, `m${index}`, index);
-    return artifacts.concat(codeArtifacts(message.content, index, message.role));
+    const cached = messageCache.get(message);
+    if (cached && cached.index === index && cached.content === message.content
+        && cached.role === message.role && cached.attachments === message.attachments) {
+      return cached.artifacts;
+    }
+    const artifacts = fromAttachments(message.attachments, `m${index}`, index)
+      .concat(codeArtifacts(message.content, index, message.role));
+    messageCache.set(message, {
+      index, content: message.content, role: message.role,
+      attachments: message.attachments, artifacts,
+    });
+    return artifacts;
   }
 
   function collect(messages) {
@@ -510,6 +540,7 @@
     messageArtifacts,
     fromAttachments,
     attachmentArtifact,
+    workspaceArtifact,
     kindFor,
     previewable,
     label: labelFor,

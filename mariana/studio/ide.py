@@ -32,7 +32,10 @@ from pathlib import Path
 from ..agents.aml import ABILITY_TYPES, slugify
 from ..agents.runtime import EMPTY_REPLIES, normalize_plan, parse_model_action
 from ..agents.swarm import SwarmCoordinator, SwarmLimits, snapshot_due
-from ..agents.tools import execute_ability, json_safe
+from ..agents.tools import (
+    TOOL_ATTEMPTS, execute_ability, json_safe, nearest_tool_id, retryable_tool_failure,
+    tool_failure_hint,
+)
 from ..workspace import ensure_workspace, read_json, write_json
 from .models.context import entry_context
 from .errors import (BadRequestError, ConflictError, NotFoundError, UnavailableError,
@@ -74,7 +77,8 @@ MAX_PREVIEW_BYTES = 8_000_000
 MAX_PREVIEW_TEXT_BYTES = 2_000_000
 MAX_HEX_BYTES = 4_096
 MAX_SKILLS = 48
-MAX_PROMPT_SKILLS = 12
+MAX_PROMPT_SKILLS = MAX_SKILLS
+MAX_SKILL_PROMPT_CHARS = 6_000
 MAX_SKILL_BYTES = 48_000
 MAX_SKILL_CHARS = 5_000
 MAX_SNAPSHOT_BYTES = 4_000_000
@@ -193,6 +197,14 @@ _LANGUAGE_NAMES = {
 }
 
 _WRITE_TOOLS = frozenset({"file.write", "file.edit", "file.delete"})
+# These abilities only read or fetch; a batch of them may run concurrently.
+# Writes, deletes, shell commands and swarms always stay in call order.
+_PARALLEL_TOOLS = frozenset({
+    "file.read", "file.inspect", "file.list", "file.tree", "file.search",
+    "skill.read", "code.diagnostics", "csv.read", "sqlite.query", "git.inspect",
+    "http.fetch", "news.headlines", "browser.fetch",
+})
+MAX_PARALLEL_TOOLS = 4
 _SKILL_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _SKILL_DIRS = (".agents/skills", ".mariana/skills")
 _DIAGNOSTIC_EXTENSIONS = frozenset({".py", ".pyw", ".json", ".jsonc", ".json5"})
@@ -578,13 +590,19 @@ class IdeRun:
 
     def event(self, kind: str, **fields) -> None:
         with self.condition:
-            self._seq += 1
-            event = {"seq": self._seq, "at": _iso(), "type": kind}
-            event.update({key: json_safe(value, 200_000) for key, value in fields.items()})
-            self.events.append(event)
-            if len(self.events) > 4000:
-                self._trim_events()
+            if self.status in FINISHED:
+                return
+            self._append(kind, fields)
             self.condition.notify_all()
+
+    def _append(self, kind: str, fields: dict) -> None:
+        """Append one event; the caller holds ``condition``."""
+        self._seq += 1
+        event = {"seq": self._seq, "at": _iso(), "type": kind}
+        event.update({key: json_safe(value, 200_000) for key, value in fields.items()})
+        self.events.append(event)
+        if len(self.events) > 4000:
+            self._trim_events()
 
     def _trim_events(self) -> None:
         """Drop old streamed deltas before control events a reconnect needs."""
@@ -610,10 +628,10 @@ class IdeRun:
             self.output = output
             self.error = error
             self.ended = time.time()
-        # Emit the terminal event before flipping the status: a waiter that sees
-        # ``finished`` must also see ``run_<status>`` in ``events``.
-        self.event(f"run_{status}", output=output, error=error, **extra)
-        with self.condition:
+            # Append and flip under one lock: a waiter that sees ``finished``
+            # also sees ``run_<status>``, and no worker event can arrive after
+            # the terminal one.
+            self._append(f"run_{status}", {"output": output, "error": error, **extra})
             self.status = status
             self.condition.notify_all()
 
@@ -699,6 +717,7 @@ class IdeService:
         self._active_workspaces: set[str] = set()
         self._stats_cache: dict[str, dict] = {}
         self._index_cache: dict[str, dict] = {}
+        self._session_cache: dict[Path, tuple[int, int, dict]] = {}
         self._closed = False
 
     # -- workspaces ------------------------------------------------------
@@ -1786,6 +1805,31 @@ class IdeService:
                                 "scope": scope, "path": path})
         return records
 
+    def _skill_list_lines(self, skills: list[dict], *, include_scope: bool = False) -> list[str]:
+        """Compact skill lines for a prompt; every id stays visible.
+
+        Descriptions are bound to a small section budget so a large skill
+        collection cannot crowd pinned files and the active file out of the
+        system prompt.  When space runs out the remaining ids are listed so the
+        model can still load one with skill.read.
+        """
+        lines: list[str] = []
+        size = 0
+        for index, skill in enumerate(skills[:MAX_PROMPT_SKILLS]):
+            scope = f" ({skill['scope']})" if include_scope else ""
+            name = str(skill["name"])[:80]
+            description = str(skill["description"] or "no description")[:120]
+            line = f"- {skill['id']}{scope}: {name} — {description}"
+            if lines and size + len(line) + 1 > MAX_SKILL_PROMPT_CHARS:
+                remaining = [item["id"] for item in skills[index:]]
+                if remaining:
+                    lines.append("- Also available (call skill.read with an id): "
+                                 + ", ".join(remaining))
+                break
+            lines.append(line)
+            size += len(line) + 1
+        return lines
+
     def list_skills(self, workspace_id: str) -> list[dict]:
         """Skills the coding agent can load for this workspace."""
         return [{key: record[key] for key in ("id", "name", "description", "scope")}
@@ -1926,14 +1970,33 @@ class IdeService:
         return self.sessions_dir / f"{session_id}.json"
 
     def _load_sessions(self, newest: int | None = 200) -> list[dict]:
+        """Recent sessions; unchanged files are served from a stat-keyed cache."""
         files = sorted(self.sessions_dir.glob("ide-*.json"), key=_modified, reverse=True)
         if newest is not None:
             files = files[:newest]
         sessions = []
         for path in files:
-            data = read_json(path)
-            if isinstance(data, dict) and data.get("id"):
-                sessions.append(data)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            stamp, size = stat.st_mtime_ns, stat.st_size
+            with self._lock:
+                cached = self._session_cache.get(path)
+            if cached is not None and cached[0] == stamp and cached[1] == size:
+                data = cached[2]
+            else:
+                data = read_json(path)
+                if not isinstance(data, dict) or not data.get("id"):
+                    with self._lock:
+                        self._session_cache.pop(path, None)
+                    continue
+                with self._lock:
+                    self._session_cache[path] = (stamp, size, data)
+            sessions.append(data)
+        with self._lock:
+            if len(self._session_cache) > 512:
+                self._session_cache.clear()
         return sessions
 
     def _session_summary(self, session: dict) -> dict:
@@ -2086,7 +2149,10 @@ class IdeService:
 
     def _save_session(self, session: dict) -> None:
         session["updated"] = time.time()
-        write_json(self._session_path(session["id"]), session, indent=None)
+        path = self._session_path(session["id"])
+        write_json(path, session, indent=None)
+        with self._lock:
+            self._session_cache.pop(path, None)
 
     # -- runs ------------------------------------------------------------
     @property
@@ -2131,6 +2197,7 @@ class IdeService:
                 "swarm_rounds": MAX_SWARM_ROUNDS,
                 "swarm_seconds": MAX_SWARM_SECONDS,
                 "consolidate_percent": CONSOLIDATE_PERCENT,
+                "parallel_tools": MAX_PARALLEL_TOOLS,
             },
             "features": {
                 "lazy_tree": True,
@@ -2148,6 +2215,7 @@ class IdeService:
                 "swarm_feedback_loop": True,
                 "swarm_shared_memory": True,
                 "swarm_ipc": True,
+                "parallel_reads": True,
             },
             "security": {
                 "workspaces": "agent-workspace/ide/workspaces",
@@ -2184,7 +2252,8 @@ class IdeService:
                 **ABILITY_TYPES,
                 "skill.read": {
                     "label": "Read a skill",
-                    "description": "Load a SKILL.md from the workspace or user skills folder.",
+                    "description": ("Load one relevant skill's full instructions. Call it "
+                                    "automatically when a task matches a skill in the prompt."),
                     "params": [{"key": "name", "label": "Skill id", "type": "text"}],
                 },
                 "file.inspect": {
@@ -2645,15 +2714,10 @@ class IdeService:
                     final_recorded = True
                     break
                 messages.append({"role": "assistant", "content": reply})
-                observations = []
-                for index, call in enumerate(calls):
-                    if run.cancelled.is_set():
-                        raise _Cancelled()
-                    result = self._run_tool(
-                        run, workspace_id, session, tools, call, iteration, index, repeated,
-                        excluded,
-                    )
-                    observations.append(result)
+                observations = self._run_tool_batch(
+                    run, workspace_id, session, tools, calls, iteration, repeated, excluded,
+                )
+                for result in observations:
                     recent_calls.append((str(result.get("signature") or ""),
                                          bool(result.get("ok")),
                                          str(result.get("tool") or "")))
@@ -2860,8 +2924,9 @@ class IdeService:
             if tool["id"] == "agent.swarm":
                 continue
             if tool["type"] == "skill.read":
-                description = ("Load a SKILL.md instruction pack by id from the workspace or "
-                               "the user's skills folder.")
+                description = ("Load one relevant skill's full instructions by id from the "
+                               "workspace or the user's skills folder. Call it automatically "
+                               "when a task matches a skill description.")
                 params = [{"key": "name", "label": "Skill id", "type": "text"}]
             elif tool["type"] == "file.inspect":
                 description = ("Metadata, MIME type, dimensions, hex and a short text preview "
@@ -2885,12 +2950,10 @@ class IdeService:
         ]
         skills = self.list_skills(workspace_id)
         if skills:
-            lines.append("Available skills (call skill.read before using one):")
-            for skill in skills[:MAX_PROMPT_SKILLS]:
-                lines.append(
-                    f"- {skill['id']}: {skill['name']} — "
-                    f"{skill['description'] or 'no description'}"
-                )
+            lines.append(
+                "All skills below are available automatically. Call skill.read for each "
+                "one that fits the task before relying on it:")
+            lines.extend(self._skill_list_lines(skills))
         if excluded:
             lines.append("Hidden by the user's context rules: " + ", ".join(excluded[:16]))
         return "\n".join(lines)
@@ -3104,19 +3167,16 @@ class IdeService:
             "tools": [tool["id"] for tool in tools],
         }
 
-    def _run_tool(self, run: IdeRun, workspace_id: str, session: dict, tools: list[dict],
-                  call: dict, iteration: int, index: int,
-                  repeated: Counter, excluded: list[str] | None = None) -> dict:
-        tool_type = call["tool"]
-        arguments = call["input"] if isinstance(call["input"], dict) else {"input": call["input"]}
-        call_id = f"{iteration}-{index}"
-        definition = next((tool for tool in tools if tool["id"] == tool_type), None)
-        signature = json.dumps({"tool": tool_type, "input": arguments}, sort_keys=True,
-                               ensure_ascii=False, default=str)
-        repeated[signature] += 1
-        noted = repeated[signature] >= 3
-        run.event("tool_call", call=call_id, iteration=iteration, tool=tool_type,
-                  input=json_safe(arguments, 4000), message=f"Using {tool_type}")
+    @staticmethod
+    def _tool_signature(tool_type: str, arguments: dict) -> str:
+        return json.dumps({"tool": tool_type, "input": arguments}, sort_keys=True,
+                          ensure_ascii=False, default=str)
+
+    def _invoke_tool(self, run: IdeRun, workspace_id: str, session: dict,
+                     tools: list[dict], tool_type: str, arguments: dict,
+                     definition: dict | None, call_id: str,
+                     excluded: list[str] | None) -> tuple[dict, bool, dict | None, dict]:
+        """Run one call; safe for read-only tools to execute in a worker thread."""
         change = None
         if tool_type == "agent.swarm":
             try:
@@ -3129,25 +3189,38 @@ class IdeService:
                 observation = {"error": str(failure) or type(failure).__name__}
                 ok = False
         elif definition is None:
+            suggestion = nearest_tool_id(tool_type, [tool["id"] for tool in tools])
+            hint = f" Did you mean {suggestion!r}?" if suggestion else ""
             observation = {
                 "error": (
                     f"Tool {tool_type!r} is not enabled in {MODE_INFO[session.get('mode', 'edit')]['label']} "
-                    "mode. Use one of: " + ", ".join(tool["id"] for tool in tools)
+                    f"mode.{hint} Use one of: " + ", ".join(tool["id"] for tool in tools)
                 )
             }
             ok = False
         else:
             observation, ok, change, arguments = self._execute_defined_tool(
                 run, workspace_id, session, definition, tool_type, arguments, excluded)
-        if noted and ok:
+        return observation, ok, change, arguments
+
+    def _complete_tool(self, run: IdeRun, session: dict, tool_type: str, arguments: dict,
+                       call_id: str, iteration: int, observation, ok: bool,
+                       change: dict | None, noted: bool, signature: str,
+                       attempts: int = 1) -> dict:
+        """Publish one finished call, preserving call order and the transcript."""
+        if noted:
             observation = dict(observation) if isinstance(observation, dict) else {"result": observation}
             observation["hint"] = (
                 "You repeated the same tool call three times. Read the result, "
-                "change your approach, or finish with the final answer."
+                "change your approach, or finish with the final answer." if ok else
+                "You repeated the same failing tool call three times. Change the input or "
+                "use another tool instead of retrying it unchanged."
             )
+        bound = self._bounded_observation(observation, MAX_OBSERVATION_CHARS)
         step = {"role": "tool", "tool": tool_type, "input": json_safe(arguments, 4000),
-                "output": self._bounded_observation(observation, MAX_OBSERVATION_CHARS),
-                "ok": ok, "call": call_id, "at": _iso()}
+                "output": bound, "ok": ok, "call": call_id, "at": _iso()}
+        if attempts > 1:
+            step["attempts"] = attempts
         if change:
             step["change"] = change
         if tool_type == "agent.swarm" and isinstance(observation, dict):
@@ -3167,7 +3240,7 @@ class IdeService:
             }
         self._append_transcript(session, step)
         run.event("tool_result", call=call_id, iteration=iteration, tool=tool_type, ok=ok,
-                  output=self._bounded_observation(observation, MAX_OBSERVATION_CHARS),
+                  attempts=attempts, output=bound,
                   change=change, message=f"{tool_type} {'returned' if ok else 'failed'}")
         if tool_type == "agent.swarm" and isinstance(observation, dict):
             parent_result = self._swarm_parent_observation(observation)
@@ -3175,6 +3248,129 @@ class IdeService:
             parent_result = observation
         return {"tool": tool_type, "ok": ok, "signature": signature,
                 "result": parent_result}
+
+    def _run_tool(self, run: IdeRun, workspace_id: str, session: dict, tools: list[dict],
+                  call: dict, iteration: int, index: int,
+                  repeated: Counter, excluded: list[str] | None = None) -> dict:
+        tool_type = call["tool"]
+        arguments = call["input"] if isinstance(call["input"], dict) else {"input": call["input"]}
+        call_id = f"{iteration}-{index}"
+        definition = next((tool for tool in tools if tool["id"] == tool_type), None)
+        signature = self._tool_signature(tool_type, arguments)
+        repeated[signature] += 1
+        noted = repeated[signature] >= 3
+        run.event("tool_call", call=call_id, iteration=iteration, tool=tool_type,
+                  input=json_safe(arguments, 4000), message=f"Using {tool_type}")
+        observation, ok, change, arguments, attempts = self._invoke_with_retry(
+            run, workspace_id, session, tools, tool_type, arguments, definition,
+            call_id, excluded, iteration)
+        return self._complete_tool(run, session, tool_type, arguments, call_id, iteration,
+                                   observation, ok, change, noted, signature, attempts)
+
+    def _invoke_with_retry(self, run: IdeRun, workspace_id: str, session: dict,
+                           tools: list[dict], tool_type: str, arguments: dict,
+                           definition: dict | None, call_id: str,
+                           excluded: list[str] | None, iteration: int = 0) -> tuple:
+        """Invoke a tool, retrying a read-only call once after a temporary failure."""
+        attempts = 0
+        while True:
+            if run.cancelled.is_set():
+                raise _Cancelled()
+            attempts += 1
+            observation, ok, change, arguments = self._invoke_tool(
+                run, workspace_id, session, tools, tool_type, arguments, definition,
+                call_id, excluded)
+            error = observation.get("error") if isinstance(observation, dict) else observation
+            retryable = (tool_type in _PARALLEL_TOOLS and attempts < TOOL_ATTEMPTS
+                         and retryable_tool_failure(error))
+            if ok or not retryable:
+                break
+            run.event("log", call=call_id, iteration=iteration,
+                      tool=tool_type, attempt=attempts + 1,
+                      message=f"Retrying {tool_type} after a temporary failure")
+        if not ok:
+            hint = tool_failure_hint(tool_type, error)
+            if hint:
+                observation = ({**observation, "hint": hint}
+                               if isinstance(observation, dict)
+                               else {"error": str(observation or "failed"), "hint": hint})
+        return observation, ok, change, arguments, attempts
+
+    def _run_tool_batch(self, run: IdeRun, workspace_id: str, session: dict,
+                        tools: list[dict], calls: list[dict], iteration: int,
+                        repeated: Counter, excluded: list[str] | None = None) -> list[dict]:
+        """Run independent read-only calls together; everything else in order."""
+        definitions = {tool["id"]: tool for tool in tools}
+        parallel = (len(calls) > 1 and not run.cancelled.is_set()
+                    and all(call.get("tool") in _PARALLEL_TOOLS
+                            and call.get("tool") in definitions for call in calls))
+        if not parallel:
+            results = []
+            for index, call in enumerate(calls):
+                if run.cancelled.is_set():
+                    raise _Cancelled()
+                results.append(self._run_tool(
+                    run, workspace_id, session, tools, call, iteration, index, repeated, excluded))
+            return results
+
+        prepared = []
+        for index, call in enumerate(calls):
+            if run.cancelled.is_set():
+                raise _Cancelled()
+            tool_type = call["tool"]
+            arguments = (call["input"] if isinstance(call["input"], dict)
+                         else {"input": call["input"]})
+            call_id = f"{iteration}-{index}"
+            signature = self._tool_signature(tool_type, arguments)
+            repeated[signature] += 1
+            noted = repeated[signature] >= 3
+            run.event("tool_call", call=call_id, iteration=iteration, tool=tool_type,
+                      input=json_safe(arguments, 4000), message=f"Using {tool_type}")
+            prepared.append((tool_type, arguments, call_id, signature, noted))
+
+        workers = min(MAX_PARALLEL_TOOLS, len(prepared))
+        slots = threading.BoundedSemaphore(workers)
+        outcomes: list[tuple | None] = [None] * len(prepared)
+
+        def work(position: int, tool_type: str, arguments: dict, call_id: str,
+                 noted: bool) -> None:
+            with slots:
+                try:
+                    observation, ok, change, arguments, attempts = self._invoke_with_retry(
+                        run, workspace_id, session, tools, tool_type, arguments,
+                        definitions[tool_type], call_id, excluded, iteration)
+                    outcomes[position] = (observation, ok, change, arguments, attempts)
+                except Exception as failure:  # noqa: BLE001 - report it like a tool failure
+                    outcomes[position] = (
+                        {"error": str(failure) or type(failure).__name__}, False, None,
+                        arguments, 1)
+
+        threads = []
+        for position, (tool_type, arguments, call_id, _signature, noted) in enumerate(prepared):
+            thread = threading.Thread(
+                target=work, args=(position, tool_type, arguments, call_id, noted),
+                name=f"ide-tool-{position}", daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+        while any(thread.is_alive() for thread in threads):
+            if run.cancelled.is_set():
+                # The workers are daemons.  A read stuck on a slow mount must not
+                # keep a cancelled run alive until the filesystem responds.
+                raise _Cancelled()
+            for thread in threads:
+                thread.join(timeout=0.1)
+        if run.cancelled.is_set():
+            raise _Cancelled()
+        results = []
+        for (tool_type, original_arguments, call_id, signature, noted), outcome in zip(prepared, outcomes):
+            observation, ok, change, arguments, attempts = outcome or (
+                {"error": "The tool did not return a result"}, False, None,
+                original_arguments, 1)
+            results.append(self._complete_tool(
+                run, session, tool_type, arguments, call_id, iteration,
+                observation, ok, change, noted, signature, attempts))
+        return results
 
     @staticmethod
     def _swarm_parent_observation(observation: dict) -> dict:
@@ -3304,9 +3500,10 @@ class IdeService:
                             pass
             return observation, True, change, arguments
         except Exception as failure:  # noqa: BLE001 - the model sees the failure
-            existing = (session.get("changes") or {}).get(relative) if relative else None
-            if existing and existing.get("edits", 0) == 0:
-                session["changes"].pop(relative, None)
+            if tool_type in _WRITE_TOOLS and relative:
+                existing = (session.get("changes") or {}).get(relative)
+                if existing and existing.get("edits", 0) == 0:
+                    session["changes"].pop(relative, None)
             return {"error": str(failure)}, False, None, arguments
 
     def _filter_observation(self, tool_type: str, observation, excluded: list[str]):
@@ -3385,6 +3582,83 @@ class IdeService:
             return result, fields
         return value, []
 
+    @staticmethod
+    def _is_read_result(value) -> bool:
+        """True for the line-range shape returned by ``file.read``."""
+        return (isinstance(value, dict) and isinstance(value.get("content"), str)
+                and isinstance(value.get("start_line"), int)
+                and isinstance(value.get("end_line"), int)
+                and isinstance(value.get("total_lines"), int))
+
+    def _trim_read_result(self, value: dict, limit: int) -> dict | None:
+        """Shorten a file read without losing which lines were actually sent.
+
+        The generic shrinker cuts ``content`` in the middle and leaves the old
+        ``end_line``, so a model that continues at that line silently skips
+        code.  This keeps whole lines where possible and reports the real
+        included range plus ``next_start_line`` for the continuation.
+        """
+        content = value["content"]
+        start = max(1, value["start_line"])
+        original_end = max(start, value["end_line"])
+        total = max(0, value["total_lines"])
+        shell = {key: item for key, item in value.items() if key != "content"}
+        try:
+            overhead = len(json.dumps(shell, ensure_ascii=False, default=str)) + 128
+        except (TypeError, ValueError):
+            return None
+        budget = max(32, limit - overhead)
+        for _attempt in range(4):
+            kept: list[str] = []
+            used = 0
+            midline = False
+            for line in content.splitlines(keepends=True):
+                cost = len(json.dumps(line, ensure_ascii=False))
+                if not kept and cost > budget:
+                    cut = max(1, budget // 2)
+                    while cut > 1 and len(json.dumps(line[:cut], ensure_ascii=False)) > budget:
+                        cut //= 2
+                    kept.append(line[:cut])
+                    midline = True
+                    break
+                if kept and used + cost > budget:
+                    break
+                kept.append(line)
+                used += cost
+                if used >= budget:
+                    break
+            body = "".join(kept)
+            if not body and content:
+                body = content[:max(1, budget // 2)]
+                midline = True
+            if len(body) >= len(content) and not midline:
+                return None
+            covered = (body.count("\n") + (0 if body.endswith("\n") else 1)) if body else 0
+            actual_end = min(original_end, start + covered - 1) if covered else start
+            if midline:
+                actual_end = start
+            result = {**value, "content": body, "end_line": actual_end, "truncated": True}
+            fields = [str(field) for field in value.get("truncated_fields") or []]
+            if "content" not in fields:
+                fields.append("content")
+            result["truncated_fields"] = fields[:16]
+            if midline:
+                result["content_cut_midline"] = True
+                result["hint"] = (f"The content was cut inside line {start}; use file.search "
+                                  "or file.inspect to inspect the rest.")
+                result.pop("next_start_line", None)
+            elif actual_end < total:
+                result["next_start_line"] = actual_end + 1
+            else:
+                result.pop("next_start_line", None)
+            try:
+                if len(json.dumps(result, ensure_ascii=False, default=str)) <= limit:
+                    return result
+            except (TypeError, ValueError):
+                return None
+            budget = max(32, int(budget * 0.7))
+        return None
+
     def _bounded_observation(self, value, limit: int = MAX_OBSERVATION_CHARS):
         """Shrink a tool result but keep the keys the agent needs to continue.
 
@@ -3401,6 +3675,16 @@ class IdeService:
             return json_safe(value, limit)
         if len(encoded) <= limit:
             return value
+        if self._is_read_result(value):
+            trimmed = self._trim_read_result(value, limit)
+            if trimmed is not None:
+                value = trimmed
+                try:
+                    encoded = json.dumps(value, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    return json_safe(value, limit)
+                if len(encoded) <= limit:
+                    return value
         for field_cap, list_cap in ((OBSERVATION_FIELD_CHARS, 60), (2_000, 40),
                                     (1_000, 20), (500, 10), (200, 5)):
             shrunk, fields = self._shrink_value(value, field_cap, list_cap)
@@ -3618,7 +3902,12 @@ class IdeService:
             data = self.read_file(workspace_id, relative, limit=400)
         except (BadRequestError, NotFoundError, ValueError, OSError):
             return None
-        data["content"] = data["content"][:6_000]
+        if len(data["content"]) > 6_000:
+            data["content"] = data["content"][:6_000]
+            covered = (data["content"].count("\n")
+                       + (0 if data["content"].endswith("\n") else 1))
+            data["end_line"] = data["start_line"] + max(0, covered - 1)
+            data["truncated"] = True
         return data
 
     def _map(self, workspace: Path, limit: int = 160,
@@ -3680,7 +3969,8 @@ class IdeService:
             "",
             "Operating rules:",
             "1. Inspect before you edit: use file.tree, file.search and file.read.",
-            "   file.read returns up to 200 lines; when truncated is true, read the next range.",
+            "   file.read returns up to 200 lines or about 3,600 characters; when truncated "
+            "is true, continue from next_start_line.",
             "   Use file.inspect for images and other binary files; file.read handles UTF-8 text only.",
             "2. Make the smallest change that solves the task. Use file.edit for a targeted "
             "change; use file.write only for a new file or a full rewrite after reading "
@@ -3694,7 +3984,8 @@ class IdeService:
             "investigated at once, or benefits from independent review. Do not spawn a swarm "
             "for a one-file change.",
             "8. Batch independent reads in one turn: use {\"calls\": [...]} instead "
-            "of one round per file, then edit as soon as you have the needed context.",
+            "of one round per file. Independent read-only calls run in parallel; "
+            "then edit as soon as you have the needed context.",
             "9. Finish with a concise summary of what changed and what was verified.",
             "",
             "Reply with only one JSON object per turn:",
@@ -3710,8 +4001,9 @@ class IdeService:
         for tool in tools:
             if tool["type"] == "skill.read":
                 lines.append(
-                    "- skill.read: Load a skill's SKILL.md with its exact id "
-                    "(input keys: name). Read a matching skill before following its instructions."
+                    "- skill.read: Load one relevant skill's full instructions by exact id "
+                    "(input keys: name). Decide from the skills section when a skill fits the "
+                    "task, then call this before following it; do not wait to be told."
                 )
                 continue
             if tool["type"] == "file.inspect":
@@ -3725,7 +4017,7 @@ class IdeService:
                 lines.append(
                     "- agent.swarm: Run a leader-chosen team of up to six agents that work in "
                     "parallel, message each other, share a blackboard, review and revise each "
-                    "each other's work, and return one synthesised answer. In Edit and Auto the "
+                    "other's work, and return one synthesised answer. In Edit and Auto the "
                     "members may edit files; file-tool writes are serialized and snapshotted, "
                     "and in Ask the swarm is read-only. Input keys: tasks (array of strings or "
                     "{id, label, role, task, tools, writes} objects; empty lets the leader plan), "
@@ -3809,20 +4101,12 @@ class IdeService:
         skills = self.list_skills(workspace_id)
         if skills:
             skill_lines = [
-                "Skills are reusable instructions stored as SKILL.md files. When the task "
-                "matches one, call skill.read with its id before following it; do not claim "
-                "to use a skill you have not read."
+                "All skills below are available automatically. Decide which skills fit the "
+                "request, then call skill.read for each relevant one before doing the work. "
+                "Do not wait for the user to name a skill, and do not load unrelated skills. "
+                "Follow the loaded instructions; never claim to use a skill you have not read."
             ]
-            for skill in skills[:MAX_PROMPT_SKILLS]:
-                description = (skill["description"] or "no description")[:160]
-                skill_lines.append(
-                    f"- {skill['id']} ({skill['scope']}): {skill['name']} — {description}"
-                )
-            if len(skills) > MAX_PROMPT_SKILLS:
-                skill_lines.append(
-                    f"- … {len(skills) - MAX_PROMPT_SKILLS} more skill(s) exist; "
-                    "ask the user or call skill.read with an id you already know."
-                )
+            skill_lines.extend(self._skill_list_lines(skills, include_scope=True))
             sections.append({"id": "skills", "label": f"Skills ({len(skills)})",
                              "text": "\n".join(skill_lines)})
         if include:
@@ -3832,10 +4116,15 @@ class IdeService:
                 "text": f"Pinned context: {', '.join(include)}\n\n{blocks}",
             })
         if active and active.get("content"):
+            note = ""
+            if active.get("truncated"):
+                note = (f"\n\n(The editor preview is truncated at line "
+                        f"{active.get('end_line')} of {active.get('total_lines')}; "
+                        "use file.read to see the rest before editing.)")
             sections.append({
                 "id": "active", "label": f"Active file: {active['path']}",
                 "text": (f"File currently open in the editor: {active['path']}\n"
-                         f"```\n{active['content']}\n```"),
+                         f"```\n{active['content']}\n```{note}"),
             })
         return sections
 
@@ -3871,12 +4160,22 @@ class IdeService:
                 extra = self.read_file(workspace_id, relative, limit=200)
             except (BadRequestError, NotFoundError, ValueError, OSError):
                 continue
+            body = extra["content"][:1500]
+            note = ""
+            if extra.get("truncated") or len(extra["content"]) > 1500:
+                note = "\n(Preview only; use file.read for the complete file.)"
             pieces.append({
                 "id": f"open:{relative}", "label": f"Open file: {relative}",
                 "text": (f"Other file open in the editor: {extra['path']}\n"
-                         f"```\n{extra['content'][:1500]}\n```"),
+                         f"```\n{body}\n```{note}"),
             })
-        raw = "\n\n".join(piece["text"] for piece in pieces)
+        raw_parts = [piece["text"] for piece in pieces if piece["id"] != "task"]
+        task_text = str(message or "").strip()
+        if task_text:
+            # Keep a short anchor in the system prompt, but let the full task
+            # travel once as the user message instead of duplicating it.
+            raw_parts.insert(0, "Current task:\n" + task_text[:600])
+        raw = "\n\n".join(raw_parts)
         return pieces, raw[:MAX_PROMPT_CHARS], len(raw) > MAX_PROMPT_CHARS
 
     def _model_budget(self, model_id: str, force: bool = False) -> dict:
@@ -4333,8 +4632,8 @@ class IdeService:
             if snapshot is not None:
                 before = _read_snapshot(snapshot)
         path = self._workspace_file(workspace_id, relative)
-        after = (path.read_bytes().decode("utf-8", errors="replace")
-                 if path.is_file() else "")
+        current = path.read_bytes() if path.is_file() else b""
+        after = current.decode("utf-8", errors="replace")
         diff = "".join(difflib.unified_diff(
             before.splitlines(keepends=True), after.splitlines(keepends=True),
             fromfile=f"a/{relative}", tofile=f"b/{relative}", n=3,
@@ -4349,7 +4648,6 @@ class IdeService:
         change["removed"] = removed
         change["diff"] = diff[:MAX_DIFF_CHARS]
         change["truncated"] = len(diff) > MAX_DIFF_CHARS
-        current = path.read_bytes() if path.is_file() else b""
         change["after_version"] = _version(current)
         with self._lock:
             self._stats_cache.pop(workspace_id, None)
@@ -4414,6 +4712,8 @@ class IdeService:
             for run_id, run in list(self._runs.items()):
                 if run.session_id in session_ids:
                     self._runs.pop(run_id, None)
+            for session_id in session_ids:
+                self._session_cache.pop(self.sessions_dir / f"{session_id}.json", None)
         for path in self.runs_dir.glob("ide-run-*.json"):
             data = read_json(path)
             if isinstance(data, dict) and data.get("session_id") in session_ids:

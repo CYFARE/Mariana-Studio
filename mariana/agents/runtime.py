@@ -11,15 +11,25 @@ from datetime import datetime
 from pathlib import Path
 
 from .aml import ABILITY_TYPES, HUMAN_KINDS, render_data, render_template
+from .schema import schema_errors, validate_value
 from .swarm import SwarmCoordinator, SwarmError, SwarmLimits, snapshot_due
 from .toolcalls import extract_action_object, parse_dsml_tool_calls
-from .tools import execute_ability, json_safe
+from .tools import (
+    TOOL_ATTEMPTS, WRITE_ABILITY_TYPES, execute_ability, json_safe, nearest_tool_id,
+    retryable_tool_failure, tool_failure_hint,
+)
 
 MAX_AGENT_ITERATIONS = 40
+MAX_ACTION_REPAIRS = 2
 OBSERVATION_CHARS = 6000
+# A flow agent may take up to 40 tool rounds.  Keeping every observation would
+# overflow a small model long before the loop ends, so older rounds are replaced
+# by a compact ledger.  The newest rounds and the goal always stay verbatim.
+AGENT_CONTEXT_CHARS = 24_000
+COMPACTED_AGENT_PREFIX = "Earlier tool rounds were compacted to stay inside the context window."
 EMPTY_REPLIES = frozenset({"", "(No readable text generated)"})
 FINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-DELTA_EVENTS = frozenset({"assistant_delta", "swarm_agent_delta"})
+DELTA_EVENTS = frozenset({"assistant_delta", "reasoning_delta", "swarm_agent_delta"})
 _APPROVE_WORDS = {"true": True, "yes": True, "approve": True, "approved": True, "y": True, "ok": True,
                   "false": False, "no": False, "reject": False, "rejected": False, "n": False}
 
@@ -86,30 +96,39 @@ class LiveRun:
     # -- event & state ---------------------------------------------------
     def event(self, kind: str, **fields) -> None:
         with self.condition:
-            self._seq += 1
-            event = {
-                "seq": self._seq,
-                "at": datetime.now().isoformat(timespec="milliseconds"),
-                "type": kind,
-            }
-            event.update({key: json_safe(value, self._max_output) for key, value in fields.items()})
-            self.events.append(event)
-            if len(self.events) > 800:
-                self._trim_events()
-            self.updated = time.time()
-            if kind == "node_started":
-                self.nodes[fields.get("node")] = "running"
-                self.current_node = fields.get("node")
-            elif kind == "node_finished":
-                self.nodes[fields.get("node")] = "ok"
-            elif kind == "node_failed":
-                self.nodes[fields.get("node")] = "error"
-            elif kind in {"breakpoint", "paused", "input_requested"}:
-                self.nodes[fields.get("node")] = "paused"
-                self.current_node = fields.get("node")
-            elif kind in {"resumed", "stepped", "input_received", "input_timeout"}:
-                self.nodes[fields.get("node")] = "running"
+            if self.status in FINAL_STATUSES:
+                return
+            self._append(kind, fields)
             self.condition.notify_all()
+        self._after_event()
+
+    def _append(self, kind: str, fields: dict) -> None:
+        """Append one event; the caller holds ``condition``."""
+        self._seq += 1
+        event = {
+            "seq": self._seq,
+            "at": datetime.now().isoformat(timespec="milliseconds"),
+            "type": kind,
+        }
+        event.update({key: json_safe(value, self._max_output) for key, value in fields.items()})
+        self.events.append(event)
+        if len(self.events) > 800:
+            self._trim_events()
+        self.updated = time.time()
+        if kind == "node_started":
+            self.nodes[fields.get("node")] = "running"
+            self.current_node = fields.get("node")
+        elif kind == "node_finished":
+            self.nodes[fields.get("node")] = "ok"
+        elif kind == "node_failed":
+            self.nodes[fields.get("node")] = "error"
+        elif kind in {"breakpoint", "paused", "input_requested"}:
+            self.nodes[fields.get("node")] = "paused"
+            self.current_node = fields.get("node")
+        elif kind in {"resumed", "stepped", "input_received", "input_timeout"}:
+            self.nodes[fields.get("node")] = "running"
+
+    def _after_event(self) -> None:
         callback = getattr(self, "on_event", None)
         if callback:
             try:
@@ -209,7 +228,6 @@ class LiveRun:
         with self.condition:
             if self.status in FINAL_STATUSES:
                 return
-            self.status = status
             self.output = json_safe(output, self._max_output)
             self.error = error
             self.ended = time.time()
@@ -221,8 +239,15 @@ class LiveRun:
             self.paused = False
             self.single_step = False
             self.awaiting_input = None
+            # Append the terminal event and flip the status under one lock: a
+            # waiter that sees ``finished`` therefore also sees the event, and
+            # no worker event can land after it.
+            self._append(f"run_{status}", {
+                "message": error or status.title(), "output": self.output,
+            })
+            self.status = status
             self.condition.notify_all()
-        self.event(f"run_{status}", message=error or status.title(), output=self.output)
+        self._after_event()
 
     # -- debug controls --------------------------------------------------
     def before_node(self, node_id: str) -> None:
@@ -575,6 +600,33 @@ def _run_node(node, data, context, run, agent, gateway, root,
         expression = str(data.get("expression") or "true")
         result = render_template("{{ " + expression + " }}", context)
         return {"result": bool(result), "value": result, "expression": expression}
+    if node_type == "assert":
+        expression = str(data.get("expression") or "true")
+        value = render_template("{{ " + expression + " }}", context)
+        if not bool(value):
+            message_context = {**context, "value": value, "expression": expression}
+            message = _string(render_template(str(data.get("message") or ""), message_context)).strip()
+            raise ValueError(f"Assertion failed at {node['id']}: {message or expression}")
+        return {"ok": True, "value": value, "expression": expression}
+    if node_type == "validate":
+        target = render_data(data.get("target", ""), context)
+        if target in (None, "", {}):
+            target = context.get("last")
+        schema = data.get("schema")
+        if not isinstance(schema, dict):
+            raise ValueError(f"Validate node {node['id']} needs a JSON schema object")
+        definition_errors = schema_errors(schema)
+        if definition_errors:
+            raise ValueError(f"Validate node {node['id']} has an invalid schema: "
+                             + "; ".join(definition_errors[:3]))
+        errors = validate_value(target, schema)
+        mode = str(data.get("mode") or "fail").lower()
+        run.event("validation", node=node["id"], ok=not errors, mode=mode,
+                  error_count=len(errors), errors=json_safe(errors, 8000))
+        if errors and mode != "warn":
+            detail = "; ".join(f"{item['path']}: {item['message']}" for item in errors[:5])
+            raise ValueError(f"Validate node {node['id']} rejected the value: {detail}")
+        return {"valid": not errors, "errors": errors, "value": target, "mode": mode}
     if node_type == "llm":
         return _run_llm(node, data, context, run, agent, gateway)
     if node_type == "agent":
@@ -666,6 +718,13 @@ def _resolve_model(data: dict, agent: dict, gateway) -> str:
     raise ValueError("Choose a model in agent settings or on the node")
 
 
+def _model_candidates(data: dict, agent: dict, gateway) -> list[str]:
+    """The main model followed by an optional fallback, without duplicates."""
+    primary = _resolve_model(data, agent, gateway)
+    fallback = str(data.get("fallback_model") or "").strip()
+    return [primary, fallback] if fallback and fallback != primary else [primary]
+
+
 class _RunCancel:
     """Gateway cancellation whose own ``set()`` does not cancel the whole run.
 
@@ -692,7 +751,8 @@ class _RunCancel:
 
 def _chat(gateway, agent: dict, model: str, messages: list[dict], data: dict,
           default_temperature: float, default_tokens: int,
-          run: LiveRun | None = None, tools: list[dict] | None = None) -> dict:
+          run: LiveRun | None = None, tools: list[dict] | None = None,
+          node_id: str | None = None, iteration: int = 0) -> dict:
     settings = agent.get("model_settings") or {}
     temperature = data.get("temperature")
     config = {
@@ -717,16 +777,47 @@ def _chat(gateway, agent: dict, model: str, messages: list[dict], data: dict,
         timer.daemon = True
         timer.start()
         final: dict = {}
+        live = run is not None and bool(node_id)
+        pending = ""
+        pending_reasoning = ""
+        last_emit = 0.0
+
+        def emit(kind: str, text: str) -> None:
+            """Publish every character, even when one burst exceeds the event cap."""
+            while text:
+                run.event(kind, node=node_id, iteration=iteration, text=text[:4000])
+                text = text[4000:]
+
         try:
             for event in stream(config, scope):
                 if not isinstance(event, dict):
                     continue
-                if event.get("type") == "done":
+                kind = event.get("type")
+                if kind == "delta" and live:
+                    pending += str(event.get("text") or "")
+                elif kind == "reasoning" and live:
+                    pending_reasoning += str(event.get("text") or "")
+                elif kind == "done":
                     final = event
-                elif event.get("type") == "error":
+                elif kind == "error":
                     raise ValueError(str(event.get("error") or "The model call failed"))
+                if live and (pending or pending_reasoning):
+                    now = time.time()
+                    if now - last_emit >= 0.12:
+                        if pending:
+                            emit("assistant_delta", pending)
+                            pending = ""
+                        if pending_reasoning:
+                            emit("reasoning_delta", pending_reasoning)
+                            pending_reasoning = ""
+                        last_emit = now
         finally:
             timer.cancel()
+            if live:
+                if pending:
+                    emit("assistant_delta", pending)
+                if pending_reasoning:
+                    emit("reasoning_delta", pending_reasoning)
         run.check_limits(run.timeout)
         if scope.expired:
             raise ValueError(f"Run exceeded timeout={run.timeout:.0f}s")
@@ -737,6 +828,32 @@ def _chat(gateway, agent: dict, model: str, messages: list[dict], data: dict,
     if run is not None:
         run.check_limits(run.timeout)
     return result
+
+
+def _chat_with_fallback(node, models: list[str], gateway, agent: dict, messages: list[dict],
+                        data: dict, default_temperature: float, default_tokens: int,
+                        run: LiveRun, tools: list[dict] | None = None,
+                        start_index: int = 0, node_id: str | None = None,
+                        iteration: int = 0) -> tuple[dict, int, str]:
+    """Call the primary model, then the fallback if the provider fails."""
+    index = max(0, min(start_index, len(models) - 1))
+    while True:
+        model = models[index]
+        try:
+            result = _chat(gateway, agent, model, messages, data, default_temperature,
+                           default_tokens, run, tools, node_id=node_id, iteration=iteration)
+            return result, index, model
+        except RunCancelled:
+            raise
+        except Exception as failure:  # noqa: BLE001 - the fallback is the recovery path
+            run.check_limits(run.timeout)
+            if index + 1 >= len(models):
+                raise
+            next_model = models[index + 1]
+            run.event("log", node=node["id"], level="warning",
+                      message=(f"Model {model} failed ({failure}); falling back to "
+                               f"{next_model}"))
+            index += 1
 
 
 def _run_llm(node, data, context, run, agent, gateway):
@@ -763,13 +880,16 @@ def _run_llm(node, data, context, run, agent, gateway):
             result["json"] = None
             result["format"] = "json"
         return result
-    model = _resolve_model(data, agent, gateway)
+    models = _model_candidates(data, agent, gateway)
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt_text})
     run.check_limits(run.timeout)
-    result = _chat(gateway, agent, model, messages, data, 0.7, 512, run)
+    result, _model_index, model = _chat_with_fallback(
+        node, models, gateway, agent, messages, data, 0.7, 512, run,
+        node_id=node["id"],
+    )
     run.check_limits(run.timeout)
     reply = str(result.get("reply") or "")
     output = {
@@ -870,6 +990,63 @@ def parse_model_action(text: str) -> tuple[dict | None, list[dict]]:
     return action, normalize_tool_calls(action)
 
 
+def _looks_like_action(text: str) -> bool:
+    """Whether a non-JSON reply was probably an attempted agent action."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if not (stripped.startswith("{") or "```" in stripped or "dsml" in lowered):
+        return False
+    return any(f'"{key}"' in stripped for key in ("tool", "calls", "plan", "final"))
+
+
+def _compact_agent_messages(messages: list[dict], budget: int | None = None) -> None:
+    """Drop the oldest tool rounds when a flow agent's history grows too large.
+
+    The system prompt, the goal and the newest turns stay verbatim.  Dropped
+    rounds leave a ledger naming the tools already called, so the model does not
+    repeat work whose result it can no longer see.
+    """
+    budget = AGENT_CONTEXT_CHARS if budget is None else max(500, int(budget))
+    if len(messages) <= 6:
+        return
+    total = sum(len(str(item.get("content") or "")) for item in messages)
+    if total <= budget:
+        return
+    ledger_at = (2 if len(messages) > 2
+                 and str(messages[2].get("content") or "").startswith(COMPACTED_AGENT_PREFIX)
+                 else -1)
+    body = 3 if ledger_at == 2 else 2
+    dropped: list[dict] = []
+    while total > budget and len(messages) - body > 4:
+        pair = messages[body:body + 2]
+        if not pair:
+            break
+        del messages[body:body + 2]
+        dropped.extend(pair)
+        total -= sum(len(str(item.get("content") or "")) for item in pair)
+    if not dropped:
+        return
+    called: list[str] = []
+    for item in dropped:
+        if item.get("role") != "assistant":
+            continue
+        _action, calls = parse_model_action(str(item.get("content") or ""))
+        for call in calls[:8]:
+            tool_id = str(call.get("tool") or "")
+            if tool_id and tool_id not in called:
+                called.append(tool_id)
+    ledger = (COMPACTED_AGENT_PREFIX + " The final answer must use the remaining "
+              "observations and the newest turns."
+              + (f" Tools called earlier: {', '.join(called[:12])}." if called else ""))
+    entry = {"role": "user", "content": ledger}
+    if ledger_at == 2:
+        messages[2] = entry
+    else:
+        messages.insert(2, entry)
+
+
 def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                os_access: bool = False):
     """An LLM that chooses abilities itself: reason, call a tool, observe, repeat."""
@@ -889,20 +1066,46 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
         return {"text": f"[test mode] {goal_text[:240]}", "dry_run": True, "iterations": 0,
                 "steps": [], "model": str(data.get("model") or agent.get("model") or "") or "test-mode",
                 "usage": usage, "exhausted": False}
-    model = _resolve_model(data, agent, gateway)
+    models = _model_candidates(data, agent, gateway)
+    model_index = 0
+    model = models[0]
     messages = [{"role": "system", "content": _tool_instructions(system, tools)},
                 {"role": "user", "content": goal_text}]
     steps: list[dict] = []
+    duplicate_counts: dict[str, int] = {}
+    format_repairs = 0
     reply = ""
     for iteration in range(1, limit + 1):
+        _compact_agent_messages(messages)
         run.check_limits(run.timeout)
-        result = _chat(gateway, agent, model, messages, data, 0.3, 1024, run, tools)
+        result, model_index, model = _chat_with_fallback(
+            node, models, gateway, agent, messages, data, 0.3, 1024, run, tools,
+            start_index=model_index, node_id=node["id"], iteration=iteration,
+        )
         run.check_limits(run.timeout)
         reply = str(result.get("reply") or "")
         for key in usage:
             usage[key] += int((result.get("usage") or {}).get(key) or 0)
         action, calls = parse_model_action(reply)
         if action is None:
+            empty_reply = not str(reply).strip()
+            if format_repairs < MAX_ACTION_REPAIRS and (empty_reply or _looks_like_action(reply)):
+                format_repairs += 1
+                if reply.strip():
+                    messages.append({"role": "assistant", "content": reply[:12_000]})
+                messages.append({"role": "user", "content": (
+                    'Your reply was empty. Reply with {"final": "<answer>"} or call a tool.'
+                    if empty_reply else
+                    "That reply was not a valid action. Reply with only one JSON object: "
+                    '{"tool": ...}, {"calls": [...]}, {"plan": [...]} or '
+                    '{"final": "..."}.'
+                )})
+                run.event("log", node=node["id"], level="warning", iteration=iteration,
+                          message=("The model returned an empty reply; asking for an answer"
+                                   if empty_reply else
+                                   "The model's action was malformed; asking for a "
+                                   "corrected JSON reply"))
+                continue
             text = "" if str(reply).strip() in EMPTY_REPLIES else _string(reply)
             return {"text": text, "iterations": iteration, "steps": steps, "model": model,
                     "usage": usage, "exhausted": False}
@@ -914,6 +1117,16 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
             if "final" in action:
                 final = action.get("final")
                 text = "" if str(final).strip() in EMPTY_REPLIES else _string(final)
+                if not text and format_repairs < MAX_ACTION_REPAIRS:
+                    format_repairs += 1
+                    messages.append({"role": "assistant", "content": reply[:12_000]})
+                    messages.append({"role": "user", "content": (
+                        'Your final answer was empty. Reply with {"final": "<summary>"} '
+                        "describing the result, or continue with a tool call."
+                    )})
+                    run.event("log", node=node["id"], level="warning", iteration=iteration,
+                              message="The model finished with an empty answer; asking for a summary")
+                    continue
                 return {"text": text, "iterations": iteration, "steps": steps, "model": model,
                         "usage": usage, "exhausted": False}
             if plan is not None:
@@ -922,6 +1135,17 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                     "Plan recorded. Continue with a tool call, update the plan, "
                     "or reply with the final answer."
                 )})
+                continue
+            if format_repairs < MAX_ACTION_REPAIRS:
+                format_repairs += 1
+                messages.append({"role": "assistant", "content": reply[:12_000]})
+                messages.append({"role": "user", "content": (
+                    "That JSON object did not contain a tool call, a plan, or a final "
+                    'answer. Reply with {"tool": ...}, {"calls": [...]}, '
+                    '{"plan": [...]} or {"final": "..."} only.'
+                )})
+                run.event("log", node=node["id"], level="warning", iteration=iteration,
+                          message="The model's JSON action was empty; asking for a usable action")
                 continue
             final = reply
             text = "" if str(final).strip() in EMPTY_REPLIES else _string(final)
@@ -936,29 +1160,72 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                       message=f"Calling {tool_id}")
             step = {"iteration": iteration, "ability": tool_id,
                     "input": json_safe(tool_input, 4000)}
-            try:
-                run.check_limits(run.timeout)
-                if tool_id not in allowed:
-                    raise ValueError(
-                        f"Unknown tool {tool_id!r}. Available tools: {', '.join(allowed) or 'none'}"
-                    )
-                observation = execute_ability(allowed[tool_id], tool_input, context, root,
-                                               run.dry_run, cancelled=run.stop,
-                                               os_access=os_access)
-                run.check_limits(run.timeout)
-                step["output"] = json_safe(observation, OBSERVATION_CHARS)
-                succeeded = True
-            except RunCancelled:
-                raise
-            except Exception as error:  # noqa: BLE001 - the model sees the failure and can adapt
-                run.check_limits(run.timeout)
-                observation = {"error": str(error)}
-                step["error"] = str(error)
-                succeeded = False
+            signature = json.dumps({"tool": tool_id, "input": json_safe(tool_input, 4000)},
+                                   sort_keys=True, default=str)
+            duplicate_counts[signature] = duplicate_counts.get(signature, 0) + 1
+            attempts = 0
+            while True:
+                attempts += 1
+                try:
+                    run.check_limits(run.timeout)
+                    if tool_id not in allowed:
+                        suggestion = nearest_tool_id(tool_id, allowed)
+                        hint = f" Did you mean {suggestion!r}?" if suggestion else ""
+                        raise ValueError(
+                            f"Unknown tool {tool_id!r}.{hint} Available tools: "
+                            f"{', '.join(allowed) or 'none'}"
+                        )
+                    tool = allowed[tool_id]
+                    observation = execute_ability(tool, tool_input, context, root,
+                                                  run.dry_run, cancelled=run.stop,
+                                                  os_access=os_access)
+                    run.check_limits(run.timeout)
+                    succeeded = True
+                    break
+                except RunCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001 - the model sees the failure and can adapt
+                    run.check_limits(run.timeout)
+                    observation = {"error": str(error)}
+                    succeeded = False
+                    retryable = (tool_id in allowed
+                                 and allowed[tool_id].get("type") not in WRITE_ABILITY_TYPES
+                                 and attempts < TOOL_ATTEMPTS
+                                 and retryable_tool_failure(error))
+                    if not retryable:
+                        break
+                    run.event("log", node=node["id"], iteration=iteration, index=index,
+                              ability=tool_id, attempt=attempts + 1,
+                              message=f"Retrying {tool_id} after a temporary failure")
+            if duplicate_counts[signature] >= 3:
+                hint = (
+                    "You repeated the same tool call three times. Read the result, change "
+                    "approach, or reply with the final answer." if succeeded else
+                    "You repeated the same failing tool call three times. Change the input or "
+                    "use another tool instead of retrying it unchanged.")
+                observation = ({**observation, "hint": hint}
+                               if isinstance(observation, dict)
+                               else {"result": observation, "hint": hint})
+            if not succeeded:
+                error = observation.get("error") if isinstance(observation, dict) else observation
+                hint = tool_failure_hint(tool_id, error)
+                if hint:
+                    observation = ({**observation, "hint": hint}
+                                   if isinstance(observation, dict)
+                                   else {"error": str(observation or "failed"), "hint": hint})
+            if attempts > 1:
+                step["attempts"] = attempts
+            step["output"] = json_safe(observation, OBSERVATION_CHARS)
+            if not succeeded:
+                error_value = (observation.get("error") if isinstance(observation, dict)
+                               else observation)
+                step["error"] = str(error_value or "failed")
             steps.append(step)
-            observations.append({"tool": tool_id, "ok": succeeded, "result": observation})
+            observations.append({"tool": tool_id, "ok": succeeded, "result": observation,
+                                 "attempts": attempts})
             run.event("tool_result", node=node["id"], iteration=iteration, index=index,
-                      ability=tool_id, ok=succeeded, output=json_safe(observation, 4000),
+                      ability=tool_id, ok=succeeded, attempts=attempts,
+                      output=json_safe(observation, 4000),
                       message=f"{tool_id} {'returned' if succeeded else 'failed'}")
         messages.append({"role": "assistant", "content": reply})
         if len(observations) == 1:
@@ -992,6 +1259,11 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
     if not goal_text.strip():
         raise ValueError(f"Swarm node {node['id']} needs a goal")
     system = _string(render_data(data.get("system", ""), context)).strip()
+    criteria = _string(render_data(data.get("criteria", ""), context)).strip()
+    effort = str(data.get("effort") or "").strip().lower()
+    if effort not in {"low", "medium", "high"}:
+        effort = ""
+    reflection = data.get("reflection") is not False
     policy = agent.get("swarm") or {}
     if not isinstance(policy, dict):
         policy = {}
@@ -1030,12 +1302,14 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
     })
     run.event("node_input", node=node["id"], input=goal_text[:4000])
     if run.dry_run:
+        criteria_list = [line.strip(" -•*\t") for line in criteria.splitlines()
+                         if line.strip(" -•*\t")][:8]
         output = {
             "text": f"[test mode] {goal_text[:240]}",
             "summary": "Test mode swarm", "agents": [], "completed": 0, "failed": 0,
             "messages": 0, "reviews": [], "blackboard": [], "changed_files": [],
             "strategy": str(data.get("strategy") or "auto"), "usage": {},
-            "elapsed": 0.0, "dry_run": True,
+            "elapsed": 0.0, "dry_run": True, "success_criteria": criteria_list,
         }
         run.set_swarm({
             "id": f"swarm-{node['id']}-test", "status": "completed",
@@ -1043,6 +1317,7 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
             "round": 0, "phase": "synthesis", "model": model,
             "leader_model": leader_model, "agents": [], "messages": [],
             "blackboard": [], "reviews": [], "changed_files": [],
+            "success_criteria": criteria_list, "unmet_criteria": [], "gaps": [],
             "usage": {}, "warnings": ["dry run: no model was called"],
         })
         return output
@@ -1052,9 +1327,10 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
         tools=tools, executor=lambda member, tool_id, arguments: _swarm_ability(
             abilities, member, tool_id, arguments, context, root, run, os_access),
         limits=limits, allow_write=allow_write, allow_ipc=allow_ipc,
-        allow_os_access=os_access,
+        allow_os_access=os_access, criteria=criteria, effort=effort, reflection=reflection,
         shared_memory=shared_memory, dry_run=run.dry_run,
-        on_event=lambda kind, **fields: _swarm_event(run, coordinator, kind, **fields),
+        on_event=lambda kind, **fields: _swarm_event(
+            run, coordinator, kind, node=node["id"], **fields),
         cancelled=lambda: run.stop.is_set(), briefing="",
     )
     run.swarm_coordinator = coordinator
@@ -1108,6 +1384,10 @@ def _render_swarm_agents(value, context: dict) -> list[dict]:
                 rendered["tools"] = list(item["tools"])[:24]
             if item.get("writes"):
                 rendered["writes"] = list(item["writes"])[:40]
+            if item.get("depends_on"):
+                rendered["depends_on"] = list(item["depends_on"])[:12]
+            if item.get("plan"):
+                rendered["plan"] = list(item["plan"])[:12]
             result.append(rendered)
     return result
 

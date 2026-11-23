@@ -39,7 +39,9 @@ from typing import Callable
 
 from .aml import SWARM_STRATEGIES
 from .toolcalls import extract_action_object, parse_dsml_tool_calls
-from .tools import json_safe
+from .tools import (
+    TOOL_ATTEMPTS, json_safe, nearest_tool_id, retryable_tool_failure, tool_failure_hint,
+)
 
 STRATEGY_INFO = {
     "auto": "Choose the best shape for the task.",
@@ -53,9 +55,12 @@ WRITE_TOOLS = frozenset({"file.write", "file.edit", "file.delete", "shell.exec"}
 RESULT_KEY_PREFIXES = ("result.",)
 SNAPSHOT_EVENTS = frozenset({
     "swarm_start", "swarm_plan", "swarm_leader", "swarm_round", "swarm_agent_start",
-    "swarm_agent_end", "swarm_review", "swarm_memory", "swarm_context", "swarm_end",
+    "swarm_agent_end", "swarm_agent_plan", "swarm_review", "swarm_memory", "swarm_context",
+    "swarm_end",
 })
 EMPTY_REPLIES = frozenset({"", "(No readable text generated)"})
+MAX_PLAN_STEPS = 12
+MAX_SUCCESS_CRITERIA = 8
 # A reasoning model can spend a small output budget on hidden thinking and return nothing
 # visible, or stop mid-sentence when the budget runs out.  One retry at a larger budget is
 # cheaper than losing a member or the leader's synthesis; the cap keeps that retry bounded.
@@ -64,6 +69,13 @@ MAX_RETRY_TOKENS = 12_000
 # extension instead of being stopped mid-research.  The ceiling keeps a looping
 # model from spending the run's whole time budget in one phase.
 MAX_MEMBER_STEPS = 24
+# Leave a bounded slice of the run budget for the member wrap-up and the leader
+# synthesis; otherwise a busy tool loop can consume the whole budget and lose
+# the work that was already collected. Long runs keep more of it because a
+# local model may need a minute or more to write the final report.
+FINISH_RESERVE_MAX = 90.0
+FINISH_RESERVE_MIN = 5.0
+FINISH_RESERVE_RATIO = 0.1
 CONTEXT_ACTIONS = frozenset({"get", "read", "expand", "open", "request",
                              "find", "search", "lookup", "release", "free",
                              "status", "budget"})
@@ -89,6 +101,8 @@ _STATE_STATUSES = frozenset({"planning", "running", "reviewing", "synthesizing",
                              "completed", "failed", "cancelled"})
 _KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 _MEMBER_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
+# Channel participants with special meaning; a member must never shadow them.
+RESERVED_MEMBER_IDS = frozenset({"leader", "all", "operator", "system", "user"})
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SPACE = re.compile(r"[ \t]+")
 
@@ -166,6 +180,29 @@ def _clean_text(value, limit: int) -> str:
     return text
 
 
+def _clean_criteria(value) -> list[str]:
+    """Acceptance checks as a deduplicated list, one per line or list entry."""
+    if isinstance(value, str):
+        raw = [line.strip(" -•*\t") for line in value.splitlines()]
+    elif isinstance(value, dict):
+        raw = _as_list(value.get("criteria", value.get("success_criteria", [])))
+    else:
+        raw = _as_list(value)
+    result = []
+    seen = set()
+    for item in raw:
+        if isinstance(item, dict):
+            item = item.get("text") or item.get("criterion") or item.get("check") or ""
+        text = _clean_text(item, 300)
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+        if len(result) >= MAX_SUCCESS_CRITERIA:
+            break
+    return result
+
+
 def _elide(text: str, limit: int) -> str:
     """Trim long text from the middle so its head and newest tail both survive."""
     if limit <= 0:
@@ -183,6 +220,13 @@ def _retry_tokens(max_tokens: int) -> int:
     """A larger output budget for the one retry; never smaller than the first call."""
     grown = max(int(max_tokens) * 2, 6_000)
     return max(int(max_tokens), min(grown, MAX_RETRY_TOKENS))
+
+
+def _finish_reserve(seconds: float) -> float:
+    """Time kept back for wrap-up and synthesis, bounded for short runs."""
+    seconds = max(0.0, float(seconds))
+    return min(seconds * 0.5,
+               max(FINISH_RESERVE_MIN, min(FINISH_RESERVE_MAX, seconds * FINISH_RESERVE_RATIO)))
 
 
 def _json_value(value, limit: int):
@@ -369,16 +413,17 @@ class SwarmContextPool:
         self.per_agent = max(0, int(per_agent))
         self._lock = threading.Lock()
         self._grants: dict[str, int] = {}
+        self._used = 0
 
     def used(self, member_id: str | None = None) -> int:
         with self._lock:
             if member_id is None:
-                return sum(self._grants.values())
+                return self._used
             return int(self._grants.get(str(member_id), 0))
 
     def free(self) -> int:
         with self._lock:
-            return max(0, self.capacity - sum(self._grants.values()))
+            return max(0, self.capacity - self._used)
 
     def grant(self, member_id: str, chars) -> int:
         """Reserve up to ``chars`` more characters for one member; 0 if full."""
@@ -392,20 +437,23 @@ class SwarmContextPool:
         with self._lock:
             current = self._grants.get(member_id, 0)
             room = max(0, self.per_agent - current)
-            free = max(0, self.capacity - sum(self._grants.values()))
+            free = max(0, self.capacity - self._used)
             allowed = min(wanted, room, free)
             if allowed:
                 self._grants[member_id] = current + allowed
+                self._used += allowed
             return allowed
 
     def release(self, member_id: str) -> int:
         """Return one member's grant to the pool; returns the freed amount."""
         with self._lock:
-            return int(self._grants.pop(str(member_id or ""), 0))
+            released = int(self._grants.pop(str(member_id or ""), 0))
+            self._used = max(0, self._used - released)
+            return released
 
     def snapshot(self) -> dict:
         with self._lock:
-            used = sum(self._grants.values())
+            used = self._used
             return {
                 "capacity": self.capacity,
                 "per_agent": self.per_agent,
@@ -800,6 +848,13 @@ class SwarmMember:
     context_granted: int = 0
     context_request: int = 0
     result_handle: str = ""
+    depends_on: list[str] = field(default_factory=list)
+    plan: list[dict] = field(default_factory=list)
+    plan_version: int = 0
+    reflected: bool = False
+    tool_calls: int = 0
+    tool_failures: int = 0
+    tool_retries: int = 0
 
     def to_dict(self, include_text: bool = False, output_limit: int = 8_000) -> dict:
         item = {
@@ -814,6 +869,11 @@ class SwarmMember:
             "context_granted": self.context_granted,
             "result_handle": self.result_handle,
             "started": self.started, "ended": self.ended, "revisions": self.revisions,
+            "depends_on": list(self.depends_on),
+            "plan": [dict(step) for step in self.plan],
+            "plan_version": self.plan_version,
+            "tool_calls": self.tool_calls, "tool_failures": self.tool_failures,
+            "tool_retries": self.tool_retries,
             "reviews": [dict(item) for item in self.reviews[-6:]],
             "feedback": [dict(item) for item in self.feedback[-6:]],
         }
@@ -835,7 +895,8 @@ class SwarmCoordinator:
                  on_event: Callable[..., None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
                  briefing: str = "", max_workers: int | None = None,
-                 allow_os_access: bool = False):
+                 allow_os_access: bool = False, criteria=(), effort: str = "",
+                 reflection: bool = True):
         goal_text = _clean_text(goal, 12_000)
         if not goal_text:
             raise SwarmError("A swarm needs a goal")
@@ -853,13 +914,26 @@ class SwarmCoordinator:
         self.allow_os_access = bool(allow_os_access)
         self.allow_ipc = bool(allow_ipc)
         self.shared_memory = bool(shared_memory)
+        self.reflection = bool(reflection)
+        self.effort = effort if effort in {"low", "medium", "high"} else ""
+        self.caller_criteria = _clean_criteria(criteria)
+        self.success_criteria: list[str] = list(self.caller_criteria)
+        self.gaps: list[str] = []
+        self.unmet_criteria: list[str] = []
         self.dry_run = bool(dry_run)
         self._on_event = on_event
         self._cancelled = cancelled
         self.briefing = _clean_text(briefing, self.limits.max_prompt_chars)
-        self._max_workers = max(1, min(self.limits.max_agents, int(max_workers or self.limits.max_agents)))
+        try:
+            requested_workers = int(max_workers or self.limits.max_agents)
+        except (TypeError, ValueError):
+            requested_workers = self.limits.max_agents
+        self._max_workers = max(1, min(self.limits.max_agents, requested_workers))
         self.gateway = gateway
         self.deadline = time.monotonic() + self.limits.max_seconds
+        self.finish_reserve = 0.0
+        self.work_deadline = self.deadline
+        self.timed_out = False
         self.status = "queued"
         self.strategy = "map_reduce"
         self.round = 0
@@ -874,9 +948,13 @@ class SwarmCoordinator:
         self.warnings: list[str] = []
         self.result: dict | None = None
         self._lock = threading.RLock()
+        # Serialises callbacks so a worker event cannot be delivered after
+        # ``swarm_end`` and reopen a finished stream.
+        self._emit_lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._members: list[SwarmMember] = []
         self._by_id: dict[str, SwarmMember] = {}
+        self._abandoned: set[str] = set()
         self._reviews: list[dict] = []
         self._requested_rounds = 0
         self._blackboard = SwarmBlackboard(self.limits.max_memory_entries,
@@ -896,6 +974,10 @@ class SwarmCoordinator:
             raise SwarmError(
                 "This swarm has already run; create a new SwarmCoordinator for another run")
         self.started = time.time()
+        self.deadline = time.monotonic() + self.limits.max_seconds
+        self.finish_reserve = _finish_reserve(self.limits.max_seconds)
+        self.work_deadline = self.deadline - self.finish_reserve
+        self.timed_out = False
         self.status = "planning"
         self._emit("swarm_start", swarm=self.id, leader=self.leader_model,
                    strategy=str(strategy or "auto"), requested_rounds=_int_value(rounds),
@@ -904,17 +986,37 @@ class SwarmCoordinator:
         try:
             specs = self._plan(agents, strategy, rounds)
             self._build_members(specs)
+            if (self.strategy == "pipeline" and len(self._members) > 1
+                    and not any(member.depends_on for member in self._members)):
+                self.warnings.append(
+                    "This pipeline has no dependencies; its stages run one after another "
+                    "and share the time budget. Map & reduce is faster for independent work.")
             self._emit("swarm_plan", swarm=self.id, strategy=self.strategy,
                        rounds=self._requested_rounds, agents=[m.to_dict() for m in self._members],
+                       success_criteria=list(self.success_criteria),
                        notes=self.reason, message=f"Plan ready: {len(self._members)} agent(s)")
             self.status = "running"
             self.phase = "work"
             if self.strategy == "pipeline":
                 for member in self._members:
+                    if self.timed_out or time.monotonic() >= self.work_deadline:
+                        self.timed_out = True
+                        self.warnings.append(
+                            "The work budget ended before the pipeline finished; later "
+                            "stages were skipped.")
+                        break
                     self._run_phase("work", [member])
             else:
-                self._run_phase("work")
+                self._run_work()
+            if self._members and all(member.status == "failed" for member in self._members):
+                raise SwarmError("Every swarm member failed")
             for round_no in range(1, self._requested_rounds + 1):
+                if self.timed_out or time.monotonic() >= self.work_deadline:
+                    self.timed_out = True
+                    self._emit("swarm_round", swarm=self.id, round=round_no, phase="stop",
+                               message="The work budget is reserved for the final answer; "
+                                       "the feedback loop was skipped")
+                    break
                 self._check_cancel()
                 if not self._review_round(round_no):
                     break
@@ -924,8 +1026,18 @@ class SwarmCoordinator:
                     self._emit("swarm_round", swarm=self.id, round=round_no,
                                phase="stop", message="Leader stopped the feedback loop")
                     break
+            if self.timed_out:
+                # Finish every member before synthesis: a worker that never started or
+                # never answered must not stay "running" in the result.
+                self._abandon_members("failed", "Work budget exhausted before completion")
+                if not any(member.output for member in self._members):
+                    raise SwarmTimeout(
+                        "Swarm time budget exhausted before any agent produced a result")
             self.status = "synthesizing"
             self.phase = "synthesis"
+            # Only real cancellation stops synthesis here; the reserve may already be
+            # gone, in which case _synthesize assembles the members' work.
+            self._check_stopped()
             output = self._synthesize()
             self.status = "completed"
             self.result = self._result(True, output=output)
@@ -935,30 +1047,38 @@ class SwarmCoordinator:
                        messages=self._channel.count(), reviews=len(self._all_reviews()),
                        blackboard=len(self._blackboard) if self.shared_memory else 0,
                        context=self._context_pool.snapshot(),
+                       success_criteria=list(self.success_criteria),
+                       unmet_criteria=list(self.unmet_criteria),
                        changed_files=list(self.changed_files),
+                       timed_out=self.timed_out,
+                       assembled=bool(output.get("assembled")),
                        message="Swarm finished")
             return self.result
         except SwarmCancelled:
-            self._abandon_members("cancelled", "Swarm cancelled")
             self.status = "cancelled"
+            self._abandon_members("cancelled", "Swarm cancelled")
             self.result = self._result(False, error="Swarm cancelled")
             self._emit("swarm_end", swarm=self.id, ok=False, status="cancelled",
-                       error="Swarm cancelled", message="Swarm cancelled")
+                       error="Swarm cancelled", timed_out=self.timed_out,
+                       message="Swarm cancelled")
             return self.result
         except SwarmTimeout:
-            self._abandon_members("failed", "Swarm time budget exhausted")
+            self.timed_out = True
             self.status = "failed"
+            self._abandon_members("failed", "Swarm time budget exhausted")
             self.result = self._result(False, error="Swarm time budget exhausted")
             self._emit("swarm_end", swarm=self.id, ok=False, status="failed",
-                       error=self.result["error"], message="Swarm time budget exhausted")
+                       error=self.result["error"], timed_out=self.timed_out,
+                       message="Swarm time budget exhausted")
             return self.result
         except Exception as failure:  # noqa: BLE001 - the caller records the failure
             message = str(failure) or type(failure).__name__
-            self._abandon_members("failed", message)
             self.status = "failed"
+            self._abandon_members("failed", message)
             self.result = self._result(False, error=message)
             self._emit("swarm_end", swarm=self.id, ok=False, status="failed",
-                       error=self.result["error"], message="Swarm failed")
+                       error=self.result["error"], timed_out=self.timed_out,
+                       message="Swarm failed")
             return self.result
         finally:
             self.updated = time.time()
@@ -1005,12 +1125,16 @@ class SwarmCoordinator:
                 if self.shared_memory else [],
                 "reviews": [self._snapshot_review(item)
                             for item in self._all_reviews()[-20:]],
+                "success_criteria": list(self.success_criteria),
+                "gaps": list(self.gaps),
+                "unmet_criteria": list(self.unmet_criteria),
                 "context": self._context_pool.snapshot(),
                 "context_items": len(self._context_bank),
                 "context_handles": self._context_bank.handles(limit=8),
                 "changed_files": list(self.changed_files),
                 "usage": dict(self.usage),
                 "warnings": list(self.warnings),
+                "timed_out": self.timed_out,
                 "started": self.started,
                 "updated": self.updated,
             }
@@ -1053,7 +1177,7 @@ class SwarmCoordinator:
             try:
                 reply, usage = self._complete(
                     self.leader_model, prompt, temperature=0.15, max_tokens=2_500,
-                    label="leader", phase="planning",
+                    label="leader", phase="planning", effort=self.effort or None,
                 )
             except (SwarmCancelled, SwarmTimeout):
                 raise
@@ -1086,6 +1210,10 @@ class SwarmCoordinator:
         self._requested_rounds = max(0, min(requested_rounds, planned_rounds,
                                              self.limits.max_rounds))
         self.reason = _clean_text((plan or {}).get("notes") or (plan or {}).get("reason") or "", 600)
+        self.success_criteria = _clean_criteria([
+            *self.caller_criteria,
+            *((plan or {}).get("success_criteria") or (plan or {}).get("criteria") or []),
+        ])
         planned = self._normalise_agents((plan or {}).get("agents"))
         merged = self._merge_agents(explicit, planned)
         if not merged:
@@ -1113,6 +1241,10 @@ class SwarmCoordinator:
                 item["read_only"] = extra["read_only"]
             if extra.get("context") and not item.get("context"):
                 item["context"] = extra["context"]
+            if extra.get("depends_on") and not item.get("depends_on"):
+                item["depends_on"] = extra["depends_on"]
+            if extra.get("plan") and not item.get("plan"):
+                item["plan"] = extra["plan"]
             if not item.get("task"):
                 item["task"] = extra.get("task") or self.goal
             merged.append(item)
@@ -1154,6 +1286,10 @@ class SwarmCoordinator:
             seen_tasks.add(task_key)
             base = _clean_id(item.get("id") or f"agent-{index + 1}", f"agent-{index + 1}")
             member_id = base
+            if member_id in RESERVED_MEMBER_IDS:
+                member_id = f"{member_id}-member"
+                self.warnings.append(
+                    f"Member id {base!r} is reserved for the channel; renamed to {member_id!r}.")
             counter = 2
             while member_id in seen:
                 member_id = f"{base}-{counter}"
@@ -1161,10 +1297,25 @@ class SwarmCoordinator:
             seen.add(member_id)
             label = _clean_text(item.get("label") or item.get("name") or member_id, 80)
             role = _clean_text(item.get("role") or "researcher", 40)
-            tools = [str(tool) for tool in _as_list(item.get("tools"))][:24]
-            writes = [self._clean_scope(path) for path in _as_list(item.get("writes"))]
+            raw_tools = _as_list(item.get("tools"))
+            tools = [str(tool.get("id") or tool.get("type") or "")
+                     if isinstance(tool, dict) else str(tool) for tool in raw_tools][:24]
+            tools = [tool for tool in tools if tool]
+            requested_writes = _as_list(item.get("writes"))
+            writes = [self._clean_scope(path) for path in requested_writes]
             writes = [path for path in writes if path][:40]
+            if requested_writes and not writes:
+                self.warnings.append(
+                    f"{member_id} asked for write scopes outside the workspace; it is read-only.")
             read_only = _flag(item.get("read_only"), not self.allow_write)
+            depends_on = []
+            for dependency in _as_list(item.get("depends_on") or item.get("after")
+                                       or item.get("needs"))[:12]:
+                dependency_id = _clean_id(dependency, "")
+                if dependency_id and dependency_id not in depends_on:
+                    depends_on.append(dependency_id)
+            plan = self._normalise_plan(item.get("plan") or item.get("steps"),
+                                        limit=MAX_PLAN_STEPS)
             context_chars = 0
             if item.get("context_chars") not in (None, ""):
                 context_chars = max(0, min(self.limits.max_agent_context_chars,
@@ -1177,6 +1328,8 @@ class SwarmCoordinator:
                 "read_only": read_only or not self.allow_write,
                 "read_only_explicit": "read_only" in item,
                 "context": context_chars,
+                "depends_on": depends_on,
+                "plan": plan,
                 "instruction": _clean_text(item.get("instruction") or item.get("focus") or "", 600),
             })
         return members
@@ -1187,7 +1340,8 @@ class SwarmCoordinator:
             requested = spec["tools"]
             plain = {str(tool).strip().lower() for tool in requested}
             wide = plain & {"*", "all", "any"}
-            if requested and plain <= {"none", "no-tools", "no_tools", "no tools"}:
+            no_tools = bool(requested and plain <= {"none", "no-tools", "no_tools", "no tools"})
+            if no_tools:
                 chosen = []  # an explicit no-tool member (an empty list means every tool)
             elif requested and wide:
                 chosen = [tool["id"] for tool in self.tools if tool.get("enabled", True)]
@@ -1209,7 +1363,7 @@ class SwarmCoordinator:
             # A member told to leave a note on the blackboard needs the write tool.
             # Without a write scope that is only safe under a server-wide OS grant;
             # with a scope the executor still enforces the scope on every write.
-            if (self.allow_write and "file.write" in available
+            if (not no_tools and self.allow_write and "file.write" in available
                     and "file.write" not in chosen
                     and _task_writes_files(spec["task"])
                     and (spec["writes"] or self.allow_os_access)):
@@ -1236,6 +1390,8 @@ class SwarmCoordinator:
                 tools=chosen, writes=writes,
                 read_only=read_only,
                 summary="",
+                depends_on=list(spec.get("depends_on") or []),
+                plan=[dict(step) for step in spec.get("plan") or []],
                 context_request=int(spec.get("context") or 0),
             )
             if spec.get("context"):
@@ -1251,13 +1407,37 @@ class SwarmCoordinator:
             raise SwarmError("The plan produced no usable member agents")
         self._channel = SwarmChannel([member.id for member in self._members], self.limits,
                                      on_message=self._message_event)
+        self._resolve_dependencies()
         self._seed_blackboard()
         if not self.allow_ipc:
             self._emit("swarm_leader", swarm=self.id, phase="planning",
                        message="Agent-to-agent messaging is disabled for this swarm")
 
+    def _resolve_dependencies(self) -> None:
+        """Drop unknown/self dependencies and break cycles before work starts."""
+        known = {member.id for member in self._members}
+        for member in self._members:
+            member.depends_on = [dep for dep in member.depends_on
+                                 if dep in known and dep != member.id][:8]
+        pending = {member.id: list(member.depends_on) for member in self._members
+                   if member.depends_on}
+        while pending:
+            ready = [member_id for member_id, deps in pending.items()
+                     if all(dep not in pending for dep in deps)]
+            if not ready:
+                for member in self._members:
+                    member.depends_on = []
+                self.warnings.append(
+                    "The leader planned a cycle in agent dependencies; the cycle was ignored "
+                    "and those agents ran in parallel.")
+                self._emit("swarm_leader", swarm=self.id, phase="planning",
+                           message="Dependency cycle ignored; affected agents run in parallel")
+                break
+            for member_id in ready:
+                pending.pop(member_id)
+
     def _seed_blackboard(self) -> None:
-        """Give every member the same starting knowledge: goal and plan."""
+        """Give every member the same starting knowledge: goal, criteria and plan."""
         if not self.shared_memory:
             return
         try:
@@ -1265,19 +1445,62 @@ class SwarmCoordinator:
             self._blackboard.write("leader", "swarm.plan", {
                 "strategy": self.strategy,
                 "rounds": self._requested_rounds,
+                "success_criteria": list(self.success_criteria),
                 "members": [{
                     "id": member.id, "label": member.label, "role": member.role,
                     "task": member.task[:400], "instruction": member.instruction[:300],
+                    "depends_on": list(member.depends_on),
+                    "plan": [dict(step) for step in member.plan],
                 } for member in self._members],
             }, note="leader plan")
         except SwarmLimitError:
             pass
+
+    def _run_work(self) -> None:
+        """Run members in dependency waves; independent members still share threads."""
+        remaining = list(self._members)
+        done: set[str] = set()
+        wave = 0
+        while remaining:
+            if self.timed_out or time.monotonic() >= self.work_deadline:
+                self.timed_out = True
+                self.warnings.append(
+                    "The work budget ended before every dependency wave ran; the "
+                    "remaining agents were skipped.")
+                break
+            self._check_cancel()
+            ready = [member for member in remaining
+                     if all(dep in done for dep in member.depends_on)]
+            if not ready:
+                for member in remaining:
+                    member.depends_on = []
+                self.warnings.append(
+                    "Work could not be ordered by dependencies; the remaining agents ran in "
+                    "parallel.")
+                ready = list(remaining)
+            wave += 1
+            if wave > 1 or any(member.depends_on for member in ready):
+                self._emit("swarm_leader", swarm=self.id, phase="work", wave=wave,
+                           message=(f"Work wave {wave}: {len(ready)} agent(s) "
+                                    "after their dependencies finished"))
+            self._run_phase("work", ready)
+            done.update(member.id for member in ready)
+            remaining = [member for member in remaining if member not in ready]
 
     # -- work, review, revise --------------------------------------------
     def _run_phase(self, phase: str, members: list[SwarmMember] | None = None,
                    feedback: dict[str, list[dict]] | None = None) -> None:
         selected = members if members is not None else list(self._members)
         if not selected:
+            return
+        try:
+            self._check_cancel()
+        except SwarmTimeout:
+            # The hard deadline can pass between phases when a wrap-up used the
+            # reserve.  Skipping the phase keeps the work already collected.
+            self.timed_out = True
+            self.warnings.append(
+                f"The time budget ended before the {phase} phase; it was skipped.")
             return
         self._emit("swarm_round", swarm=self.id, round=self.round, phase=phase,
                    message=f"{phase.title()} phase: {len(selected)} agent(s)")
@@ -1298,15 +1521,27 @@ class SwarmCoordinator:
                            label=member.label, ok=False, error=member.error,
                            elapsed=round((member.ended or time.time()) - (member.started or time.time()), 2),
                            round=self.round, phase=phase,
+                           tool_calls=member.tool_calls, tool_failures=member.tool_failures,
+                           tool_retries=member.tool_retries,
                            message=f"{member.label} failed")
 
-        errors = self._run_workers(selected, worker, "member")
+        try:
+            errors = self._run_workers(selected, worker, "member")
+        except SwarmTimeout:
+            # The hard budget ended while a worker was stuck in a call that ignored
+            # cancellation.  The results already collected are still worth returning.
+            self.timed_out = True
+            self.warnings.append(
+                "The time budget ended while agents were still working; the swarm "
+                "continues with the results it has.")
+            return
         if any(isinstance(item, SwarmCancelled) for item in errors):
             raise SwarmCancelled()
         if any(isinstance(item, SwarmTimeout) for item in errors):
-            raise SwarmTimeout("Swarm time budget exhausted")
-        if phase == "work" and all(member.status == "failed" for member in selected):
-            raise SwarmError("Every swarm member failed")
+            self.timed_out = True
+            self.warnings.append(
+                "The time budget ended while agents were still working; the swarm "
+                "continues with the results it has.")
 
     def _run_workers(self, items, worker, name: str) -> list[BaseException]:
         """Run ``worker(item)`` on daemon threads and collect their exceptions."""
@@ -1314,14 +1549,17 @@ class SwarmCoordinator:
         if not queue:
             return []
         errors: list[BaseException] = []
+        began = False
         lock = threading.Lock()
 
         def consume() -> None:
+            nonlocal began
             while True:
                 with lock:
                     if not queue:
                         return
                     item = queue.pop(0)
+                    began = True
                 try:
                     worker(item)
                 except (SwarmCancelled, SwarmTimeout) as failure:
@@ -1342,7 +1580,7 @@ class SwarmCoordinator:
                 for thread in threads:
                     thread.join(timeout=0.2)
                 raise SwarmCancelled()
-            if time.monotonic() > self.deadline:
+            if time.monotonic() > self.deadline and began:
                 # A model or tool call that ignores the cancel token must not hold the
                 # coordinator open past its budget; the worker is a daemon thread.
                 for thread in threads:
@@ -1357,6 +1595,9 @@ class SwarmCoordinator:
         member.started = member.started or time.time()
         member.ended = None
         member.phase = phase
+        if phase in {"work", "revise"}:
+            # Each work phase is a fresh chance to notice an unfinished plan.
+            member.reflected = False
         member.status = "reviewing" if phase == "review" else "revising" if phase == "revise" else "running"
         member.error = None
         member.text = ""
@@ -1370,32 +1611,92 @@ class SwarmCoordinator:
         extended = False
         initial_messages = len(messages)
         exhausted = True
+        budget_note = "Step budget exhausted"
         duplicate_counts: dict[str, int] = {}
+        empty_finals = 0
         iteration = 0
         while iteration < limit:
             iteration += 1
+            if time.monotonic() >= self.work_deadline:
+                self.timed_out = True
+                budget_note = "Work budget exhausted"
+                self.warnings.append(
+                    f"{member.id} reached the work deadline; finishing with collected results.")
+                exhausted = True
+                break
             self._check_cancel()
             member.steps += 1
             self._emit("swarm_agent_step", swarm=self.id, agent=member.id,
                        iteration=iteration, phase=phase, round=self.round,
                        message=f"{member.label}: round {iteration}")
-            reply, usage = self._complete(
-                self.model, messages, temperature=0.25 if phase == "work" else 0.15,
-                max_tokens=2_500, label=member.id, phase=phase, member=member,
-                iteration=iteration, with_tools=True,
-            )
+            try:
+                reply, usage = self._complete(
+                    self.model, messages, temperature=0.25 if phase == "work" else 0.15,
+                    max_tokens=2_500, label=member.id, phase=phase, member=member,
+                    iteration=iteration, with_tools=True, effort=self.effort or None,
+                    empty_ok=True, deadline=self.work_deadline,
+                )
+            except SwarmTimeout:
+                self.timed_out = True
+                budget_note = "Work budget exhausted"
+                self.warnings.append(
+                    f"{member.id} reached the work deadline; finishing with collected results.")
+                exhausted = True
+                break
             member.steps = max(member.steps, iteration)
             for key in member.usage:
-                member.usage[key] += int(usage.get(key) or 0)
+                member.usage[key] += _int_value(usage.get(key), 0)
             action = _model_action(reply)
             if action is None:
+                if not str(reply).strip():
+                    if empty_finals < 2:
+                        # An empty reply is not a final answer. Ask once for the
+                        # findings instead of finishing the member with no output.
+                        empty_finals += 1
+                        messages.append({"role": "user", "content": (
+                            'Your reply was empty. Reply with a complete '
+                            '{"final": "<your findings>"} or continue with a tool call.'
+                        )})
+                        self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
+                                   iteration=iteration, phase=phase, round=self.round,
+                                   message=f"{member.label} returned an empty reply; asking for its findings")
+                        self._compact_messages(messages, member)
+                        continue
+                    # Two empty replies means another identical turn is wasted.
+                    # Break to the tool-free wrap-up, which can still recover a
+                    # summary from the observations already collected.
+                    self.warnings.append(
+                        f"{member.id} returned repeated empty replies; asking for a final answer.")
+                    exhausted = True
+                    break
+                if self._check_open_plan(member, messages, reply, iteration, limit):
+                    continue
                 self._finish_member(member, reply.strip()[: self.limits.max_output_chars],
                                     phase, ok=True)
                 exhausted = False
                 break
             outcome, results = self._member_actions(
                 member, phase, action, duplicate_counts, iteration)
+            if outcome is not None and not outcome.strip():
+                if empty_finals < 2:
+                    empty_finals += 1
+                    if reply.strip():
+                        messages.append({"role": "assistant", "content": reply[:12_000]})
+                    observation = self._member_observation(member, phase, results) if results else ""
+                    messages.append({"role": "user", "content": (
+                        (observation + "\n\n" if observation else "")
+                        + 'Your final answer was empty. Reply with a complete '
+                        '{"final": "<your findings>"} or continue with a tool call.'
+                    )})
+                    self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
+                               iteration=iteration, phase=phase, round=self.round,
+                               message=f"{member.label} returned an empty final; asking for its findings")
+                    self._compact_messages(messages, member)
+                    continue
+                outcome = None
             if outcome is not None:
+                if self._check_open_plan(member, messages, reply, iteration, limit):
+                    continue
                 self._finish_member(member, outcome, phase, ok=True)
                 exhausted = False
                 break
@@ -1433,11 +1734,38 @@ class SwarmCoordinator:
                         "shared without a final synthesis.")
                     self._finish_member(member, partial[: self.limits.max_output_chars],
                                         phase, ok=True,
-                                        error="Step budget exhausted; no final answer was produced")
+                                        error=f"{budget_note}; no final answer was produced")
                 else:
                     fallback = member.text.strip() or f"No final answer after {limit} rounds."
                     self._finish_member(member, fallback[: self.limits.max_output_chars],
-                                        phase, ok=False, error="Step budget exhausted")
+                                        phase, ok=False, error=budget_note)
+
+    def _check_open_plan(self, member: SwarmMember, messages: list[dict], reply: str,
+                         iteration: int, limit: int) -> bool:
+        """Nudge a member once when it finishes with unfinished plan steps."""
+        unfinished = self._unfinished_steps(member)
+        if member.phase not in {"work", "revise"}:
+            return False
+        if self.reflection and unfinished and not member.reflected and iteration < limit:
+            member.reflected = True
+            if reply.strip():
+                messages.append({"role": "assistant", "content": reply[:12_000]})
+            messages.append({"role": "user", "content": (
+                "You are about to finish, but these plan steps are still open:\n"
+                + "\n".join(f"- {step.get('text', '')}" for step in unfinished[:8])
+                + "\nFinish them with tools now, or state in one line why each is "
+                  "unnecessary. Then reply with the final answer again."
+            )})
+            self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
+                       iteration=iteration, phase=member.phase, round=self.round,
+                       message=f"{member.label} is checking "
+                               f"{len(unfinished)} unfinished plan step(s)")
+            self._compact_messages(messages, member)
+            return True
+        if unfinished:
+            self.warnings.append(
+                f"{member.id} finished with {len(unfinished)} unfinished plan step(s).")
+        return False
 
     def _member_wrap_up(self, member: SwarmMember, phase: str,
                         messages: list[dict]) -> str:
@@ -1453,22 +1781,30 @@ class SwarmCoordinator:
                    message=f"{member.label} reached its tool budget; asking for a final answer")
         prompt = [*messages, {"role": "user", "content": (
             "Tool budget reached. Do not call another tool. Using only the observations "
-            "above, answer the task now. If a requested date has no matching items, say so "
-            "and use the newest available items. Reply with only "
-            '{"final": "<answer>"}.'
+            "above and your plan, answer the task now. If a requested date has no matching "
+            "items, say so and use the newest available items. Reply with only "
+            '{"final": "<answer>"}.\n\nYour plan:\n' + self._plan_lines(member)
         )}]
         try:
             reply, usage = self._complete(
                 self.model, prompt, temperature=0.1, max_tokens=1_500, label=member.id,
                 phase=phase, member=member, iteration=0, with_tools=False,
+                effort=self.effort or None, empty_ok=True,
             )
-        except (SwarmCancelled, SwarmTimeout):
+        except SwarmCancelled:
             raise
+        except SwarmTimeout:
+            # The finish reserve can be gone too (a call that ignored cancellation,
+            # or a very short budget). Keep the collected observations instead.
+            self.timed_out = True
+            self.warnings.append(
+                f"{member.id} had no time for a wrap-up call; using its collected results.")
+            return ""
         except Exception as failure:  # noqa: BLE001 - the partial-result fallback follows
             self.warnings.append(f"{member.id} could not produce a final answer: {failure}")
             return ""
         for key in member.usage:
-            member.usage[key] += int(usage.get(key) or 0)
+            member.usage[key] += _int_value(usage.get(key), 0)
         action = _model_action(reply)
         if isinstance(action, dict):
             for key in ("final", "answer", "result", "output", "text", "findings"):
@@ -1481,10 +1817,23 @@ class SwarmCoordinator:
 
     @staticmethod
     def _member_partial(messages: list[dict]) -> str:
-        """The newest observations, used when even the wrap-up call fails."""
-        observations = [str(item.get("content") or "") for item in messages
-                        if item.get("role") == "user"
-                        and not str(item.get("content") or "").startswith(COMPACTED_PREFIX)]
+        """The newest real observations, used when even the wrap-up call fails.
+
+        Coordinator repair prompts are not evidence.  A member that only returned
+        empty replies must fall back to a clear failure, not present the
+        coordinator's own nudge text as its findings.
+        """
+        coordinator = (
+            "Your reply was empty", "Your final answer was empty",
+            "You are about to finish", "Tool budget reached",
+            "Review not recorded", "Plan recorded. Continue",
+        )
+        observations = [
+            str(item.get("content") or "") for item in messages
+            if item.get("role") == "user"
+            and not str(item.get("content") or "").startswith(COMPACTED_PREFIX)
+            and not any(marker in str(item.get("content") or "") for marker in coordinator)
+        ]
         observations = [text for text in observations if text.strip()]
         if len(observations) <= 1:
             return ""
@@ -1500,6 +1849,11 @@ class SwarmCoordinator:
         results: list[str] = []
         final: str | None = None
         ops = self._normalise_actions(action, phase)
+        if not ops:
+            return None, [
+                "That JSON object contained no usable action. Reply with one of the supported "
+                "forms: a tool call, a calls list, a message, a memory update, a plan, a "
+                "context request, or a final answer."]
         for operation in ops:
             kind = operation.pop("op")
             if kind == "say":
@@ -1509,12 +1863,7 @@ class SwarmCoordinator:
             elif kind == "context":
                 results.append(self._member_context(member, operation))
             elif kind == "plan":
-                plan = self._normalise_plan(operation.get("plan") or operation.get("steps"))
-                if plan:
-                    self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
-                               phase=phase, round=self.round,
-                               message=f"{member.label} updated a {len(plan)}-step plan")
-                    results.append("Plan recorded.")
+                results.append(self._member_plan(member, operation, phase))
             elif kind == "tool":
                 results.append(self._member_tool(member, operation, duplicate_counts, iteration))
             elif kind == "review":
@@ -1565,6 +1914,8 @@ class SwarmCoordinator:
         if "plan" in action:
             operations.append({"op": "plan", "plan": action.get("plan")})
         calls = action.get("calls", action.get("tools"))
+        if isinstance(calls, dict):
+            calls = [calls]
         if isinstance(calls, list) and calls:
             for call in calls[:8]:
                 if isinstance(call, dict):
@@ -1650,8 +2001,9 @@ class SwarmCoordinator:
         """Apply one untrusted context request against the shared pool and bank."""
         if not isinstance(operation, dict):
             return "A context action must be a JSON object."
-        action = str(operation.get("action") or operation.get("op") or "").lower()
-        if not action:
+        action = str(operation.get("action") or "").lower()
+        if not action or action == "context":
+            # ``_normalise_actions`` adds op="context"; it is not a real action.
             action = ("get" if any(operation.get(key)
                                    for key in ("handle", "key", "peer", "query"))
                       else "status")
@@ -1722,14 +2074,16 @@ class SwarmCoordinator:
         if not text:
             return f"{label} is empty."
         length = len(text)
-        offset = max(0, min(_int_value(operation.get("offset") or operation.get("start"), 0),
-                            max(0, length - 1)))
+        offset = max(0, _int_value(operation.get("offset") or operation.get("start"), 0))
+        if offset >= length:
+            return (f"{label} has {length:,} characters, so offset {offset:,} is past the "
+                    "end. Use a lower offset, or omit offset to read from the start.")
         requested = _int_value(operation.get("chars") or operation.get("max_chars"),
                                self.limits.max_context_item_chars)
         # Reserve only the slice that can actually be returned; asking for the tail
         # of a file must not lock the whole per-request ceiling out of the pool.
-        requested = max(500, min(requested, self.limits.max_context_item_chars,
-                                  max(500, length - offset)))
+        requested = max(1, min(requested, self.limits.max_context_item_chars,
+                               length - offset))
         granted = self._context_pool.grant(member.id, requested)
         member.context_granted = self._context_pool.used(member.id)
         pool = self._context_pool.snapshot()
@@ -1865,6 +2219,10 @@ class SwarmCoordinator:
 
     def _member_tool(self, member: SwarmMember, operation: dict,
                      duplicate_counts: dict[str, int], iteration: int) -> str:
+        if time.monotonic() >= self.work_deadline:
+            self.timed_out = True
+            return ("The work budget is over; do not call more tools. Report the findings "
+                    "you already have.")
         tool_id = str(operation.get("tool") or operation.get("name") or "").strip()
         arguments = operation.get("input", operation.get("arguments", operation.get("args", {})))
         if isinstance(arguments, str):
@@ -1879,8 +2237,10 @@ class SwarmCoordinator:
         if not tool_id:
             return "A tool call needs a tool id."
         if tool_id not in member.tools:
+            suggestion = nearest_tool_id(tool_id, member.tools)
+            hint = f" Did you mean {suggestion!r}?" if suggestion else ""
             return (
-                f"Tool {tool_id!r} is not available to {member.id}. "
+                f"Tool {tool_id!r} is not available to {member.id}.{hint} "
                 f"Use one of: {', '.join(member.tools) or 'none'}."
             )
         if tool_id in WRITE_TOOLS:
@@ -1907,21 +2267,48 @@ class SwarmCoordinator:
                    input=json_safe(arguments, 1_500), iteration=iteration,
                    phase=member.phase, round=self.round,
                    message=f"{member.label} is using {tool_id}")
-        if self.executor is None:
-            observation, ok = {"error": "This swarm has no tool executor."}, False
-        else:
-            try:
-                self._check_cancel()
-                if tool_id in WRITE_TOOLS:
-                    with self._write_lock:
+        tool_type = next((tool["type"] for tool in self.tools if tool["id"] == tool_id), "")
+        retryable = tool_id not in WRITE_TOOLS and tool_type not in WRITE_TOOLS
+        member.tool_calls += 1
+        attempts = 0
+        observation: dict | object
+        ok = False
+        while True:
+            attempts += 1
+            if self.executor is None:
+                observation, ok = {"error": "This swarm has no tool executor."}, False
+            else:
+                try:
+                    self._check_cancel()
+                    if tool_id in WRITE_TOOLS:
+                        with self._write_lock:
+                            observation, ok = self.executor(member.to_dict(), tool_id, arguments)
+                    else:
                         observation, ok = self.executor(member.to_dict(), tool_id, arguments)
-                else:
-                    observation, ok = self.executor(member.to_dict(), tool_id, arguments)
-                self._observe_changes(observation)
-            except SwarmCancelled:
-                raise
-            except Exception as failure:  # noqa: BLE001 - the member model can recover
-                observation, ok = {"error": str(failure) or type(failure).__name__}, False
+                    self._observe_changes(observation)
+                except (SwarmCancelled, SwarmTimeout):
+                    raise
+                except Exception as failure:  # noqa: BLE001 - the member model can recover
+                    observation, ok = {"error": str(failure) or type(failure).__name__}, False
+            if ok or not retryable or attempts >= TOOL_ATTEMPTS:
+                break
+            error = observation.get("error") if isinstance(observation, dict) else observation
+            if not retryable_tool_failure(error):
+                break
+            if time.monotonic() >= self.deadline - 0.5:
+                break
+            member.tool_retries += 1
+            self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
+                       iteration=iteration, phase=member.phase, round=self.round,
+                       message=f"{member.label} is retrying {tool_id} after a temporary failure")
+        if not ok:
+            member.tool_failures += 1
+            error = observation.get("error") if isinstance(observation, dict) else observation
+            hint = tool_failure_hint(tool_id, error)
+            if hint:
+                observation = ({**observation, "hint": hint}
+                               if isinstance(observation, dict)
+                               else {"error": str(observation or "failed"), "hint": hint})
         try:
             encoded = json.dumps(observation, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
@@ -1938,17 +2325,20 @@ class SwarmCoordinator:
             bounded = json_safe(observation, preview_cap)
         else:
             bounded = json.loads(encoded)
-        if duplicate_counts[signature] >= 3 and ok:
+        if duplicate_counts[signature] >= 3:
             bounded = dict(bounded) if isinstance(bounded, dict) else {"result": bounded}
             bounded["hint"] = (
                 "You repeated the same tool call three times. Read the result, change approach, "
-                "or reply with the final answer."
-            )
+                "or reply with the final answer." if ok else
+                "You repeated the same failing tool call three times. Change the input or use "
+                "another tool instead of retrying it unchanged.")
         self._emit("swarm_agent_tool", swarm=self.id, agent=member.id, tool=tool_id,
-                   ok=ok, output=bounded, iteration=iteration,
+                   ok=ok, output=bounded, iteration=iteration, attempts=attempts,
                    phase=member.phase, round=self.round,
                    message=f"{member.label} {'finished' if ok else 'failed'} {tool_id}")
         rendered = json.dumps(bounded, ensure_ascii=False)
+        if attempts > 1:
+            rendered += f"\n(retried {attempts - 1} time(s) after a temporary failure)"
         if handle:
             rendered += (f"\n[This result was shortened. Its full text is stored as {handle}; "
                          f'request a slice with {{"context": {{"action": "get", '
@@ -2008,10 +2398,16 @@ class SwarmCoordinator:
 
     def _finish_member(self, member: SwarmMember, output: str, phase: str, ok: bool,
                        error: str | None = None) -> None:
+        with self._lock:
+            if self.status in {"completed", "failed", "cancelled"}:
+                return  # a worker abandoned by cancellation must not rewrite the result
+            if member.id in self._abandoned:
+                return  # a worker abandoned at the work deadline must not reopen the member
         member.ended = time.time()
         if phase == "review":
             member.status = "done" if ok else "failed"
-            member.summary = output[:600]
+            if not member.summary:
+                member.summary = output[:600]
         elif phase == "revise":
             if ok and output:
                 member.output = output
@@ -2048,6 +2444,10 @@ class SwarmCoordinator:
                    usage=dict(member.usage), version=member.version,
                    elapsed=round((member.ended or time.time()) - (member.started or time.time()), 2),
                    phase=phase, round=self.round, score=member.score,
+                   tool_calls=member.tool_calls, tool_failures=member.tool_failures,
+                   tool_retries=member.tool_retries,
+                   plan=[dict(step) for step in member.plan],
+                   depends_on=list(member.depends_on),
                    message=f"{member.label} {'finished' if ok else 'failed'}")
 
     def _publish_result(self, member: SwarmMember) -> None:
@@ -2073,6 +2473,10 @@ class SwarmCoordinator:
     def _review_round(self, round_no: int) -> bool:
         if self.limits.max_reviews <= 0:
             return False
+        if time.monotonic() >= self.work_deadline:
+            self.timed_out = True
+            self.warnings.append("The work budget ended before peer review; reviews were skipped.")
+            return False
         members = [member for member in self._members if member.output]
         if len(members) < 2:
             return False
@@ -2081,7 +2485,13 @@ class SwarmCoordinator:
         self.phase = "review"
         self._emit("swarm_leader", swarm=self.id, phase="review",
                    message="Leader is assigning peer reviews")
-        assignments = self._assign_reviews(members, round_no)
+        try:
+            assignments = self._assign_reviews(members, round_no)
+        except SwarmTimeout:
+            self.timed_out = True
+            self.warnings.append(
+                "The work budget ended while assigning peer reviews; reviews were skipped.")
+            return False
         if not assignments:
             return False
         self._emit("swarm_round", swarm=self.id, round=round_no, phase="review",
@@ -2102,7 +2512,15 @@ class SwarmCoordinator:
                         continue
                     reviewer.phase = "review"
                     reviewer.status = "reviewing"
-                    self._run_member_review_only(reviewer, target, assignment, round_no)
+                    try:
+                        self._run_member_review_only(reviewer, target, assignment, round_no)
+                    except (SwarmCancelled, SwarmTimeout):
+                        raise
+                    except Exception as failure:  # noqa: BLE001 - keep other assignments
+                        review_ok = False
+                        reviewer.error = str(failure) or type(failure).__name__
+                        self.warnings.append(f"{reviewer.id}'s review failed for "
+                                             f"{target.id}: {reviewer.error}")
             except (SwarmCancelled, SwarmTimeout):
                 review_ok = False
                 raise
@@ -2125,11 +2543,20 @@ class SwarmCoordinator:
 
         items = [(reviewer, tasks) for reviewer_id, tasks in by_reviewer.items()
                  if (reviewer := self._by_id.get(reviewer_id)) is not None]
-        errors = self._run_workers(items, worker, "review")
+        try:
+            errors = self._run_workers(items, worker, "review")
+        except SwarmTimeout:
+            self.timed_out = True
+            self.warnings.append(
+                "The work budget ended during peer review; remaining reviews were skipped.")
+            return False
         if any(isinstance(item, SwarmCancelled) for item in errors):
             raise SwarmCancelled()
         if any(isinstance(item, SwarmTimeout) for item in errors):
-            raise SwarmTimeout("Swarm time budget exhausted")
+            self.timed_out = True
+            self.warnings.append(
+                "The work budget ended during peer review; remaining reviews were skipped.")
+            return False
         return bool(self._round_reviews(round_no))
 
     def _assign_reviews(self, members: list[SwarmMember], round_no: int) -> list[dict]:
@@ -2158,7 +2585,8 @@ class SwarmCoordinator:
             ]
             try:
                 reply, usage = self._complete(self.leader_model, prompt, temperature=0.1,
-                                              max_tokens=1_500, label="leader", phase="review-plan")
+                                              max_tokens=1_500, label="leader", phase="review-plan",
+                                              deadline=self.work_deadline)
             except (SwarmCancelled, SwarmTimeout):
                 raise
             except Exception as failure:  # noqa: BLE001 - a failed leader falls back to a ring
@@ -2233,9 +2661,10 @@ class SwarmCoordinator:
             reply, usage = self._complete(self.model, messages, temperature=0.1,
                                           max_tokens=1_500, label=reviewer.id, phase=phase,
                                           member=reviewer, iteration=iteration,
-                                          with_tools=True)
+                                          with_tools=True, empty_ok=True,
+                                          deadline=self.work_deadline)
             for key in reviewer.usage:
-                reviewer.usage[key] += int(usage.get(key) or 0)
+                reviewer.usage[key] += _int_value(usage.get(key), 0)
             action = _model_action(reply)
             if action is None:
                 self._record_fallback_review(reviewer, target, reply)
@@ -2251,7 +2680,8 @@ class SwarmCoordinator:
                     text = self._member_review(reviewer, operation, phase)
                     if self._review_recorded(reviewer, target, round_no):
                         reviewer.status = "done"
-                        reviewer.summary = text
+                        # Keep the member's work summary; the review lives in its
+                        # own records and must not replace what the reader found.
                         return
                     results.append(text)  # rejected: report it and let the model retry
                     continue
@@ -2275,7 +2705,7 @@ class SwarmCoordinator:
                 '"strengths": [...], "issues": [...], "suggestions": [...], '
                 '"summary": "<one paragraph>"}}'
             )})
-        self._record_fallback_review(reviewer, target, reviewer.summary or "No review produced.")
+        self._record_fallback_review(reviewer, target, "")
         reviewer.status = "done"
 
     def _review_key(self, reviewer: str, target: str, round_no: int) -> str:
@@ -2333,13 +2763,16 @@ class SwarmCoordinator:
         ]
         if self.briefing:
             system.extend(["", self.briefing[:4_000]])
+        if self.success_criteria:
+            system.extend(["", "Success criteria the work is judged against:",
+                           *[f"- {item}" for item in self.success_criteria]])
         # Dynamic knowledge goes last so prompt trimming keeps it.
         system.extend([
             "",
             self._context_lines(reviewer),
             "",
             "Peer results (compare the target against them and flag contradictions or duplicated work):",
-            self._peer_digest(reviewer, limit=5, chars=500),
+            self._peer_digest(reviewer, limit=5, chars=500, exclude={target.id}),
             "",
             "Shared blackboard (read with a memory get when a value matters):",
             memory,
@@ -2371,22 +2804,35 @@ class SwarmCoordinator:
         prompt = [
             {"role": "system", "content": (
                 "You lead a review swarm. Decide whether another revision round would measurably "
-                'improve the result. Reply with only {"continue": true|false, "reason": "..."}. '
+                "improve the result against the success criteria. List the criteria that are "
+                'still unmet or unsupported. Reply with only {"continue": true|false, '
+                '"reason": "...", "gaps": ["<unmet requirement>"]}. '
                 "Stop when the remaining issues are cosmetic or every score is 4 or more."
             )},
             {"role": "user", "content": (
                 f"Goal: {self.goal[:4_000]}\n"
+                + (("Success criteria:\n" + "\n".join(f"- {item}" for item in self.success_criteria)
+                    + "\n") if self.success_criteria else "")
                 + "\n".join(
                     f"- {item['reviewer']} reviewed {item['target']} with {item['score']}/5: "
                     f"{'; '.join(item.get('issues') or [])[:400]}"
                     for item in reviews
+                )
+                + "\n\nMember plans:\n"
+                + "\n".join(
+                    f"- {member.id}: "
+                    f"{sum(1 for step in member.plan if step.get('status') == 'done')} "
+                    f"/{len(member.plan)} steps done"
+                    for member in self._members if member.plan
                 )
                 + f"\n\nOperator notes:\n{self._operator_notes() or '(none)'}"
             )},
         ]
         try:
             reply, usage = self._complete(self.leader_model, prompt, temperature=0.0,
-                                          max_tokens=800, label="leader", phase="review-decision")
+                                          max_tokens=800, label="leader",
+                                          phase="review-decision", effort=self.effort or None,
+                                          deadline=self.work_deadline)
         except (SwarmCancelled, SwarmTimeout):
             raise
         except Exception as failure:  # noqa: BLE001 - default to the configured rounds
@@ -2397,6 +2843,14 @@ class SwarmCoordinator:
         if action is None or "continue" not in action:
             return True
         self.reason = _clean_text(action.get("reason") or self.reason, 400)
+        if "gaps" in action:
+            raw_gaps = action.get("gaps")
+            if isinstance(raw_gaps, str):
+                raw_gaps = [raw_gaps]
+            self.gaps = _clean_criteria(
+                [*self.gaps, *(raw_gaps if isinstance(raw_gaps, list) else [])])
+            self._emit("swarm_leader", swarm=self.id, phase="review", gaps=list(self.gaps),
+                       message=f"Leader found {len(self.gaps)} open gap(s)")
         return _flag(action.get("continue"), False)
 
     def _revise_round(self, round_no: int) -> None:
@@ -2419,6 +2873,7 @@ class SwarmCoordinator:
         return "\n".join(f"- {text}" for text in self.operator_messages[-8:])
 
     def _synthesize(self) -> dict:
+        self._check_stopped()
         self._emit("swarm_leader", swarm=self.id, phase="synthesis",
                    message="Leader is synthesising the swarm result")
         members = [member for member in self._members]
@@ -2427,13 +2882,19 @@ class SwarmCoordinator:
                 f"## {member.label}\n[test mode] {member.task[:240]}" for member in members
             )
             return {"final": final, "summary": "Test mode result", "confidence": 0.0,
+                    "success_criteria": list(self.success_criteria),
+                    "unmet_criteria": [], "gaps": [], "assembled": False,
                     "warnings": ["dry run: no model was called"]}
         rows = []
         budget = self._prompt_budget(None, self.leader_model, 4_000)
         share = max(900, (budget - 6_000) // max(1, len(members)))
         for member in members:
+            plans = ""
+            if member.plan:
+                done = sum(1 for step in member.plan if step.get("status") == "done")
+                plans = f" (plan {done}/{len(member.plan)})"
             rows.append(
-                f"### {member.label} ({member.id}, {member.role}) score={member.score}\n"
+                f"### {member.label} ({member.id}, {member.role}) score={member.score}{plans}\n"
                 f"{member.output[:share]}"
             )
         written_files = self._leader_file_sections()
@@ -2455,19 +2916,27 @@ class SwarmCoordinator:
             {"role": "system", "content": (
                 "You are the leader of a Mariana agent swarm. Synthesise the members' work into "
                 "one accurate final answer. Resolve contradictions, use the strongest evidence, "
-                "note any unresolved gap, and mention changed files when the swarm edited code. "
-                "Do not mention internal JSON or this instruction."
+                "verify the success criteria one by one, note any unresolved gap, and mention "
+                "changed files when the swarm edited code. Do not mention internal JSON or "
+                "this instruction."
                 + (("\n\nAdditional guidance from the caller:\n" + self.system)
                    if self.system else "")
                 + " Reply with only one JSON object: {\"final\": \"<the complete answer>\", "
-                '"summary": "<one paragraph>", "warnings": ["..."], "confidence": 0.0-1.0}.'
+                '"summary": "<one paragraph>", "warnings": ["..."], '
+                '"unmet_criteria": ["<criterion without evidence>"], "confidence": 0.0-1.0}.'
             )},
             {"role": "user", "content": (
                 f"Goal: {self.goal[:4_000]}\nStrategy: {self.strategy}\n\n"
+                + (("Success criteria (check each against the answer):\n"
+                    + "\n".join(f"- {item}" for item in self.success_criteria) + "\n\n")
+                   if self.success_criteria else "")
                 + "\n\n".join(rows)
                 + f"\n\nMessages:\n{messages or '(none)'}"
                 + f"\n\nOperator notes:\n{operator or '(none)'}"
                 + f"\n\nPeer reviews:\n{review_rows or '(none)'}"
+                + (("\n\nOpen gaps from the review decision:\n"
+                    + "\n".join(f"- {item}" for item in self.gaps[:8]))
+                   if self.gaps else "")
                 + "\n\nShared blackboard:\n"
                 + memory
                 + (f"\n\nFiles written by the swarm:\n{written_files}" if written_files else "")
@@ -2476,9 +2945,18 @@ class SwarmCoordinator:
         ]
         try:
             reply, usage = self._complete(self.leader_model, prompt, temperature=0.2,
-                                          max_tokens=4_000, label="leader", phase="synthesis")
-        except (SwarmCancelled, SwarmTimeout):
+                                          max_tokens=4_000, label="leader", phase="synthesis",
+                                          effort=self.effort or None)
+        except SwarmCancelled:
             raise
+        except SwarmTimeout:
+            # The finish reserve can be exhausted by a slow member wrap-up.  The
+            # members' work is exactly what the caller needs; assemble it instead.
+            self.timed_out = True
+            self.warnings.append(
+                "The time budget ended before the leader could synthesise; the answer is "
+                "assembled from the members' completed work.")
+            reply, usage = "", {}
         except Exception as failure:  # noqa: BLE001 - assemble the members' work instead
             self.warnings.append(f"Leader synthesis failed: {failure}; member results are returned.")
             reply, usage = "", {}
@@ -2488,30 +2966,56 @@ class SwarmCoordinator:
             final = _string(action["final"]).strip()
             summary = _clean_text(action.get("summary") or "", 1_200)
             warnings = [_clean_text(item, 300) for item in _as_list(action.get("warnings"))[:8]]
+            self.unmet_criteria = _clean_criteria(
+                action.get("unmet_criteria") or action.get("unmet") or "")
+            if self.unmet_criteria:
+                warnings.append("Unmet success criteria: " + "; ".join(self.unmet_criteria))
             try:
                 confidence = max(0.0, min(1.0, float(action.get("confidence", 0.0))))
             except (TypeError, ValueError):
                 confidence = 0.0
             if final:
                 return {"final": final, "summary": summary or final[:400],
-                        "warnings": warnings, "confidence": confidence}
+                        "warnings": warnings, "confidence": confidence,
+                        "success_criteria": list(self.success_criteria),
+                        "unmet_criteria": list(self.unmet_criteria),
+                        "gaps": list(self.gaps), "assembled": False}
             self.warnings.append("The leader returned an empty synthesis; assembling member results.")
         elif action is None:
             stripped = (reply or "").strip()
             if stripped:
                 return {"final": stripped, "summary": stripped[:400],
-                        "warnings": ["leader synthesis was free text"], "confidence": 0.0}
+                        "warnings": ["leader synthesis was free text"], "confidence": 0.0,
+                        "success_criteria": list(self.success_criteria),
+                        "unmet_criteria": [], "gaps": list(self.gaps), "assembled": False}
             self.warnings.append("The leader returned no synthesis; assembling member results.")
         else:
             self.warnings.append(
                 "The leader returned a JSON object without a final answer; "
                 "assembling member results.")
-        final = "\n\n".join(
-            f"## {member.label}\n{member.output or '(no output)'}" for member in members
-        )
-        return {"final": final or "The swarm produced no output.",
-                "summary": "Assembled from member results because the leader returned no synthesis.",
-                "warnings": list(self.warnings), "confidence": 0.0}
+        delivered = [member for member in members if member.output]
+        missing = [member for member in members if not member.output]
+        sections = [f"## {member.label}\n\n{member.output}" for member in delivered]
+        if missing:
+            sections.append("## Not delivered\n\n" + "\n".join(
+                f"- **{member.label}** — {member.error or 'did not finish'}"
+                for member in missing))
+        final = "\n\n".join(sections)
+        lead = ("The time budget ended before the leader could synthesise this run."
+                if self.timed_out else "The leader could not synthesise this run.")
+        if delivered:
+            lead += (f" {len(delivered)} of {len(members)} agents delivered findings; the "
+                     "sections below are their own hand-offs.")
+        summary = ("Assembled from the agents' collected work because the time budget "
+                   "ended before synthesis." if self.timed_out else
+                   "Assembled from the agents' collected work because the leader "
+                   "returned no synthesis.")
+        return {"final": (f"> {lead}\n\n{final}" if final
+                          else "The swarm produced no output."),
+                "summary": summary,
+                "warnings": list(self.warnings), "confidence": 0.0,
+                "success_criteria": list(self.success_criteria),
+                "unmet_criteria": [], "gaps": list(self.gaps), "assembled": True}
 
     # -- prompt building -------------------------------------------------
     def _leader_file_sections(self, limit: int = 4, chars: int = 4_000) -> str:
@@ -2536,6 +3040,7 @@ class SwarmCoordinator:
         }
         sections = []
         for path in paths[:max(1, limit)]:
+            self._check_stopped()
             try:
                 observation, ok = self.executor(
                     leader, "file.read",
@@ -2585,20 +3090,28 @@ class SwarmCoordinator:
                 "You are the leader of a Mariana agent swarm. Plan a small, focused team that "
                 "will complete the goal in parallel. Members can call tools, message each other, "
                 "write to a shared blackboard and review each other. You remain the only agent "
-                "that produces the final answer. Reply with only one JSON object:\n"
+                "that produces the final answer. Think first about the deliverable, the "
+                "evidence each part needs and the order work can safely happen in. Reply with "
+                "only one JSON object:\n"
                 '{"strategy": "map_reduce|peer_review|debate|pipeline", "rounds": 0-'
-                + str(self.limits.max_rounds) + ', "agents": [{"id": "<lowercase-id>", '
-                '"label": "<short name>", "role": "<role>", "task": "<specific task>", '
+                + str(self.limits.max_rounds) + ', "success_criteria": ["<testable check>"], '
+                '"agents": [{"id": "<lowercase-id>", "label": "<short name>", '
+                '"role": "<role>", "task": "<specific task>", '
                 '"tools": ["<tool ids>"] or ["*"] or ["none"], '
                 '"writes": ["<relative path or folder>"], '
                 '"read_only": true|false, "context_chars": <extra chars, optional>, '
+                '"depends_on": ["<agent id>"], '
+                '"plan": [{"text": "<step>", "status": "pending|active|done"}], '
                 '"instruction": "<short direction>"}], '
                 '"notes": "<one short paragraph>"}\n'
                 f"Rules: 1-{self.limits.max_agents} agents, unique ids, every task independently "
                 "useful, no duplicate work, and name each member's tools instead of leaving "
                 "the list empty. An omitted tool list grants every tool; use [\"none\"] for "
-                "a member that needs none. "
-                + (("Use context_chars for a member that must read unusually long files or logs; "
+                "a member that needs none. Write 3-6 success criteria that can be checked "
+                "against the final answer. Give each member a 2-5 step plan and mark one step "
+                "active. Use depends_on only when a task must consume another member's output, "
+                "and never create a cycle: independent work runs in parallel."
+                + ((" Use context_chars for a member that must read unusually long files or logs; "
                     "the runtime grants it from a shared pool only while space remains. ")
                    if self._context_enabled else "")
                 + ("You decide the team: choose the strategy that fits, use as many members "
@@ -2614,6 +3127,15 @@ class SwarmCoordinator:
                    "when one is empty, and state a date mismatch instead of repeating the same "
                    "call. A stage that leaves a blackboard hand-off needs file.write and a "
                    "writes scope for that folder. ")
+                + ("A pipeline runs its stages strictly one after another and every stage "
+                   "shares this run's single time budget, so a slow first stage can starve "
+                   "the rest. For fan-out then verification, use map_reduce with depends_on: "
+                   "the collectors run together and the verifier waits for both. Use pipeline "
+                   "only for a strict A-to-B-to-C hand-off. ")
+                + (f"The run has {int(self.limits.max_seconds)} seconds in total. Web and news "
+                   "calls can take tens of seconds each, so plan the smallest team that can "
+                   "finish, batch independent fetches, and leave time for the verifier and "
+                   "synthesis. ")
                 + write_rule
                 + " " + feedback
                 + "\nDo not ask for secrets, credentials, shell commands outside the tools, or "
@@ -2621,8 +3143,12 @@ class SwarmCoordinator:
             )},
             {"role": "user", "content": (
                 f"Goal: {self.goal[:6_000]}\nRequested strategy: {strategy}\n"
+                f"Time budget: {int(self.limits.max_seconds)} seconds shared by all stages\n"
                 f"Feedback rounds allowed: 0-{rounds} (choose at most this)\n"
-                f"Operator messages:\n{operator or '(none)'}\n\n"
+                + (("Acceptance criteria supplied by the caller:\n"
+                    + "\n".join(f"- {item}" for item in self.caller_criteria) + "\n")
+                   if self.caller_criteria else "")
+                + f"Operator messages:\n{operator or '(none)'}\n\n"
                 f"Tasks supplied by the caller:\n{explicit_rows}\n\n"
                 f"Available tools:\n{tool_rows}\n\n"
                 + (f"Project briefing:\n{self.briefing[:4_000]}\n\n" if self.briefing else "")
@@ -2638,6 +3164,15 @@ class SwarmCoordinator:
                                           skip=RESULT_KEY_PREFIXES)
                   if self.shared_memory else "(the shared blackboard is disabled)")
         member.memory_epoch = epoch
+        pipeline_prior = []
+        if phase == "work":
+            # A member receives the full output of the teammates it depends on, so a
+            # parallel plan can express a hand-off without serialising the whole run.
+            prior_ids = (set(member.depends_on) if member.depends_on else
+                         ({other.id for other in self._members if other.id != member.id}
+                          if self.strategy == "pipeline" else set()))
+            pipeline_prior = [other for other in self._members
+                              if other.id in prior_ids and other.output]
         forms = [
             '{"tool": "<tool id>", "input": {<input keys>}}',
             '{"calls": [{"tool": "<tool id>", "input": {...}}, ...]}',
@@ -2667,6 +3202,10 @@ class SwarmCoordinator:
             "Batch independent tool calls in one turn with the calls form: one turn is one "
             "step, so batching leaves more rounds for the actual research. Stop as soon as "
             "the observations answer the task.",
+            "Before your final answer, write any required hand-off file or blackboard note; "
+            "the tool-free wrap-up cannot call tools.",
+            "For multi-step work, send a plan action first and mark exactly one step active. "
+            "Update the plan as steps complete; the leader uses it to judge progress.",
             "",
             "Available tools:",
             self._tool_lines(member),
@@ -2679,33 +3218,44 @@ class SwarmCoordinator:
             self._context_lines(member),
             "",
             "Peer results so far (compare and build on them; do not repeat their work):",
-            self._peer_digest(member, limit=4, chars=400),
+            self._peer_digest(member, limit=4, chars=400,
+                              exclude={other.id for other in pipeline_prior}),
             "",
             "Shared blackboard (use a memory get to read a full value):",
             memory,
             "",
+            "Your current plan (update it with a plan action):",
+            self._plan_lines(member),
+            "",
             "Unread messages:",
             inbox,
         ])
+        if self.success_criteria:
+            system.extend(["", "Success criteria the final answer must satisfy:",
+                           *[f"- {item}" for item in self.success_criteria]])
         if member.writes:
             system.append("You may write only inside: " + ", ".join(member.writes))
         elif not self.allow_write:
             system.append("Editing and shell access are disabled; report the exact change instead.")
         task = f"Goal: {self.goal}\nYour task: {member.task}\nPhase: {phase}."
-        if self.strategy == "pipeline" and phase == "work":
-            prior = [other for other in self._members
-                     if other.id != member.id and other.output]
-            if prior:
-                task += "\n\nPrevious stages to build on:\n" + "\n\n".join(
-                    f"### {other.label} ({other.id})\n{other.output[:4_000]}"
-                    + (f"\n(full text: {other.result_handle})" if other.result_handle else "")
-                    for other in prior
-                )
+        if pipeline_prior:
+            task += "\n\nPrevious stages to build on:\n" + "\n\n".join(
+                f"### {other.label} ({other.id})\n{other.output[:4_000]}"
+                + (f"\n(full text: {other.result_handle})" if other.result_handle else "")
+                for other in pipeline_prior
+            )
         if self.strategy == "debate":
             task += ("\n\nChallenge assumptions, compare evidence with the other members, "
                      "and make your final answer robust to counter-arguments. Name the "
                      "strongest peer claim you disagree with, then rebut it with evidence or "
                      "adopt it, and state what you changed.")
+        if phase == "revise" and member.output:
+            # A revision must show the work being revised; otherwise the member is
+            # asked to address feedback on an answer it cannot see.
+            task += ("\n\nYour previous answer (revise it using the feedback):\n"
+                     + member.output[:6_000])
+            if member.result_handle:
+                task += f"\n(full text: {member.result_handle})"
         if feedback:
             task += "\n\nFeedback from peers (revise the work and address each point):\n" + "\n".join(
                 f"- {item['reviewer']} scored {item['score']}/5. Issues: "
@@ -2713,6 +3263,10 @@ class SwarmCoordinator:
                 f"{'; '.join(item.get('suggestions') or []) or 'none'}."
                 for item in feedback[:8]
             )
+        if self.gaps:
+            task += ("\n\nLeader gap analysis for the whole team (address any gap that "
+                     "touches your task):\n"
+                     + "\n".join(f"- {item}" for item in self.gaps[:8]))
         return [{"role": "system", "content": self._cap_prompt("\n".join(system), member)},
                 {"role": "user", "content": task}]
 
@@ -2734,20 +3288,41 @@ class SwarmCoordinator:
             lines.append(self.system)
         return "\n".join(lines)
 
-    def _peer_digest(self, member: SwarmMember, limit: int = 4, chars: int = 400) -> str:
-        """Compact results already produced by the rest of the team."""
-        rows = []
-        for other in self._members:
-            if other.id == member.id or not other.output:
+    def _peer_digest(self, member: SwarmMember, limit: int = 4, chars: int = 400,
+                     exclude: set[str] | None = None) -> str:
+        """The peer results most likely to change this member's work.
+
+        Only a few results fit in the prompt, so they are ranked by keyword
+        overlap with the member's own task instead of by planning order.  An
+        identical result is sent once; the full text stays behind its handle.
+        ``exclude`` drops results already shown in full elsewhere in the prompt.
+        """
+        limit = max(1, int(limit))
+        excluded = {str(item) for item in exclude or ()}
+        task = f"{member.task} {member.role}".lower()
+        words = sorted({word for word in re.split(r"\W+", task) if len(word) >= 3},
+                       key=len, reverse=True)[:16]
+        rows: list[tuple[int, int, SwarmMember, str]] = []
+        seen: set[str] = set()
+        for index, other in enumerate(self._members):
+            if other.id == member.id or other.id in excluded or not other.output:
                 continue
+            fingerprint = other.output[:2_000]
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            lowered = other.output.lower()
+            score = sum(lowered.count(word) for word in words)
+            rows.append((score, index, other, other.output))
+        rows.sort(key=lambda row: (-row[0], row[1]))
+        digest = []
+        for _score, _index, other, body in rows[:limit]:
             full = f" (full text: {other.result_handle})" if other.result_handle else ""
-            rows.append(
+            digest.append(
                 f"- {other.label} ({other.id}, {other.role}, v{other.version}, "
                 f"score {other.score if other.score is not None else 'n/a'}): "
-                f"{other.output[:chars]}{full}")
-            if len(rows) >= max(1, limit):
-                break
-        return "\n".join(rows) or "(no peer results yet)"
+                f"{body[:chars]}{full}")
+        return "\n".join(digest) or "(no peer results yet)"
 
     def _context_lines(self, member: SwarmMember) -> str:
         """The dynamic context protocol and what the pool can grant right now."""
@@ -2783,9 +3358,51 @@ class SwarmCoordinator:
         lines = []
         for tool_id in selected:
             tool = by_id.get(tool_id, {"id": tool_id, "description": READ_TOOL_HINTS.get(tool_id, "")})
-            keys = ", ".join(field["key"] for field in tool.get("params", [])) or "none"
+            params = tool.get("params") if isinstance(tool.get("params"), list) else []
+            keys = ", ".join(
+                str(field.get("key")) for field in params
+                if isinstance(field, dict) and field.get("key")) or "none"
             lines.append(f"- {tool_id}: {tool.get('description') or ''} Input keys: {keys}.")
         return "\n".join(lines)
+
+    def _member_plan(self, member: SwarmMember, operation: dict, phase: str) -> str:
+        """Persist a member's plan and keep it to one active step at a time."""
+        plan = self._normalise_plan(operation.get("plan") or operation.get("steps"),
+                                    limit=MAX_PLAN_STEPS)
+        if not plan:
+            return "A plan needs at least one step with text."
+        active_seen = False
+        for step in plan:
+            if step["status"] != "active":
+                continue
+            if active_seen:
+                step["status"] = "pending"
+            active_seen = True
+        member.plan = plan
+        member.plan_version += 1
+        done = sum(1 for step in plan if step["status"] == "done")
+        next_step = next((step["text"] for step in plan if step["status"] == "active"),
+                         next((step["text"] for step in plan if step["status"] == "pending"), ""))
+        self._emit("swarm_agent_plan", swarm=self.id, agent=member.id, phase=phase,
+                   round=self.round, plan=[dict(step) for step in plan],
+                   version=member.plan_version, done=done, total=len(plan),
+                   message=f"{member.label} updated a {len(plan)}-step plan ({done} done)")
+        guidance = f"Plan saved: {done}/{len(plan)} steps done."
+        if next_step:
+            guidance += f" Next: {next_step}"
+        return guidance
+
+    @staticmethod
+    def _unfinished_steps(member: SwarmMember) -> list[dict]:
+        return [step for step in member.plan if step.get("status") != "done"]
+
+    def _plan_lines(self, member: SwarmMember) -> str:
+        if not member.plan:
+            return "(no plan yet; make a short one when the task has several steps)"
+        marks = {"done": "x", "active": ">", "pending": " "}
+        return "\n".join(
+            f"{index}. [{marks.get(step.get('status'), ' ')}] {step.get('text', '')}"
+            for index, step in enumerate(member.plan, 1))
 
     def _member_observation(self, member: SwarmMember, phase: str,
                             results: list[str] | None = None) -> str:
@@ -2809,8 +3426,6 @@ class SwarmCoordinator:
                 blocks.append("Blackboard now:\n"
                               + self._blackboard.digest(limit=12, value_chars=240))
                 member.memory_epoch = epoch
-            else:
-                blocks.append("Blackboard unchanged since your last turn.")
         blocks.append("Continue with a tool call, a message, a memory update, a context "
                       "request, or the final answer.")
         return "\n\n".join(blocks)[: cap * 2]
@@ -2830,6 +3445,8 @@ class SwarmCoordinator:
         ledger_at = 2 if (len(messages) > 2
                           and str(messages[2].get("content") or "").startswith(COMPACTED_PREFIX)
                           ) else -1
+        previous_handles = (CONTEXT_HANDLE.findall(str(messages[2].get("content") or ""))
+                            if ledger_at == 2 else [])
         body = 3 if ledger_at == 2 else 2
         total = sum(len(str(item.get("content") or "")) for item in messages)
         dropped: list[dict] = []
@@ -2850,18 +3467,24 @@ class SwarmCoordinator:
                 member.id, "history", f"{member.label} compacted turns", text,
                 max_chars=self._context_bank.max_chars)
         handles: list[str] = []
-        for match in CONTEXT_HANDLE.findall(text):
+        for match in [*previous_handles, *CONTEXT_HANDLE.findall(text)]:
             if match not in handles:
                 handles.append(match)
         if handle:
             handles.append(handle)
-        ledger = (
-            COMPACTED_PREFIX + " Earlier turns were compacted to stay inside the context "
-            "window. Nothing was lost: read any handle back with "
-            '{"context": {"action": "get", "handle": "<handle>"}}.'
-            + ("\nHandles: " + ", ".join(handles[:12]) if handles else
-               "\nNo handles were stored.")
-        )
+        if handles:
+            ledger = (
+                COMPACTED_PREFIX + " Earlier turns were compacted to stay inside the context "
+                "window. Nothing was lost: read any handle back with "
+                '{"context": {"action": "get", "handle": "<handle>"}}.'
+                + "\nHandles: " + ", ".join(handles[:12])
+            )
+        else:
+            ledger = (
+                COMPACTED_PREFIX + " Earlier turns were compacted to stay inside the context "
+                "window. They were not stored as handles, so rely on the plan and the "
+                "newest observations."
+            )
         entry = {"role": "user", "content": ledger}
         if ledger_at == 2:
             messages[2] = entry
@@ -2910,11 +3533,20 @@ class SwarmCoordinator:
         return max(500, budget)
 
     # -- model calls -----------------------------------------------------
+    def _native_tools(self, member: SwarmMember | None, phase: str) -> list[dict]:
+        """The tool schemas a model call may see: the member's grant, read-only in review."""
+        allowed = ({tool["id"] for tool in self.tools} if member is None
+                   else set(member.tools))
+        return [tool for tool in self.tools
+                if tool["id"] in allowed
+                and (phase != "review" or tool["id"] not in WRITE_TOOLS)]
+
     def _complete(self, model: str, messages: list[dict], *, temperature: float,
                   max_tokens: int, label: str, phase: str,
                   member: SwarmMember | None = None, iteration: int = 0,
                   _allow_retry: bool = True, effort: str | None = None,
-                  with_tools: bool = False) -> tuple[str, dict]:
+                  with_tools: bool = False, empty_ok: bool = False,
+                  deadline: float | None = None) -> tuple[str, dict]:
         self._check_cancel()
         config = {
             "model": model,
@@ -2927,15 +3559,13 @@ class SwarmCoordinator:
         if effort:
             config["reasoning_effort"] = effort
         if with_tools and self.tools:
-            # Members get native function calling where the endpoint supports it; the
-            # prompt still lists the tools and the DSML/JSON parsers remain the fallback.
-            # A reviewer only sees read tools, matching its prompt.
-            native = ([tool for tool in self.tools if tool["id"] not in WRITE_TOOLS]
-                      if phase == "review" else self.tools)
+            # A member only sees the tools it was granted; a review sees read tools.
+            native = self._native_tools(member, phase)
             if native:
                 config["tools"] = native
         cancel = _SwarmCancel(self._cancelled)
-        remaining = self.deadline - time.monotonic()
+        limit = self.deadline if deadline is None else min(self.deadline, float(deadline))
+        remaining = limit - time.monotonic()
         if remaining <= 0:
             raise SwarmTimeout("Swarm time budget exhausted")
         timer = threading.Timer(remaining, cancel.expire)
@@ -2945,10 +3575,22 @@ class SwarmCoordinator:
         result: dict = {}
         pending = ""
         emitted = 0.0
+        reasoning_noted = False
+
+        def emit_delta(text: str) -> None:
+            """Publish every character, even when one burst exceeds the event cap."""
+            while text:
+                self._emit("swarm_agent_delta", swarm=self.id, agent=member.id,
+                           iteration=iteration, phase=phase, round=self.round,
+                           text=text[:4_000])
+                text = text[4_000:]
+
         try:
             stream = getattr(self.gateway, "stream", None)
             if callable(stream):
                 for event in stream(config, cancel):
+                    if not isinstance(event, dict):
+                        continue
                     if self._cancelled and self._cancelled():
                         raise SwarmCancelled("Swarm cancelled")
                     if cancel.expired:
@@ -2960,12 +3602,11 @@ class SwarmCoordinator:
                         if member is not None:
                             pending += text
                             if time.time() - emitted >= 0.12:
-                                self._emit("swarm_agent_delta", swarm=self.id, agent=member.id,
-                                           iteration=iteration, phase=phase, round=self.round,
-                                           text=pending[:4_000])
+                                emit_delta(pending)
                                 pending, emitted = "", time.time()
                     elif kind == "reasoning":
-                        if member is not None:
+                        if member is not None and not reasoning_noted:
+                            reasoning_noted = True
                             self._emit("swarm_agent_status", swarm=self.id, agent=member.id,
                                        iteration=iteration, phase=phase, round=self.round,
                                        message=f"{member.label} is reasoning")
@@ -2980,39 +3621,58 @@ class SwarmCoordinator:
                         raise SwarmError(str(event.get("error") or "The model call failed"))
             else:
                 result = self.gateway.chat(config)
+                if not isinstance(result, dict):
+                    result = {}
         finally:
             timer.cancel()
             if pending and member is not None:
-                self._emit("swarm_agent_delta", swarm=self.id, agent=member.id,
-                           iteration=iteration, phase=phase, round=self.round,
-                           text=pending[:4_000])
+                emit_delta(pending)
         if cancel.expired:
             raise SwarmTimeout("Swarm time budget exhausted")
         if self._is_cancelled():
             raise SwarmCancelled("Swarm cancelled")
         self._check_cancel()
         reply = str(result.get("reply") or "".join(parts))
-        usage = dict(result.get("usage") or {})
+        usage = dict(result.get("usage") or {}) if isinstance(result.get("usage"), dict) else {}
         empty = not reply.strip() or reply.strip() in EMPTY_REPLIES
         finish = str(result.get("finish_reason") or "")
-        completion = usage.get("completion_tokens")
+        completion = _int_value(usage.get("completion_tokens"), 0)
         # A reasoning model spends max_tokens before it writes a visible answer, and a
         # member that hits the limit stops mid-sentence.  Retrying at the same budget
         # would truncate identically, so give the one retry more room.
         truncated = finish == "length" or (
-            not empty and isinstance(completion, (int, float)) and completion >= max_tokens)
+            not empty and completion >= max_tokens)
         if (empty or truncated) and not result.get("error") and _allow_retry:
-            if time.monotonic() < self.deadline - 0.5:
+            if time.monotonic() < limit - 0.5:
                 reason = ("The model returned an empty reply" if empty
                           else "The model hit its output limit")
                 self._emit("swarm_agent_status", swarm=self.id,
                            agent=member.id if member else "leader",
                            iteration=iteration, phase=phase, round=self.round,
                            message=f"{reason}; retrying with a larger budget")
-                return self._complete(model, messages, temperature=temperature,
-                                      max_tokens=_retry_tokens(max_tokens), label=label,
-                                      phase=phase, member=member, iteration=iteration,
-                                      _allow_retry=False, effort="low")
+                try:
+                    retry_reply, retry_usage = self._complete(
+                        model, messages, temperature=temperature,
+                        max_tokens=_retry_tokens(max_tokens), label=label,
+                        phase=phase, member=member, iteration=iteration,
+                        _allow_retry=False, effort="low",
+                        with_tools=with_tools, empty_ok=empty_ok, deadline=limit)
+                except (SwarmCancelled, SwarmTimeout):
+                    raise
+                except Exception as failure:  # noqa: BLE001 - keep usable partial text
+                    if empty_ok and not empty:
+                        self.warnings.append(
+                            f"{label}'s retry failed ({failure}); using the partial reply.")
+                        return reply, usage
+                    raise
+                # Usage from both attempts is real spend; the first call is not free.
+                combined = {key: _int_value(usage.get(key), 0) + _int_value(retry_usage.get(key), 0)
+                            for key in set(usage) | set(retry_usage)}
+                if empty_ok and not empty and not retry_reply.strip():
+                    self.warnings.append(
+                        f"{label}'s retry returned no text; using the partial reply.")
+                    return reply, combined
+                return retry_reply, combined
         if empty:
             if result.get("error"):
                 raise SwarmError(str(result["error"]))
@@ -3022,7 +3682,16 @@ class SwarmCoordinator:
                     "retry in Solo with a higher Maximum output tokens, or choose a "
                     "model that returns visible text"
                 )
+            if empty_ok:
+                return "", usage
             raise SwarmError("The model returned an empty reply")
+        if truncated:
+            self.warnings.append(
+                f"{label} stopped at its output limit; the answer may be incomplete.")
+            self._emit("swarm_agent_status", swarm=self.id,
+                       agent=member.id if member else "leader",
+                       iteration=iteration, phase=phase, round=self.round,
+                       message="The model hit its output limit; the answer may be incomplete")
         return reply, usage
 
     def _fit_messages(self, messages: list[dict], budget: int | None = None) -> list[dict]:
@@ -3056,21 +3725,22 @@ class SwarmCoordinator:
     def _add_usage(self, usage: dict) -> None:
         with self._lock:
             for key in self.usage:
-                self.usage[key] += int((usage or {}).get(key) or 0)
+                self.usage[key] += _int_value((usage or {}).get(key), 0)
 
     # -- state, events, limits -------------------------------------------
     def _emit(self, event_type: str, **fields) -> None:
-        self.updated = time.time()
-        if self.status in {"completed", "failed", "cancelled"} and event_type != "swarm_end":
-            return  # a late event from an abandoned worker must not reopen a finished run
-        payload = {"swarm": self.id, "phase": self.phase, "round": self.round}
-        payload.update(fields)
-        callback = self._on_event
-        if callback:
-            try:
-                callback(event_type, **payload)
-            except Exception:  # noqa: BLE001 - a failed UI callback must not fail the swarm
-                pass
+        with self._emit_lock:
+            self.updated = time.time()
+            if self.status in {"completed", "failed", "cancelled"} and event_type != "swarm_end":
+                return  # a late event from an abandoned worker must not reopen a finished run
+            payload = {"swarm": self.id, "phase": self.phase, "round": self.round}
+            payload.update(fields)
+            callback = self._on_event
+            if callback:
+                try:
+                    callback(event_type, **payload)
+                except Exception:  # noqa: BLE001 - a failed UI callback must not fail the swarm
+                    pass
 
     def _message_event(self, message: dict) -> None:
         self._emit("swarm_message", swarm=self.id, **{
@@ -3085,7 +3755,9 @@ class SwarmCoordinator:
         if not isinstance(observation, dict):
             return
         paths = []
-        if isinstance(observation.get("path"), str) and observation.get("written"):
+        if isinstance(observation.get("path"), str) and (
+                observation.get("written") or observation.get("changed")
+                or observation.get("deleted")):
             paths.append(observation["path"])
         if isinstance(observation.get("change"), dict) and observation["change"].get("path"):
             paths.append(observation["change"]["path"])
@@ -3098,10 +3770,19 @@ class SwarmCoordinator:
                         self.changed_files.append(path)
 
     def _check_cancel(self) -> None:
+        if self.status in {"completed", "failed", "cancelled"}:
+            raise SwarmCancelled("Swarm stopped")
         if self._is_cancelled():
             raise SwarmCancelled("Swarm cancelled")
         if time.monotonic() > self.deadline:
             raise SwarmTimeout("Swarm time budget exhausted")
+
+    def _check_stopped(self) -> None:
+        """Cancel check for the finish path, which must survive the hard deadline."""
+        if self.status in {"completed", "failed", "cancelled"}:
+            raise SwarmCancelled("Swarm stopped")
+        if self._is_cancelled():
+            raise SwarmCancelled("Swarm cancelled")
 
     def _is_cancelled(self) -> bool:
         try:
@@ -3137,15 +3818,20 @@ class SwarmCoordinator:
         return result
 
     def _clean_scope(self, value) -> str:
-        text = str(value or "").strip().replace("\\", "/").strip()
+        raw = str(value or "").strip().replace("\\", "/").strip()
+        if not raw:
+            return ""
+        if raw in {".", "*"}:
+            return "*"
+        # Check absolutes before removing slashes; otherwise "/etc/passwd" would
+        # silently become the relative scope "etc/passwd".
+        if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or ".." in raw.split("/"):
+            return ""
+        text = raw
         while text.startswith("./"):
             text = text[2:]
         text = text.strip("/")
         if not text:
-            return ""
-        if text in {".", "*"}:
-            return "*"
-        if text.startswith("/") or re.match(r"^[A-Za-z]:", text) or ".." in text.split("/"):
             return ""
         return text[:400]
 
@@ -3158,13 +3844,13 @@ class SwarmCoordinator:
     def _round_reviews(self, round_no: int) -> list[dict]:
         return [item for item in self._all_reviews() if item.get("round") == round_no]
 
-    def _normalise_plan(self, value) -> list[dict]:
+    def _normalise_plan(self, value, limit: int = 40) -> list[dict]:
         if isinstance(value, dict):
             value = value.get("todos", value.get("steps", value.get("plan", [])))
         if not isinstance(value, (list, tuple)):
             return []
         result = []
-        for item in list(value)[:40]:
+        for item in list(value)[:max(1, limit)]:
             if isinstance(item, str):
                 result.append({"text": _clean_text(item, 300), "status": "pending"})
             elif isinstance(item, dict):
@@ -3185,6 +3871,8 @@ class SwarmCoordinator:
                 member.context_granted = 0
             if member.status in {"done", "failed", "cancelled"}:
                 continue
+            with self._lock:
+                self._abandoned.add(member.id)
             member.ended = member.ended or now
             member.error = member.error or error
             # Work already delivered stays successful; the lost phase is reported by error.
@@ -3205,6 +3893,9 @@ class SwarmCoordinator:
             "failed": sum(1 for member in self._members if member.status == "failed"),
             "messages": self._channel.count(),
             "reviews": [self._snapshot_review(item) for item in self._all_reviews()[-20:]],
+            "success_criteria": list(self.success_criteria),
+            "unmet_criteria": list(self.unmet_criteria),
+            "gaps": list(self.gaps),
             "blackboard": [self._snapshot_entry(item)
                            for item in self._blackboard.snapshot()[-20:]]
             if self.shared_memory else [],
@@ -3215,6 +3906,7 @@ class SwarmCoordinator:
             "changed_files": list(self.changed_files),
             "usage": dict(self.usage),
             "warnings": list(dict.fromkeys(str(item) for item in self.warnings)),
+            "timed_out": self.timed_out,
             "elapsed": round(time.time() - (self.started or time.time()), 2),
         }
         if output:

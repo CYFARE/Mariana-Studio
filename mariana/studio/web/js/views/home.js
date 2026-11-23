@@ -2,8 +2,8 @@
 
 (function () {
   const Studio = window.Studio;
-  const { $, h, format, api } = Studio;
-  const { card, hero, statRow, actionCard, listRow } = Studio.components;
+  const { $, h, format, api, icon } = Studio;
+  const { card, listRow } = Studio.components;
   let active = false;
   let loading = false;
   let again = false;
@@ -107,67 +107,92 @@
       });
       const uptime = h("span", { text: format.duration(system.uptime) });
       live = { gpu: gpuMeter, memory: memoryMeter, disk: diskMeter, uptime };
+      const setup = counts.chat_ready ? null : Studio.ui.callout("warning",
+        h("div", { class: "stack tight" },
+          h("span", { text: "No chat-ready model yet. Download open weights or connect a provider before starting a conversation." }),
+          h("div", { class: "row wrap" },
+            h("a", { class: "button small", href: "#/models?tab=discover", text: "Find a model" }))));
+      const recent = chats.chats[0] || null;
+      const quick = [
+        ["#/chat", "chat", "Chat", "Ask a model or a swarm"],
+        ["#/ide", "ide", "IDE", "Agentic coding"],
+        ["#/train", "train", "Train", "Build from a corpus"],
+        ["#/finetune", "tune", "Fine-tune", "Adapt existing weights"],
+      ];
       Studio.ui.render(root,
-        hero({
-          eyebrow: `Mariana Studio ${system.version}`,
-          title: "Research, improve and deploy language models.",
-          text: "One local workspace for training novel architectures, adapting open models, chatting across providers, designing agents and shipping portable inference artifacts.",
-          actions: [
-            h("a", { class: "button primary large", href: "#/chat", text: "Start chatting" }),
-            h("a", { class: "button large", href: "#/models", text: "Get a model" }),
-          ],
-        }),
-        statRow([
-          { label: "Models", value: format.number(counts.models), hint: `${counts.chat_ready} chat ready` },
-          { label: "Fine-tunable", value: format.number(counts.tunable), hint: "Local weights" },
-          { label: "Conversations", value: format.number(counts.chats), hint: "Saved on this machine" },
-          { label: "Agents", value: format.number(counts.agents), hint: `${counts.active_jobs} active jobs` },
-        ]),
-        h("div", { class: "action-grid" },
-          actionCard({ href: "#/models", glyph: "download", title: "Discover models", description: "Download open weights or connect a local or remote provider." }),
-          actionCard({ href: "#/train", glyph: "train", title: "Train", description: "Build a DRV-LM or Next-Concept model from your own corpus." }),
-          actionCard({ href: "#/finetune", glyph: "tune", title: "Fine-tune", description: "Adapt Mariana or Hugging Face models with LoRA or full training." }),
-          actionCard({ href: "#/agents", glyph: "agents", title: "Design agents", description: "Compose, test, debug and schedule visual model workflows." })),
-        h("div", { class: "grid-2" },
+        h("section", { class: "home-welcome" },
+          h("div", { class: "home-welcome-copy" },
+            h("p", { class: "eyebrow", text: `Version ${system.version}` }),
+            h("h2", { text: recent ? "Pick up where you left off." : "Your local model workspace." }),
+            h("p", { class: "muted", text: recent
+              ? `Last conversation: ${recent.title}`
+              : "Train, adapt, chat with and ship language models without leaving this machine." }),
+            h("div", { class: "row wrap" },
+              h("a", {
+                class: "button primary large",
+                href: recent ? `#/chat?id=${encodeURIComponent(recent.id)}` : "#/chat?new=1",
+                text: recent ? "Continue chatting" : "Start a chat",
+              }),
+              h("a", { class: "button large", href: "#/models", text: "Browse models" }))),
+          h("nav", { class: "home-stats", "aria-label": "Workspace summary" },
+            [
+              ["models", counts.models, "#/models"],
+              ["chat ready", counts.chat_ready, "#/models"],
+              ["conversations", counts.chats, "#/chat"],
+              ["agents", counts.agents, "#/agents"],
+            ].map(([label, value, href]) => h("a", { class: "home-stat", href },
+              h("strong", { text: format.number(value) }), h("span", { text: label }))))),
+        setup,
+        h("nav", { class: "home-actions", "aria-label": "Quick actions" },
+          quick.map(([href, glyph, title, text]) => h("a", { class: "home-action", href },
+            h("span", { class: "home-action-icon" }, icon(glyph, "small")),
+            h("span", { class: "home-action-copy" },
+              h("strong", { text: title }), h("span", { text }))))),
+        h("div", { class: "home-grid" },
+          h("div", { class: "home-stack" },
+            card({
+              title: "Recent conversations",
+              actions: h("a", { class: "small", href: "#/chat", text: "Open Chat" }),
+              children: chats.chats.length ? chats.chats.slice(0, 4).map(chat => listRow({
+                href: `#/chat?id=${encodeURIComponent(chat.id)}`,
+                title: chat.title,
+                subtitle: chat.preview || "No messages",
+                meta: format.ago(chat.updated),
+              })) : [Studio.ui.empty({ compact: true, text: "Your saved conversations will appear here." })],
+            }),
+            card({
+              title: "Recent jobs",
+              actions: h("button", { class: "link-button small", type: "button", onclick: () => $("jobs-button").click(), text: "Job centre" }),
+              children: jobs.length ? jobs.slice(0, 4).map(job => listRow({
+                leading: Studio.ui.status(job.status),
+                title: job.title,
+                subtitle: job.stage || format.title(job.kind),
+                meta: format.ago(job.created),
+              })) : [Studio.ui.empty({ compact: true, text: "Training, downloads and exports will appear here." })],
+            })),
           card({
             title: "System",
-            actions: Studio.ui.badge(system.device.type.toUpperCase(), "completed", { title: system.device.label }),
+            actions: [
+              Studio.ui.badge(system.device.type.toUpperCase(), "completed", { title: system.device.label }),
+              h("a", { class: "small", href: "#/models?tab=runtimes", text: "Manage" }),
+            ],
             children: [
               gpuMeter,
               memoryMeter,
               diskMeter,
-              Studio.ui.kv([["Python", system.software.python], ["PyTorch", system.software.torch], ["CPU threads", system.device.threads], ["Uptime", uptime]]),
+              h("details", { class: "disclosure" },
+                h("summary", { text: "Software and runtimes" }),
+                h("div", { class: "disclosure-body stack tight" },
+                  Studio.ui.kv([
+                    ["Python", system.software.python], ["PyTorch", system.software.torch],
+                    ["CPU threads", system.device.threads], ["Uptime", uptime],
+                  ]),
+                  runtimes.length ? runtimes.map(([id, runtime]) => listRow({
+                    title: runtime.label || runtime.name || format.title(id),
+                    subtitle: runtime.hint || runtime.detail || runtime.path || runtime.url || runtime.status || "Detected",
+                    trailing: Studio.ui.badge(runtimeReady(runtime) ? "Ready" : "Stopped", runtimeReady(runtime) ? "completed" : ""),
+                  })) : Studio.ui.empty({ compact: true, text: "No optional runtimes detected." }))),
             ],
-          }),
-          card({
-            title: "Runtimes",
-            actions: h("a", { href: "#/models?tab=runtimes", class: "small", text: "Manage" }),
-            children: runtimes.length ? runtimes.map(([id, runtime]) => listRow({
-              title: runtime.label || runtime.name || format.title(id),
-              subtitle: runtime.hint || runtime.detail || runtime.path || runtime.url || runtime.status || "Detected",
-              trailing: Studio.ui.badge(runtimeReady(runtime) ? "Ready" : "Stopped", runtimeReady(runtime) ? "completed" : ""),
-            })) : [Studio.ui.empty({ compact: true, text: "No optional runtimes detected. Mariana checkpoints still work." })],
-          })),
-        h("div", { class: "grid-2" },
-          card({
-            title: "Recent conversations",
-            actions: h("a", { class: "small", href: "#/chat", text: "Open Chat" }),
-            children: chats.chats.length ? chats.chats.slice(0, 5).map(chat => listRow({
-              href: `#/chat?id=${encodeURIComponent(chat.id)}`,
-              title: chat.title,
-              subtitle: chat.preview || "No messages",
-              meta: format.ago(chat.updated),
-            })) : [Studio.ui.empty({ compact: true, text: "Your saved conversations will appear here." })],
-          }),
-          card({
-            title: "Recent jobs",
-            actions: h("button", { class: "link-button small", type: "button", onclick: () => $("jobs-button").click(), text: "Job centre" }),
-            children: jobs.length ? jobs.slice(0, 5).map(job => listRow({
-              leading: Studio.ui.status(job.status),
-              title: job.title,
-              subtitle: job.stage || format.title(job.kind),
-              meta: format.ago(job.created),
-            })) : [Studio.ui.empty({ compact: true, text: "Training, downloads and exports will appear here." })],
           })));
     } catch (error) {
       if (!background && active) {

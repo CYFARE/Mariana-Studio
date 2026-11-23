@@ -70,6 +70,23 @@
     return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
   }
 
+  function liveAgentText(value) {
+    const text = String(value || "");
+    const trimmed = text.trimStart();
+    /* Members usually stream a JSON action before they call a tool.  Showing
+       partial JSON is noise; the final output arrives when the turn ends. */
+    if (trimmed.startsWith("{") || trimmed.startsWith("```")) {
+      return "Preparing a tool call…";
+    }
+    return text.slice(-4000);
+  }
+
+  function elapsedSeconds(meta, active) {
+    if (Number(meta.elapsed) > 0) return Number(meta.elapsed);
+    const started = Number(meta.startedAt) || 0;
+    return active && started ? Math.max(0, (Date.now() - started) / 1000) : 0;
+  }
+
   function setAgents(swarm, list) {
     const prior = new Map();
     for (const agent of swarm.agents) prior.set(agentId(agent), agent);
@@ -110,7 +127,14 @@
     if (snapshot.model) meta.model = snapshot.model;
     if (snapshot.status) meta.status = snapshot.status;
     if (snapshot.reason) meta.leaderNote = snapshot.reason;
+    if (snapshot.started !== undefined && snapshot.started !== null) {
+      const started = Number(snapshot.started);
+      if (Number.isFinite(started) && started > 0) {
+        meta.startedAt = started < 1e12 ? started * 1000 : started;
+      }
+    }
     if (snapshot.context && typeof snapshot.context === "object") meta.context = snapshot.context;
+    if (snapshot.timed_out) meta.timedOut = true;
     if (Array.isArray(snapshot.warnings) && snapshot.warnings.length) meta.warnings = snapshot.warnings;
     meta.messageCount = Math.max(swarm.messages.length, Number(meta.messageCount) || 0);
     meta.reviewCount = Math.max(swarm.reviews.length, Number(meta.reviewCount) || 0);
@@ -125,6 +149,7 @@
     switch (event.type) {
       case "swarm_start": {
         if (event.swarm) meta.id = event.swarm;
+        if (!meta.startedAt) meta.startedAt = Date.now();
         if (event.strategy) meta.strategy = event.strategy;
         if (event.leader) meta.leader = event.leader;
         if (event.model) meta.model = event.model;
@@ -139,12 +164,14 @@
         setAgents(swarm, event.agents || []);
         if (event.strategy) meta.strategy = event.strategy;
         if (event.rounds !== undefined) meta.rounds = event.rounds;
+        if (Array.isArray(event.success_criteria)) meta.criteria = event.success_criteria;
         if (event.notes) meta.leaderNote = event.notes;
         meta.phase = "work";
         break;
       }
       case "swarm_leader": {
         if (event.text || event.message) meta.leaderNote = event.text || event.message;
+        if (Array.isArray(event.gaps)) meta.gaps = event.gaps;
         if (event.phase) meta.phase = event.phase;
         break;
       }
@@ -171,6 +198,7 @@
         agent.status = event.phase === "review" ? "reviewing"
           : event.phase === "revise" ? "revising" : "running";
         agent.note = event.message || "";
+        agent.text = "";  // a new phase starts a new live stream
         if (event.phase) meta.phase = event.phase;
         if (event.round !== undefined) meta.round = event.round;
         break;
@@ -178,6 +206,15 @@
       case "swarm_agent_step":
       case "swarm_agent_status": {
         const agent = ensureAgent(swarm, event);
+        agent.status = event.phase === "review" ? "reviewing"
+          : event.phase === "revise" ? "revising" : "thinking";
+        agent.note = event.message || agent.note || "";
+        break;
+      }
+      case "swarm_agent_plan": {
+        const agent = ensureAgent(swarm, event);
+        if (Array.isArray(event.plan)) agent.plan = event.plan;
+        if (event.version !== undefined) agent.planVersion = event.version;
         agent.status = event.phase === "review" ? "reviewing"
           : event.phase === "revise" ? "revising" : "thinking";
         agent.note = event.message || agent.note || "";
@@ -207,6 +244,7 @@
         if (event.score !== undefined) agent.score = event.score;
         if (event.version !== undefined) agent.version = event.version;
         if (event.steps !== undefined) agent.steps = event.steps;
+        if (event.usage) agent.usage = event.usage;
         if (event.phase) meta.phase = event.phase;
         break;
       }
@@ -250,12 +288,19 @@
         meta.ok = event.ok !== false;
         meta.status = event.status || (meta.ok ? "completed" : "failed");
         meta.phase = "synthesis";
+        if (event.elapsed !== undefined) meta.elapsed = event.elapsed;
+        else if (meta.startedAt) meta.elapsed = Math.max(0, (Date.now() - meta.startedAt) / 1000);
         if (Array.isArray(event.agents) && event.agents.length) setAgents(swarm, event.agents);
         if (event.output) meta.final = event.output;
         if (event.summary) meta.summary = event.summary;
+        if (Array.isArray(event.success_criteria)) meta.criteria = event.success_criteria;
+        if (Array.isArray(event.unmet_criteria)) meta.unmetCriteria = event.unmet_criteria;
         if (event.messages !== undefined) meta.messageCount = event.messages;
         if (event.reviews !== undefined) meta.reviewCount = event.reviews;
         if (event.blackboard !== undefined) meta.memoryCount = event.blackboard;
+        if (Array.isArray(event.changed_files)) meta.changedFiles = event.changed_files.slice(0, 20);
+        if (event.timed_out) meta.timedOut = true;
+        if (event.assembled) meta.assembled = true;
         if (event.error) meta.error = event.error;
         break;
       }
@@ -280,10 +325,17 @@
     if (summary.rounds !== undefined) meta.rounds = summary.rounds;
     if (summary.leader) meta.leader = summary.leader;
     if (summary.summary) meta.summary = summary.summary;
+    if (Array.isArray(summary.success_criteria)) meta.criteria = summary.success_criteria;
+    if (Array.isArray(summary.unmet_criteria)) meta.unmetCriteria = summary.unmet_criteria;
+    if (Array.isArray(summary.gaps)) meta.gaps = summary.gaps;
     if (summary.elapsed !== undefined) meta.elapsed = summary.elapsed;
+    else if (meta.startedAt) meta.elapsed = Math.max(0, (Date.now() - meta.startedAt) / 1000);
     if (summary.usage) meta.usage = summary.usage;
+    if (summary.timed_out) meta.timedOut = true;
+    if (summary.assembled) meta.assembled = true;
     if (Array.isArray(summary.warnings) && summary.warnings.length) meta.warnings = summary.warnings;
     if (Array.isArray(summary.tools)) meta.tools = summary.tools.slice(0, 24).map(String);
+    if (Array.isArray(summary.changed_files)) meta.changedFiles = summary.changed_files.slice(0, 20);
     if (summary.messages !== undefined) meta.messageCount = summary.messages;
     if (summary.review_count !== undefined) meta.reviewCount = summary.review_count;
     if (summary.memory_count !== undefined) meta.memoryCount = summary.memory_count;
@@ -321,28 +373,43 @@
     const settled = swarm.agents.filter(agent => ["done", "failed"].includes(agentState(agent))).length;
     const cancelled = meta.status === "cancelled";
     const ok = meta.ok !== false;
+    const partial = failed > 0 && ok && finished;
+    const elapsed = elapsedSeconds(meta, active);
+    const duration = elapsed ? (Studio.format && Studio.format.duration
+      ? Studio.format.duration(elapsed) : `${Math.round(elapsed)}s`) : "";
     const badgeText = active ? "Running"
       : cancelled ? "Stopped"
-        : failed ? "Finished with failures"
-          : finished ? (ok ? "Done" : "Failed")
-            : swarm.agents.length || meta.error ? "Stopped" : "Queued";
+        : finished && !ok ? (failed ? "Finished with failures" : "Failed")
+          : partial ? `Done · ${failed} failed`
+            : finished ? "Done"
+              : swarm.agents.length || meta.error ? "Stopped" : "Queued";
     const badgeTone = active ? "running"
       : cancelled ? "muted"
-        : failed || (!ok && finished) ? "failed"
-          : finished ? "completed" : "muted";
+        : finished && !ok ? "failed"
+          : partial ? "warning"
+            : finished ? "completed" : "muted";
     const role = meta.strategy ? String(meta.strategy).replace(/_/g, " ") : "leader-planned";
     const root = Studio.ui.render(container);
-    const card = h("article", { class: `swarm-card${failed ? " failed" : ""}` });
+    const card = h("article", { class: `swarm-card${failed && !ok ? " failed" : ""}` });
     root.append(card);
 
     card.append(h("div", { class: "swarm-head" },
       Studio.icon("agents", "small"),
+      active ? h("span", { class: "swarm-live", "aria-hidden": "true" }) : null,
       h("strong", { class: "grow", text: "Agent swarm" }),
       h("span", { class: "muted tiny", text: swarm.agents.length ? `${settled}/${swarm.agents.length} finished` : "" }),
       Studio.ui.badge(badgeText, badgeTone)));
 
     const metaRow = h("div", { class: "swarm-meta" },
       Studio.ui.badge(role, "accent"),
+      duration ? Studio.ui.badge(active ? `${duration} · live` : duration,
+        active ? "running" : "muted") : null,
+      meta.timedOut ? Studio.ui.badge("Time limit", "warning",
+        { title: "The work budget ended; the answer uses the work that was already collected." }) : null,
+      meta.assembled && !meta.timedOut
+        ? Studio.ui.badge("Assembled", "warning",
+          { title: "The leader did not synthesise; this card holds each agent's hand-off." })
+        : null,
       meta.round ? Studio.ui.badge(`Round ${meta.round}${meta.rounds ? `/${meta.rounds}` : ""}`, "muted") : null,
       meta.phase ? Studio.ui.badge(phaseLabel(meta.phase), active ? "running" : "muted") : null,
       meta.reviewCount ? Studio.ui.badge(`${meta.reviewCount} review${meta.reviewCount === 1 ? "" : "s"}`,
@@ -365,6 +432,18 @@
     if (meta.leaderNote) {
       card.append(h("p", { class: "swarm-note", text: meta.leaderNote }));
     }
+    if (Array.isArray(meta.criteria) && meta.criteria.length) {
+      const rows = h("ul", { class: "swarm-criteria" });
+      for (const item of meta.criteria) rows.append(h("li", { text: item }));
+      card.append(h("details", { class: "swarm-section", "data-swarm-key": "criteria",
+        open: isOpen("criteria", false) },
+        h("summary", { text: `Success criteria · ${meta.criteria.length}` }), rows));
+    }
+    const openGaps = [...(meta.gaps || []), ...(meta.unmetCriteria || [])];
+    if (openGaps.length) {
+      card.append(Studio.ui.callout("warning",
+        h("span", { text: `Open gaps: ${openGaps.slice(0, 6).join("; ")}` })));
+    }
     if (!swarm.agents.length) {
       card.append(h("p", { class: "muted tiny",
         text: active ? "The leader is planning the team…" : "No agents reported." }));
@@ -380,17 +459,35 @@
         : h("span", { class: "swarm-glyph" },
           Studio.icon(state === "failed" ? "alert" : state === "done" ? "check" : "sparkle", "small"));
       const label = agent.label || agentId(agent) || "Agent";
+      const plan = Array.isArray(agent.plan) ? agent.plan : [];
+      const planDone = plan.filter(step => step.status === "done").length;
       const facts = [];
       if (agent.role) facts.push(agent.role);
+      if (plan.length) facts.push(`plan ${planDone}/${plan.length}`);
       if (agent.score !== undefined && agent.score !== null) facts.push(`${agent.score}/5`);
       if (agent.version && agent.version > 1) facts.push(`v${agent.version}`);
       if (agent.steps) facts.push(`${agent.steps} step${agent.steps === 1 ? "" : "s"}`);
+      const retried = agent.tool_retries ?? agent.toolRetries ?? 0;
+      if (retried) facts.push(`${retried} tool retr${retried === 1 ? "y" : "ies"}`);
       const granted = agent.contextGranted ?? agent.context_granted;
       if (granted) facts.push(`${compactChars(granted)} context`);
+      if (agent.usage && agent.usage.completion_tokens && agent.elapsed) {
+        facts.push(`${Math.round(agent.usage.completion_tokens / Math.max(1, agent.elapsed))} tok/s`);
+      }
       if (agent.elapsed) facts.push(`${agent.elapsed}s`);
       const detail = h("div", { class: "swarm-body" });
       if (facts.length) detail.append(h("p", { class: "muted tiny swarm-facts", text: facts.join(" · ") }));
       if (agent.task) detail.append(h("p", { class: "muted tiny", text: agent.task }));
+      if (plan.length) {
+        const steps = h("ol", { class: "swarm-plan" });
+        for (const step of plan) {
+          steps.append(h("li", {
+            class: `swarm-plan-step ${step.status || "pending"}`,
+            text: step.text || "",
+          }));
+        }
+        detail.append(steps);
+      }
       if (agent.lastTool) detail.append(h("p", { class: "muted tiny", text: `Last tool: ${agent.lastTool}` }));
       if (agent.note && !agent.output) detail.append(h("p", { class: "muted tiny", text: agent.note }));
       if (agent.error) {
@@ -400,8 +497,8 @@
         Studio.markdown.into(output, agent.output);
         detail.append(output);
       } else if (agent.text) {
-        detail.append(h("pre", { class: "swarm-preview", "data-swarm-output": agentId(agent),
-          text: agent.text.slice(-4000) }));
+        detail.append(h("pre", { class: "swarm-preview live", "data-swarm-output": agentId(agent),
+          text: liveAgentText(agent.text) }));
       }
       list.append(h("details", {
         class: `swarm-agent ${state}`, "data-swarm-key": `agent:${agentId(agent)}`,
@@ -411,13 +508,30 @@
           glyph,
           h("span", { class: "grow" },
             h("strong", { text: label }),
-            agent.task ? h("span", { class: "swarm-task", text: agent.task }) : null),
+            agent.task && state !== "done"
+              ? h("span", { class: "swarm-task", text: agent.task })
+              : null,
+            agent.note && state === "done"
+              ? h("span", { class: "swarm-task swarm-result-line",
+                text: oneLine(agent.note, 140) })
+              : null),
           Studio.ui.badge(statusLabel(state),
             state === "done" ? "completed" : state === "failed" ? "failed"
               : state === "queued" ? "muted" : "running")),
         detail));
     }
     card.append(list);
+
+    const warnings = Array.isArray(meta.warnings)
+      ? [...new Set(meta.warnings.map(item => String(item || "").trim()).filter(Boolean))]
+      : [];
+    if (warnings.length) {
+      const rows = h("ul", { class: "swarm-notes" });
+      for (const warning of warnings.slice(0, 12)) rows.append(h("li", { text: warning }));
+      card.append(h("details", { class: "swarm-section", "data-swarm-key": "notes",
+        open: isOpen("notes", false) },
+        h("summary", { text: `Run notes · ${warnings.length}` }), rows));
+    }
 
     if (swarm.reviews.length) {
       const rows = h("div", { class: "stack tight" });

@@ -24,7 +24,7 @@
     add({ label: "Add a remote endpoint", hint: "Action", glyph: "globe", action: () => Studio.views.go("models", { tab: "endpoints", add: "1" }) });
     add({ label: "Create an agent", hint: "Action", glyph: "agents", action: () => Studio.views.go("agents", { new: "1" }) });
     add({ label: "Manage Python dependencies", hint: "Install optional requirements", glyph: "download", action: () => Studio.dependencies.open() });
-    add({ label: "Toggle colour theme", hint: "Action", glyph: "sun", action: () => $("theme-toggle").click() });
+    add({ label: "Choose colour theme", hint: "System, light or dark", glyph: "sun", action: () => $("theme-toggle").click() });
     add({ label: "Show background jobs", hint: "Action", glyph: "jobs", action: () => $("jobs-button").click() });
   }
 
@@ -38,10 +38,15 @@
 
   function render() {
     const query = $("palette-input").value.trim().toLowerCase();
-    const extra = Studio.models.list.filter(model => model.capabilities && model.capabilities.chat).map(model => ({
-      label: model.name, hint: `Chat · ${model.source_label}`, glyph: "chat", keywords: `${model.id} ${model.kind}`,
-      action: () => Studio.views.go("chat", { model: model.id, new: "1" }),
-    }));
+    /* Keep the resting state short: workspaces and actions.  Models join only
+       once the person types, so opening the palette never scrolls a catalogue. */
+    const extra = query
+      ? Studio.models.list.filter(model => model.capabilities && model.capabilities.chat).map(model => ({
+        label: model.name, hint: `Chat · ${model.source_label}`, glyph: "chat",
+        keywords: `${model.id} ${model.kind}`,
+        action: () => Studio.views.go("chat", { model: model.id, new: "1" }),
+      })).slice(0, 8)
+      : [];
     filtered = commands.filter(command => !command.when || command.when()).concat(extra).map(command => ({ command, value: score(command, query) }))
       .filter(item => item.value > 0).sort((a, b) => b.value - a.value)
       .slice(0, 30).map(item => item.command);

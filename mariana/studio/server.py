@@ -15,13 +15,14 @@ import sys
 import threading
 import traceback
 import webbrowser
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .api import router
 from .app import NAME, Studio
-from .assets import CONTENT_SECURITY_POLICY, read_asset
+from .assets import CONTENT_SECURITY_POLICY, read_asset_entry
 from .errors import (
     STATUS_CODES,
     BadRequestError,
@@ -57,6 +58,9 @@ def make_handler(app: Studio, bind_host: str):
     class Handler(BaseHTTPRequestHandler):
         server_version = "MarianaStudio"
         sys_version = ""
+        # Keep-alive amortises the connection setup across the many small
+        # scripts and stylesheets the page loads.
+        protocol_version = "HTTP/1.1"
 
         # -- security ----------------------------------------------------
         def _check_origin(self, method: str) -> None:
@@ -113,13 +117,35 @@ def make_handler(app: Studio, bind_host: str):
 
         def _send_error(self, error: StudioError) -> None:
             payload = json.dumps(error.payload(), ensure_ascii=False).encode("utf-8")
-            self._send(error.status, payload, JSON_TYPE, {"Cache-Control": "no-store"})
+            self.close_connection = True
+            self._send(error.status, payload, JSON_TYPE,
+                       {"Cache-Control": "no-store", "Connection": "close"})
+
+        def _send_not_modified(self, content_type: str, headers: dict) -> None:
+            """A bodyless 304 that still carries the validators a client needs."""
+            self.send_response(304)
+            self.send_header("Content-Type", content_type)
+            for name, value in {**BASE_HEADERS, **headers}.items():
+                self.send_header(name, value)
+            self.end_headers()
+
+        @staticmethod
+        def _etag_matches(header: str | None, etag: str) -> bool:
+            if not header:
+                return False
+            values = [value.strip() for value in header.split(",")]
+            if "*" in values:
+                return True
+            wanted = etag.removeprefix("W/")
+            return any(value.removeprefix("W/") == wanted for value in values)
 
         def _send_stream(self, stream: EventStream) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.close_connection = True
             for name, value in BASE_HEADERS.items():
                 self.send_header(name, value)
             self.end_headers()
@@ -147,14 +173,25 @@ def make_handler(app: Studio, bind_host: str):
                 self._check_origin(method)
                 path = urlparse(self.path).path
                 if method in {"GET", "HEAD"} and not path.startswith(("/api/", "/v1/")):
-                    asset = read_asset(path)
+                    asset = read_asset_entry(path)
                     if asset is None:
                         raise NotFoundError("Not found")
-                    body, content_type = asset
-                    headers = {"Cache-Control": "no-cache"}
-                    if content_type.startswith("text/html"):
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "ETag": asset.etag,
+                        "Last-Modified": formatdate(asset.modified, usegmt=True),
+                        "Vary": "Accept-Encoding",
+                    }
+                    if asset.content_type.startswith("text/html"):
                         headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
-                    return self._send(200, body, content_type, headers)
+                    if self._etag_matches(self.headers.get("If-None-Match"), asset.etag):
+                        return self._send_not_modified(asset.content_type, headers)
+                    compressed = (asset.gzip is not None
+                                  and "gzip" in (self.headers.get("Accept-Encoding") or "").lower())
+                    if compressed:
+                        headers["Content-Encoding"] = "gzip"
+                    return self._send(200, asset.gzip if compressed else asset.body,
+                                      asset.content_type, headers)
                 handler, params = router.resolve("GET" if method == "HEAD" else method, path)
                 request = Request(method, self.path, self.headers, self._read_body(), params)
                 result = handler(app, request)

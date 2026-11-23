@@ -70,7 +70,7 @@
       || /^&gt;/.test(line) || ITEM.test(line) || isTable(lines, index);
   }
 
-  function renderList(lines, start) {
+  function renderList(lines, start, render = true) {
     const first = ITEM.exec(lines[start]);
     const base = indentOf(lines[start]);
     const ordered = isOrdered(first[2]);
@@ -100,7 +100,7 @@
       }
       if (indent < base) break;
       if (indent >= base + 2 && items.length) {
-        const [html, next] = renderList(lines, index);
+        const [html, next] = renderList(lines, index, render);
         items[items.length - 1].children += html;
         index = next;
         continue;
@@ -109,6 +109,7 @@
       items.push({ text: match[3], children: "" });
       index += 1;
     }
+    if (!render) return ["", index];
     const tag = ordered ? "ol" : "ul";
     const number = ordered ? parseInt(first[2], 10) : 1;
     const open = ordered && number > 1 ? `<ol start="${number}">` : `<${tag}>`;
@@ -116,7 +117,7 @@
     return [`${open}${body}</${tag}>`, index];
   }
 
-  function renderTable(lines, start) {
+  function renderTable(lines, start, render = true) {
     const head = cells(lines[start]);
     let index = start + 2;
     const rows = [];
@@ -124,13 +125,22 @@
       rows.push(cells(lines[index]));
       index += 1;
     }
+    if (!render) return ["", index];
     const header = head.map(cell => `<th>${inline(cell)}</th>`).join("");
     const body = rows.map(row => `<tr>${head.map((_, column) => `<td>${inline(row[column] || "")}</td>`).join("")}</tr>`).join("");
     return [`<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`, index];
   }
 
-  function renderBlocks(lines, blocks) {
-    const output = [];
+  /* Walk top-level blocks.  With `options.output` the caller receives one HTML
+     string per block; `options.reuse` blocks are copied from `options.rendered`
+     without running inline formatting again.  A streaming reply only grows, so
+     every block before the last is final and can be reused. */
+  function renderBlocks(lines, blocks, options = {}) {
+    const output = options.output || [];
+    const reuse = Math.max(0, options.reuse || 0);
+    const rendered = options.rendered || [];
+    const cachedAt = position => position < reuse && typeof rendered[position] === "string"
+      ? rendered[position] : null;
     let index = 0;
     while (index < lines.length) {
       const line = lines[index];
@@ -138,21 +148,22 @@
         index += 1;
         continue;
       }
+      const cached = cachedAt(output.length);
       const placeholder = /^\u0000(\d+)\u0000$/.exec(line.trim());
       if (placeholder) {
-        output.push(blocks[Number(placeholder[1])] || "");
+        output.push(cached !== null ? cached : (blocks[Number(placeholder[1])] || ""));
         index += 1;
         continue;
       }
       const heading = HEADING.exec(line);
       if (heading) {
-        const level = heading[1].length;
-        output.push(`<h${level}>${inline(heading[2])}</h${level}>`);
+        if (cached !== null) output.push(cached);
+        else output.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`);
         index += 1;
         continue;
       }
       if (RULE.test(line)) {
-        output.push("<hr>");
+        output.push(cached !== null ? cached : "<hr>");
         index += 1;
         continue;
       }
@@ -162,18 +173,18 @@
           quoted.push(lines[index].replace(/^&gt;\s?/, ""));
           index += 1;
         }
-        output.push(`<blockquote>${renderBlocks(quoted, blocks)}</blockquote>`);
+        output.push(cached !== null ? cached : `<blockquote>${renderBlocks(quoted, blocks)}</blockquote>`);
         continue;
       }
       if (ITEM.test(line)) {
-        const [html, next] = renderList(lines, index);
-        output.push(html);
+        const [html, next] = renderList(lines, index, cached === null);
+        output.push(cached !== null ? cached : html);
         index = next;
         continue;
       }
       if (isTable(lines, index)) {
-        const [html, next] = renderTable(lines, index);
-        output.push(html);
+        const [html, next] = renderTable(lines, index, cached === null);
+        output.push(cached !== null ? cached : html);
         index = next;
         continue;
       }
@@ -183,18 +194,43 @@
         paragraph.push(lines[index]);
         index += 1;
       }
-      output.push(`<p>${inline(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`);
+      output.push(cached !== null ? cached
+        : `<p>${inline(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`);
     }
-    return output.join("");
+    return options.output ? output : output.join("");
+  }
+
+  /* Markdown text -> one HTML string per top-level block.  Closed code fences
+     are cached by source so an unchanged fence is escaped once, not per tick. */
+  function renderDocument(text, options = {}) {
+    const source = String(text === null || text === undefined ? "" : text)
+      .replace(/\r\n?/g, "\n").replace(/[\u0000\u0001]/g, "");
+    const blocks = [];
+    const fenceCache = options.fenceCache;
+    const body = source.replace(FENCE, (whole, language, code) => {
+      let html;
+      if (fenceCache && whole.endsWith("```")) {
+        const key = `${language}\u0000${code}`;
+        html = fenceCache.get(key);
+        if (html === undefined) {
+          html = codeBlock(code, language);
+          fenceCache.set(key, html);
+        }
+      } else html = codeBlock(code, language);
+      blocks.push(html);
+      return `\n\u0000${blocks.length - 1}\u0000\n`;
+    });
+    return renderBlocks(escapeHtml(body).split("\n"), blocks, options);
   }
 
   /* Markdown text -> HTML string.  Safe to assign to innerHTML. */
   function render(text) {
-    const source = String(text === null || text === undefined ? "" : text)
-      .replace(/\r\n?/g, "\n").replace(/[\u0000\u0001]/g, "");
-    const blocks = [];
-    const body = source.replace(FENCE, (_, language, code) => `\n\u0000${blocks.push(codeBlock(code, language)) - 1}\u0000\n`);
-    return renderBlocks(escapeHtml(body).split("\n"), blocks);
+    return renderDocument(text);
+  }
+
+  /* One HTML string per top-level block; joins back to render(). */
+  function blocks(text) {
+    return renderDocument(text, { output: [] });
   }
 
   /* Add syntax colour and Mermaid previews to code fences after insertion.
@@ -232,11 +268,54 @@
     block.dataset.highlighted = "true";
   }
 
-  function enhance(root) {
+  /* Offscreen history is highlighted in idle slices so opening a long chat
+     paints immediately.  Visible or small renders still highlight eagerly. */
+  const lazyBlocks = [];
+  let lazyCursor = 0;
+  let lazyScheduled = false;
+
+  function scheduleLazyHighlight() {
+    if (lazyScheduled) return;
+    lazyScheduled = true;
+    const run = deadline => {
+      lazyScheduled = false;
+      let budget = 12;
+      while (lazyCursor < lazyBlocks.length && budget > 0
+          && (!deadline || deadline.timeRemaining() > 2)) {
+        const block = lazyBlocks[lazyCursor];
+        lazyCursor += 1;
+        budget -= 1;
+        if (block && block.isConnected) highlightBlock(block);
+      }
+      if (lazyCursor < lazyBlocks.length) {
+        if (lazyCursor > 256) {
+          lazyBlocks.splice(0, lazyCursor);
+          lazyCursor = 0;
+        }
+        scheduleLazyHighlight();
+      } else {
+        lazyBlocks.length = 0;
+        lazyCursor = 0;
+      }
+    };
+    if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 1000 });
+    else setTimeout(run, 16);
+  }
+
+  function queueHighlight(block) {
+    if (block.dataset.enhanced || block.dataset.highlighted || block.dataset.highlightQueued) return;
+    block.dataset.highlightQueued = "true";
+    lazyBlocks.push(block);
+    scheduleLazyHighlight();
+  }
+
+  function enhance(root, options = {}) {
     if (!root) return root;
     if (Studio.diagrams) Studio.diagrams.enhance(root);
     for (const block of Array.from(root.querySelectorAll(".code-block"))) {
-      if (!block.dataset.enhanced) highlightBlock(block);
+      if (block.dataset.enhanced) continue;
+      if (options.lazy) queueHighlight(block);
+      else highlightBlock(block);
     }
     return root;
   }
@@ -245,7 +324,68 @@
   function into(element, text, options = {}) {
     element.classList.add("markdown");
     element.innerHTML = render(text);
-    if (options.enhance !== false) enhance(element);
+    if (options.enhance !== false) enhance(element, options);
+    return element;
+  }
+
+  const streamStates = new WeakMap();
+
+  function reset(element) {
+    streamStates.delete(element);
+  }
+
+  /* Incremental paint for append-only model output.  Completed top-level
+     blocks are left alone; only the growing last block is replaced.  Call into()
+     once the stream ends for the authoritative render and highlighting. */
+  function stream(element, text) {
+    element.classList.add("markdown");
+    let state = streamStates.get(element);
+    if (!state) {
+      /* A fresh stream owns the whole content: clear any text or blocks left by
+         a previous render or by the reset() before a slid preview window. */
+      element.replaceChildren();
+      state = { rendered: [], count: 0, tail: null, fenceCache: new Map() };
+      streamStates.set(element, state);
+    }
+    let options = {
+      output: [], reuse: state.count > 0 ? state.count - 1 : 0,
+      rendered: state.rendered, fenceCache: state.fenceCache,
+    };
+    let pieces = renderDocument(text, options);
+    /* Content was replaced or edited backwards: rebuild the block list. */
+    if (pieces.length < state.count) {
+      element.replaceChildren();
+      state.tail = null;
+      state.count = 0;
+      state.rendered = [];
+      pieces = renderDocument(text, { output: [], reuse: 0, rendered: [], fenceCache: state.fenceCache });
+    }
+    /* The old tail may have become a stable block with final content. */
+    if (state.tail) {
+      state.tail.remove();
+      state.tail = null;
+    }
+    const already = state.count > 0 ? state.count - 1 : 0;
+    const stable = Math.max(0, pieces.length - 1);
+    if (stable > already) {
+      const template = document.createElement("template");
+      for (let index = already; index < stable; index += 1) {
+        template.innerHTML = pieces[index];
+        const node = template.content.firstElementChild;
+        if (node) element.append(node);
+      }
+    }
+    if (pieces.length) {
+      const template = document.createElement("template");
+      template.innerHTML = pieces[pieces.length - 1];
+      const tail = template.content.firstElementChild;
+      if (tail) {
+        element.append(tail);
+        state.tail = tail;
+      }
+    }
+    state.count = pieces.length;
+    state.rendered = pieces;
     return element;
   }
 
@@ -257,5 +397,5 @@
     if (code) Studio.copy(code.textContent, "Code copied");
   });
 
-  Studio.markdown = { render, into, enhance, escapeHtml };
+  Studio.markdown = { render, blocks, into, stream, reset, enhance, escapeHtml };
 })();

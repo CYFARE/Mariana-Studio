@@ -1,14 +1,14 @@
-# Agent Management Protocol (AMP) v1.7
+# Agent Management Protocol (AMP) v1.10
 
 AMP is the HTTP/JSON protocol for creating, validating, running, testing,
 debugging and scheduling AML agents in Mariana Studio. It is intentionally
 small enough for another LLM to use from a prompt and complete enough for a
 local automation suite.
 
-- Current version: `1.7` (a superset of `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changes in 1.7](#12-changes-in-17))
+- Current version: `1.10` (a superset of `1.9`, `1.8`, `1.7`, `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changes in 1.10](#12-changes-in-110))
 - Transport: HTTP/1.1, JSON bodies, UTF-8
 - Base path: `/api/agents`
-- Language: [Agent Management Language (AML) v1.6](./AML.md)
+- Language: [Agent Management Language (AML) v1.8](./AML.md)
 - Discovery: `GET /api/agents/protocol`
 - Server default: `http://127.0.0.1:8765`
 
@@ -31,21 +31,27 @@ instead of hardcoding the schema.
 ```json
 {
   "protocol": "AMP",
-  "version": "1.7",
-  "aml_version": "1.6",
+  "version": "1.10",
+  "aml_version": "1.8",
   "tool_calling": {
     "formats": ["json", "dsml", "native"],
     "native_backends": ["openai-compatible", "anthropic", "ollama"],
     "fallback": "prompted JSON",
     "note": "Every format uses the same allow-list, sandbox and tool_call/tool_result events."
   },
+  "guardrails": {
+    "assert": "A safe expression must be true; message explains the failure.",
+    "validate": "A bounded JSON schema subset validates structured output.",
+    "model_fallback": "llm and agent nodes accept fallback_model."
+  },
   "transport": "HTTP/JSON",
   "base_path": "/api/agents",
   "node_types": {"llm": {
     "label": "LLM", "category": "intelligence", "icon": "✦", "description": "...",
-    "fields": [{"key": "prompt", "label": "Prompt", "type": "template", "rows": 6, "help": "..."}],
+    "fields": [{"key": "prompt", "label": "Prompt", "type": "template", "rows": 6, "help": "..."},
+               {"key": "fallback_model", "label": "Fallback model", "type": "model"}],
     "defaults": {"model": "", "system": "", "prompt": "", "format": "text",
-                 "temperature": 0.7, "max_tokens": 512}
+                 "temperature": 0.7, "max_tokens": 512, "fallback_model": ""}
   }},
   "common_fields": [{"key": "retry", "label": "Retries on error", "type": "number", "min": 0, "max": 5}],
   "field_types": ["text", "template", "expression", "number", "select", "boolean", "json",
@@ -69,7 +75,8 @@ instead of hardcoding the schema.
                         "review": "...", "plan": "...", "final": "..."},
     "events": ["swarm_start", "swarm_plan", "swarm_leader", "swarm_round",
                "swarm_agent_start", "swarm_agent_step", "swarm_agent_delta",
-               "swarm_agent_status", "swarm_agent_tool", "swarm_agent_end",
+               "swarm_agent_status", "swarm_agent_tool", "swarm_agent_plan",
+               "swarm_agent_end",
                "swarm_message", "swarm_memory", "swarm_review", "swarm_context", "swarm_end"]
   },
   "run_statuses": ["queued", "running", "paused", "completed", "failed", "cancelled"],
@@ -268,19 +275,26 @@ Run statuses: `queued`, `running`, `paused`, `completed`, `failed`, `cancelled`.
 Node statuses: `pending`, `running`, `ok`, `error`, `paused`.
 
 Event types: `run_started`, `node_started`, `node_input`, `node_finished`,
-`node_failed`, `tool_call`, `tool_result`, `input_requested`, `input_received`,
-`input_timeout`, `breakpoint`, `resumed`, `log`, `run_completed`, `run_failed`,
-`run_cancelled`, and the swarm events in §3.1.
+`node_failed`, `assistant_delta`, `reasoning_delta`, `tool_call`, `tool_result`,
+`validation`, `input_requested`, `input_received`, `input_timeout`, `breakpoint`,
+`resumed`, `log`, `run_completed`, `run_failed`, `run_cancelled`, and the swarm
+events in §3.1.
 
 - `node_input` carries the rendered `input` of a node (an LLM prompt, an ability
   input), truncated.
 - `node_finished` carries `output` and `elapsed_ms`.
+- `assistant_delta` and `reasoning_delta` are coalesced, best-effort progress
+  from a streaming `llm` or `agent` call. They carry `node`, `iteration` and a
+  `text` slice; the authoritative answer remains the node result.
+- `validation` carries `ok`, `mode`, `error_count` and a bounded `errors` list
+  from a `validate` node; assert failures surface through `node_failed`.
 - `tool_call` / `tool_result` report each ability an `agent` node used:
   `iteration`, `ability`, `input`, then `ok` and `output`. The event shape does
   not depend on how the model expressed the call: canonical JSON, DSML and
   provider-native function calls produce the same pair.
-- Swarm events carry `swarm` (the run-scoped swarm id), `agent`, `round` and
-  `phase`, so a UI can place every update on the right member and round.
+- Swarm events carry `swarm` (the run-scoped swarm id), `node` (the owning flow
+  node), `agent`, `round` and `phase`, so a UI can place every update on the
+  right node, member and round.
 
 `vars` holds the flow variables assigned so far, including the document's
 initial `vars`. `awaiting_input` is `null`, or
@@ -346,10 +360,16 @@ The same object is available on its own:
   "allow_write": false,
   "allow_ipc": true,
   "shared_memory": true,
+  "success_criteria": ["The answer names the hot loop", "Measurements are cited"],
+  "gaps": [],
+  "unmet_criteria": [],
   "agents": [
     {"id": "profiler", "label": "Profiler", "role": "investigator",
      "task": "Profile the training loop", "status": "done", "score": 4.5,
-     "version": 2, "output": "..."}
+     "version": 2, "depends_on": [], "tool_calls": 3, "tool_retries": 1,
+     "plan": [{"text": "Sample the loop", "status": "done"},
+              {"text": "Measure the hot path", "status": "done"}],
+     "output": "..."}
   ],
   "messages": [
     {"id": "msg-1a2b3c4d5e", "from": "profiler", "to": "leader",
@@ -374,7 +394,8 @@ The same object is available on its own:
 persisted with the run history, so `GET` also works after the run ends.
 State-changing events refresh this snapshot immediately; high-frequency progress
 events (`swarm_agent_step`, `swarm_agent_tool`, `swarm_agent_status`,
-`swarm_message`) refresh it at most every 250 ms. The event stream itself is
+`swarm_message`) refresh it at most every 250 ms. `swarm_agent_plan` is a
+state-changing event and refreshes immediately. The event stream itself is
 never throttled.
 
 #### `POST /api/agents/runs/{run_id}/swarm/messages`
@@ -396,20 +417,21 @@ text is empty or too long.
 | Event | Payload | Meaning |
 |---|---|---|
 | `swarm_start` | `swarm`, `leader`, `strategy`, `requested_rounds`, `tools`, `limits` | The leader started planning. |
-| `swarm_plan` | `agents`, `strategy`, `rounds`, `notes` | The final team and strategy. |
+| `swarm_plan` | `agents`, `strategy`, `rounds`, `success_criteria`, `notes` | The final team, plan, criteria and strategy. |
 | `swarm_leader` | `phase`, `text` | Leader status or plan notes. |
 | `swarm_round` | `round`, `phase` (`work`/`review`/`revise`/`stop`), `reviews` | A phase of the run started or ended. |
 | `swarm_agent_start` | `agent`, `label`, `role`, `phase`, `version` | A member started a phase. |
 | `swarm_agent_step` | `agent`, `iteration`, `phase` | A model round began. |
 | `swarm_agent_delta` | `agent`, `iteration`, `text` | Streamed member content. |
 | `swarm_agent_status` | `agent`, `message` | Reasoning or a status note. |
-| `swarm_agent_tool` | `agent`, `tool`, `input`, `ok`, `output` | A member's tool call and its result. |
+| `swarm_agent_tool` | `agent`, `tool`, `input`, `ok`, `attempts`, `output` | A member's tool call and its result; `attempts` includes an automatic retry. |
+| `swarm_agent_plan` | `agent`, `plan`, `version`, `done`, `total` | A member replaced its plan. |
 | `swarm_message` | `from`, `to`, `message_kind`, `text`, `message_id`, `reply_to`, `round` | Agent-to-agent IPC. |
 | `swarm_memory` | `agent`, `action`, `key`, `version`, `automatic` | A shared-blackboard change; `automatic` marks a runtime-published member result. |
 | `swarm_review` | `reviewer`, `target`, `score`, `issues`, `round` | A peer review was recorded. |
 | `swarm_context` | `agent`, `action` (`get`/`grant`/`denied`/`find`/`release`), `label`, `reference`, `granted`, `offset`, `total`, `context` | A context grant, denial, search or release. `context` is the current pool snapshot. |
 | `swarm_agent_end` | `agent`, `ok`, `status`, `output`, `summary`, `score`, `version`, `steps`, `usage` | A member finished or failed a phase. |
-| `swarm_end` | `ok`, `status`, `output`, `summary`, `agents`, `reviews` (count), `changed_files` | The swarm finished and the leader returned its synthesis. |
+| `swarm_end` | `ok`, `status`, `output`, `summary`, `agents`, `reviews` (count), `changed_files`, `timed_out` | The swarm finished and the leader returned its synthesis. `timed_out` is true when the work budget ended before every phase completed. |
 
 Deltas are best-effort progress; the authoritative result is the `swarm_end`
 payload and the run snapshot. A client tracks the last event `seq` and reconnects
@@ -440,10 +462,16 @@ structured answer.
 Reliability is part of the contract: an empty model reply is retried once before
 it fails a step; a failed review is reported in `warnings` without discarding the
 member's completed work; and `max_seconds` is enforced even when a backend
-ignores cancellation. Unfinished members are finalised as failed (or kept as done
-when they already produced output) before the result and `swarm_end` are emitted,
-and late worker events after the run ends are dropped. A `SwarmCoordinator` runs
-once; start a new one for another run.
+ignores cancellation. The last 10% of the budget (at least 5 s, at most 90 s) is
+reserved for wrap-up and synthesis: tool rounds stop at that work deadline, a
+member answers from its collected observations, later dependency waves and peer
+reviews are skipped with a warning, and the leader still synthesises. If the
+reserve is also gone, the result is assembled from the members' work and the run
+completes with `timed_out: true`; it fails only when no member produced output.
+Unfinished members are finalised as failed (or kept as done when they already
+produced output) before the result and `swarm_end` are emitted, and late worker
+events after the run ends are dropped. A `SwarmCoordinator` runs once; start a
+new one for another run.
 
 The runtime also shares knowledge without waiting for a member to ask: it seeds
 the blackboard with `swarm.goal` and `swarm.plan` before work starts, publishes
@@ -459,6 +487,9 @@ skipped and the run continues.
 - IPC exists only inside one `SwarmCoordinator`. There is no network transport,
   no global registry and no cross-run delivery. A sender must be a member; a
   recipient must be `leader`, `all` or a known member; self-messages are refused.
+- `leader`, `all`, `operator`, `system` and `user` are reserved channel roles. A
+  planned member id that would shadow one is renamed with a warning instead of
+  sharing the leader's mailbox.
 - Message kind is allow-listed, text is stripped of control characters, size is
   capped by `max_message_chars`, per-sender quotas and a per-swarm total apply,
   and `reply_to` must reference a message the sender actually received.
@@ -715,7 +746,50 @@ Errors are `{"error": "<actionable detail>", "code": "<coarse code>"}`.
 
 ---
 
-## 12. Changes in 1.7
+## 12. Changes in 1.10
+
+AMP 1.10 is additive; 1.9 clients keep working.
+
+- `llm` and `agent` model streams emit coalesced `assistant_delta` and
+  `reasoning_delta` events with `node`, `iteration` and `text`. A live UI can
+  render the model's current turn without polling the provider; the final answer
+  is still the `node_finished` output.
+- Deltas are trimmed first when a run keeps its bounded event history, so a
+  long stream cannot push control events out of a reconnect snapshot.
+- Swarm events add the owning flow `node` id, so a UI can place a member update
+  on the node that launched the swarm.
+
+## 13. Changes in 1.9
+
+AMP 1.9 is additive; 1.8 clients keep working.
+
+- AML 1.8 adds swarm success criteria, per-member plans and `depends_on`
+  waves, plus the `criteria`, `effort` and `reflection` node fields.
+- Discovery's leader protocol includes `success_criteria`, `depends_on`, `plan`,
+  `gaps` and `unmet_criteria`; swarm results expose all five.
+- New `swarm_agent_plan` event. `swarm_agent_tool` adds `attempts`; member state
+  adds `tool_calls`, `tool_failures`, `tool_retries`, `plan` and `depends_on`.
+- Read-only tool calls that fail with a temporary error are retried once in both
+  `swarm` and `agent` nodes; writes are never retried. Failure observations may
+  carry a `hint`, and an unknown tool id gets a closest-match suggestion.
+
+## 14. Changes in 1.8
+
+AMP 1.8 is additive; 1.7 clients keep working.
+
+- AML 1.7 adds the `assert` and `validate` guardrail nodes. Discovery already
+  publishes every node schema from one table, so clients need no protocol change
+  to render them.
+- Discovery adds a `guardrails` object describing assertions, bounded schema
+  validation and model fallback.
+- `llm` and `agent` node defaults add `fallback_model`; a failed main model call
+  retries with the fallback and an agent keeps the fallback for its remaining
+  tool rounds.
+- New run event: `validation` (the result and bounded error list of a `validate`
+  node). Assert failures use the existing `node_failed` event and the normal
+  retry/`on_error` policy.
+
+## 15. Changes in 1.7
 
 AMP 1.7 is additive; 1.6 clients keep working.
 
@@ -743,7 +817,7 @@ AMP 1.7 is additive; 1.6 clients keep working.
 - AML 1.6 adds the matching `swarm` policy keys and the `context_chars` plan
   field.
 
-## 13. Changes in 1.6
+## 16. Changes in 1.6
 
 AMP 1.6 is additive; 1.5 clients keep working.
 
@@ -756,7 +830,7 @@ AMP 1.6 is additive; 1.5 clients keep working.
   endpoint that rejects native tools falls back automatically.
 - AML 1.5 document syntax is unchanged; this is an interoperability addition.
 
-## 14. Changes in 1.5
+## 17. Changes in 1.5
 
 AMP 1.5 is additive; 1.4 clients keep working.
 
@@ -776,7 +850,7 @@ AMP 1.5 is additive; 1.4 clients keep working.
 - Swarm IPC, shared memory and write scopes have explicit quotas, allow-lists
   and sanitisation; a malformed model turn is reported back to that model.
 
-## 15. Changes in 1.4
+## 18. Changes in 1.4
 
 AMP 1.4 is additive; 1.3 clients keep working.
 
@@ -790,7 +864,7 @@ AMP 1.4 is additive; 1.3 clients keep working.
 - Top-level AML `vars` seed the run variables, and `llm` nodes with
   `format: "json"` return a parsed `json` value.
 
-## 16. Changes in 1.3
+## 19. Changes in 1.3
 
 AMP 1.3 is additive; 1.2 clients keep working.
 
@@ -807,7 +881,7 @@ AMP 1.3 is additive; 1.2 clients keep working.
   process are marked failed on the next start.
 - HTTP abilities validate every redirect target and the connected peer address.
 
-## 17. Changes in 1.2
+## 20. Changes in 1.2
 
 AMP 1.2 is additive; 1.1 clients keep working.
 
@@ -822,7 +896,7 @@ AMP 1.2 is additive; 1.1 clients keep working.
   search, diagnostic, session, revert and streaming-run operations under
   `/api/ide` without changing any `/api/agents` contract.
 
-## 18. Changes in 1.1
+## 21. Changes in 1.1
 
 AMP 1.1 is additive; 1.0 clients keep working.
 

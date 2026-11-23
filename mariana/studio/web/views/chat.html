@@ -4,6 +4,7 @@
       <div class="row">
         <button id="chat-new" class="button primary grow" type="button">New chat</button>
         <button id="chat-more" class="icon-button" type="button" aria-label="Conversation actions"></button>
+        <button id="chat-list-close" class="icon-button" type="button" aria-label="Close conversations" title="Close conversations"></button>
       </div>
       <input id="chat-search" type="search" aria-label="Search conversations" placeholder="Search chats…">
       <div id="chat-list" class="chat-list"></div>
@@ -12,6 +13,7 @@
     <div id="chat-workspace" class="chat-workspace">
       <div class="chat-main">
         <header class="chat-header">
+          <button id="chat-conversations" class="icon-button" type="button" aria-label="Show conversations" aria-controls="chat-list" aria-expanded="false" title="Conversations"></button>
           <select id="chat-model" aria-label="Chat model"><option value="">Loading models…</option></select>
           <div class="row">
             <div id="chat-mode" class="segmented" role="group" aria-label="Response mode: Swarm is the default">

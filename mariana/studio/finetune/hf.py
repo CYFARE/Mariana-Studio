@@ -19,6 +19,7 @@ from ..models.catalog import (
     transformers_weights,
 )
 from ..validation import choice, flag, number
+from . import memory
 from .dataset import find_chat_files
 from .lora import TARGET_MODES, estimate_lora_parameters, select_target_names
 
@@ -34,6 +35,14 @@ PRESETS = {
         "description": "A larger adapter for a new domain or task. The usual place to start.",
         "method": "lora", "steps": 400, "lr": 0.0002, "warmup": 20, "grad_accum": 2, "lora_r": 16,
     },
+    "low_vram": {
+        "label": "Low-VRAM LoRA (4-bit)",
+        "description": "QLoRA for 6-8 GB GPUs: 4-bit weights, gradient checkpointing and "
+                       "automatic batch sizing. The adapter is usable without a merged copy.",
+        "method": "lora", "steps": 400, "lr": 0.0002, "warmup": 20, "grad_accum": 8,
+        "lora_r": 16, "batch": 1, "quantization": "4bit",
+        "gradient_checkpointing": True, "merge": False,
+    },
     "deep": {
         "label": "Full fine-tune",
         "description": "Updates every weight. Needs more data and memory; keep the learning "
@@ -47,6 +56,8 @@ METHODS = {
     "full": "Full model",
 }
 DATA_MODES = ("auto", "text", "chat")
+QUANTIZATION_MODES = ("auto", "none", "4bit", "8bit")
+PRECISIONS = ("auto", "fp32", "bf16", "fp16")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
 _LAYER_INDEX = re.compile(r"(?:^|\.)(?:h|layers|layer|blocks|block)\.(\d+)\.")
 _FINAL_NORM = re.compile(r"(?:^|\.)(?:ln_f|norm|final_layer_norm|final_norm|norm_f)\.")
@@ -70,6 +81,7 @@ def inspect(entry: dict) -> dict:
         "finetuned_from": detail.get("finetuned_from"), "latent": False, "moe": False,
         "tokenizer": None, "default_name": f"{_slug(entry['name'])}-tuned",
         "presets": PRESETS, "methods": METHODS,
+        "quantization_ready": has_module("bitsandbytes"),
         "available": installed,
         "requirement": "" if installed else f"Transformers is not installed; {TRANSFORMERS_HINT}",
     }
@@ -157,7 +169,7 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
 
     steps = number(config, "steps", preset["steps"], 1, 10_000_000)
     learning_rate = number(config, "lr", preset["lr"], 1e-8, 1.0, float)
-    batch = number(config, "batch", 4, 1, 4096)
+    batch = number(config, "batch", preset.get("batch", 4), 1, 4096)
     grad_accum = number(config, "grad_accum", preset["grad_accum"], 1, 4096)
     warmup = number(config, "warmup", preset["warmup"], 0, 1_000_000)
     eval_every = number(config, "eval_every", max(10, min(100, steps)), 1, 10_000_000)
@@ -170,8 +182,22 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
     layer_count = int(info["layers"] or 0)
     trainable_layers = number(config, "trainable_layers", 2, 1, max(1, layer_count or 1024))
     train_on = choice(config, "train_on", "assistant", ("assistant", "all"), "Train on")
-    precision = choice(config, "precision", "auto", ("auto", "fp32", "bf16"), "Precision")
-    merge = flag(config, "merge", True)
+    precision = choice(config, "precision", "auto", PRECISIONS, "Precision")
+    quantization = choice(config, "quantization", preset.get("quantization", "auto"),
+                          QUANTIZATION_MODES, "Quantization")
+    if method != "lora" and quantization not in {"auto", "none"}:
+        raise ModelError("4-bit and 8-bit quantization need the LoRA method; choose LoRA first")
+    quantization_requirement = ""
+    if quantization in {"4bit", "8bit"} and not has_module("bitsandbytes"):
+        quantization_requirement = (
+            "Quantized fine-tuning needs bitsandbytes. Run: "
+            "pip install -r requirements-finetune.txt")
+    auto_memory = flag(config, "auto_memory", True)
+    gradient_checkpointing = flag(config, "gradient_checkpointing",
+                                  preset.get("gradient_checkpointing", False))
+    max_tokens = number(config, "max_tokens", 20_000_000, 1_000, 500_000_000)
+    max_examples = number(config, "max_examples", 500_000, 1, 20_000_000)
+    merge = flag(config, "merge", preset.get("merge", True))
 
     total, trainable = estimate_trainable(base, method, targets, rank, trainable_layers)
     total = total or int(info["parameters"] or 0)
@@ -197,6 +223,34 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
     if output.exists():
         warnings.append("The output model exists and will be moved to backups/ before writing.")
 
+    preferred = "bf16" if precision in {"auto", "bf16"} else precision
+    report = memory.recommendation(
+        total, method=method, precision=preferred, quantization=quantization,
+        batch=batch, block_size=block_size, trainable=trainable, layers=layer_count,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+    if total:
+        if method != "lora" and not report["fits_8gb"]:
+            warnings.append(
+                f"{METHODS[method]} needs about {memory.describe_bytes(report['estimate']['total'])} of "
+                f"VRAM at this size. On a 6-8 GB GPU choose LoRA with 4-bit quantization.")
+        if method == "lora" and not report["fits_8gb"]:
+            if quantization == "none":
+                warnings.append(
+                    f"This base needs about {memory.describe_bytes(report['estimate']['total'])} of "
+                    f"VRAM uncompressed. Choose 4-bit quantization for a 6-8 GB GPU.")
+            elif quantization == "auto":
+                warnings.append(
+                    f"Auto memory will switch this base to 4-bit weights "
+                    f"(~{memory.describe_bytes(report['low_vram_total'])} estimated peak) "
+                    f"when bitsandbytes is available.")
+    if quantization in {"4bit", "8bit"} and not info["quantization_ready"]:
+        warnings.append(quantization_requirement)
+    if quantization in {"4bit", "8bit"} and not has_module("accelerate"):
+        warnings.append(
+            "Accelerate is not installed; quantized loading may place weights less efficiently. "
+            "Run: pip install accelerate")
+
     scope = {
         "lora": f"LoRA r={rank}, alpha={alpha:g} on {targets} layers",
         "last_layers": f"Last {trainable_layers} of {layer_count or '?'} blocks",
@@ -208,7 +262,9 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
         "trainable_layers": trainable_layers, "steps": steps, "batch": batch,
         "grad_accum": grad_accum, "lr": learning_rate, "warmup": warmup,
         "block_size": block_size, "eval_every": eval_every, "device": config.get("device", "auto"),
-        "precision": precision, "gradient_checkpointing": flag(config, "gradient_checkpointing"),
+        "precision": precision, "quantization": quantization, "auto_memory": auto_memory,
+        "parameters": total, "max_tokens": max_tokens, "max_examples": max_examples,
+        "gradient_checkpointing": gradient_checkpointing,
         "merge": merge, "train_on": train_on,
     }
     normalized = {
@@ -231,6 +287,10 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
     ]
     if method == "lora":
         summary.append(["Result", "Adapter + merged model" if merge else "Adapter only"])
+    if total:
+        summary.append(["Estimated peak", f"~{memory.describe_bytes(report['estimate']['total'])}"])
+        if method == "lora" and not report["fits_8gb"]:
+            summary.append(["4-bit peak", f"~{memory.describe_bytes(report['low_vram_total'])}"])
     return {
         "engine": "hf", "base": info, "config": normalized,
         "preset": {"name": preset_name, **preset}, "summary": summary,
@@ -241,5 +301,6 @@ def plan(root: Path, entry: dict, config: dict) -> dict:
             "trainable_percent": (100.0 * trainable / total) if total else 0.0,
         },
         "output": str(output.relative_to(root)), "warnings": warnings,
-        "ready": info["available"],
+        "ready": info["available"] and not quantization_requirement,
+        "requirement": quantization_requirement or info["requirement"],
     }

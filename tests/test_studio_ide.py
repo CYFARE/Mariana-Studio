@@ -8,6 +8,7 @@ import json
 import shutil
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -236,9 +237,29 @@ def test_workspace_and_user_skills_are_discovered_and_read(tmp_path):
             workspace["id"], "edit", service._tools_for_mode("edit", workspace["id"]),
             service.workspace_path(workspace["id"]), None,
         )
-        assert "Skills are reusable" in prompt and "release" in prompt and "code-review" in prompt
+        assert "available automatically" in prompt
+        assert "skill.read" in prompt and "release" in prompt and "code-review" in prompt
     finally:
         service.close()
+
+
+def test_every_skill_is_exposed_automatically_in_the_prompt(service):
+    workspace = make_workspace(service)
+    root = service.workspace_path(workspace["id"]) / ".agents" / "skills"
+    for index in range(14):
+        directory = root / f"skill-{index:02d}"
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: Skill {index}\ndescription: Handles task {index}\n---\nBody.\n",
+            encoding="utf-8",
+        )
+    tools = service._tools_for_mode("edit", workspace["id"])
+    prompt = service._system_prompt(
+        workspace["id"], "edit", tools, service.workspace_path(workspace["id"]), None)
+    assert "available automatically" in prompt
+    assert "skill-13" in prompt and prompt.count("- skill-") == 14
+    briefing = service._swarm_briefing(workspace["id"], [])
+    assert "available automatically" in briefing and "skill-13" in briefing
 
 
 def test_reading_a_skill_through_a_run_returns_its_instructions(service, tmp_path):
@@ -441,6 +462,18 @@ def test_sessions_can_be_renamed_pinned_and_duplicated(service):
         service.rename_session(session["id"], {"title": "   "})
 
 
+def test_the_session_list_cache_refreshes_after_a_save(service):
+    workspace = make_workspace(service)
+    session = service._new_session(workspace["id"], "First task", "edit", "fake-coder")
+    assert service.list_sessions(workspace["id"])[0]["title"] == "First task"
+    # The cached file is re-read only after it actually changes.
+    assert service.list_sessions(workspace["id"])[0]["title"] == "First task"
+
+    session["title"] = "Changed task"
+    service._save_session(session)
+    assert service.list_sessions(workspace["id"])[0]["title"] == "Changed task"
+
+
 def test_pinned_context_and_hidden_paths_reach_the_prompt(service):
     workspace = make_workspace(service)
     service.create_folder(workspace["id"], "vendor")
@@ -529,6 +562,147 @@ def test_coding_run_streams_tools_plan_edits_and_reverts(service):
     result = service.revert_session(session["id"])
     assert result["restored"] == 1
     assert service.read_file(workspace["id"], "main.py")["content"] == original
+
+
+def test_a_late_event_cannot_arrive_after_a_run_finishes():
+    run = IdeRun("run-late", "session-late", "workspace-late", "go")
+    run.event("log", message="worker started")
+    run.finish("completed", output="done")
+    snapshot = run.snapshot()
+    count = snapshot["event_count"]
+
+    run.event("log", message="late worker")
+
+    after = run.snapshot()
+    assert after["event_count"] == count
+    assert [event["type"] for event in after["events"]] == [
+        "log", "run_completed"
+    ]
+
+
+def test_independent_read_tools_run_in_parallel_and_keep_result_order(service, monkeypatch):
+    workspace = make_workspace(service)
+    for name in ("a.py", "b.py", "c.py"):
+        service.write_file(workspace["id"], name, f"# {name}\n", version="")
+
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    real = ide_module.execute_ability
+
+    def slow(*args, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.08)
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(ide_module, "execute_ability", slow)
+    service.gateway = ScriptedGateway([
+        '{"calls": ['
+        '{"tool": "file.read", "input": {"path": "a.py"}}, '
+        '{"tool": "file.read", "input": {"path": "b.py"}}, '
+        '{"tool": "file.read", "input": {"path": "c.py"}}]}',
+        '{"final": "Read them."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read three files", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert peak >= 2
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert [result["output"]["path"] for result in results] == ["a.py", "b.py", "c.py"]
+
+
+def test_cancelling_a_parallel_batch_does_not_wait_for_a_blocked_tool(service):
+    workspace = make_workspace(service)
+    run = IdeRun("run-cancel", "session-cancel", workspace["id"], "go")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked(*_args, **_kwargs):
+        started.set()
+        release.wait(5)
+        return {"content": "late"}, True, None, {}, 1
+
+    original = service._invoke_with_retry
+    service._invoke_with_retry = blocked
+    tools = [{"id": "file.read", "type": "file.read"},
+             {"id": "file.list", "type": "file.list"}]
+    calls = [{"tool": "file.read", "input": {"path": "main.py"}},
+             {"tool": "file.list", "input": {}}]
+    outcome = []
+
+    def batch():
+        try:
+            service._run_tool_batch(
+                run, workspace["id"], {"mode": "ask"}, tools, calls, 1,
+                Counter(), [])
+        except ide_module._Cancelled:
+            outcome.append("cancelled")
+
+    worker = threading.Thread(target=batch, daemon=True)
+    try:
+        worker.start()
+        assert started.wait(2)
+        run.cancelled.set()
+        worker.join(timeout=2)
+    finally:
+        release.set()
+        service._invoke_with_retry = original
+
+    assert outcome == ["cancelled"]
+    assert worker.is_alive() is False
+
+
+def test_a_transient_read_failure_is_retried_once(service, monkeypatch):
+    workspace = make_workspace(service)
+    service.write_file(workspace["id"], "x.py", "value = 1\n", version="")
+    calls = []
+    real = ide_module.execute_ability
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("connection timed out")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ide_module, "execute_ability", flaky)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.read", "input": {"path": "x.py"}}',
+        '{"final": "Recovered."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read it", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert len(results) == 1 and results[0]["attempts"] == 2 and results[0]["ok"] is True
+    assert any(event["type"] == "log"
+               and "Retrying file.read" in event.get("message", "")
+               for event in final["events"])
+
+
+def test_a_batch_with_a_write_keeps_call_order(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"calls": ['
+        '{"tool": "file.write", "input": {"path": "created.py", "content": "value = 1\\n"}}, '
+        '{"tool": "file.read", "input": {"path": "created.py"}}]}',
+        '{"final": "Wrote and read it."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Write then read", "mode": "edit"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert [result["ok"] for result in results] == [True, True]
+    assert "value = 1" in results[1]["output"]["content"]
 
 
 def test_a_reasoning_only_reply_is_retried_with_a_larger_budget(service):
@@ -683,12 +857,32 @@ def test_observation_truncation_keeps_file_control_fields(service):
     bounded = service._bounded_observation(observation, 6_000)
 
     assert bounded["path"] == "main.py"
-    assert bounded["start_line"] == 1 and bounded["end_line"] == 200
+    assert bounded["start_line"] == 1 and bounded["end_line"] == 1
     assert bounded["total_lines"] == 900
-    assert bounded["truncated"] is True
+    assert bounded["truncated"] is True and bounded["content_cut_midline"] is True
     assert "content" in bounded["truncated_fields"]
+    assert "next_start_line" not in bounded
     assert len(bounded["content"]) < 50_000
     assert len(json.dumps(bounded)) <= 6_200
+
+
+def test_observation_truncation_reports_the_real_last_included_line(service):
+    content = "".join(
+        f"value_{index} = {index}  # " + "x" * 60 + "\n" for index in range(1, 201)
+    )
+    observation = {
+        "path": "main.py", "content": content,
+        "start_line": 1, "end_line": 200, "total_lines": 900,
+        "truncated": False, "language": "Python",
+    }
+    bounded = service._bounded_observation(observation, 6_000)
+
+    included = bounded["content"].count("\n")
+    assert included >= 1
+    assert bounded["end_line"] == included
+    assert bounded["next_start_line"] == included + 1
+    assert bounded["end_line"] < 200 and bounded["truncated"] is True
+    assert "content_cut_midline" not in bounded
 
 
 def test_a_multi_call_round_has_a_total_observation_budget(service):
@@ -948,6 +1142,46 @@ def test_context_preview_includes_a_prompt_budget(service):
     assert preview["files"][0]["tokens"] > 0
     assert budget["prompt"]["chars"] > 0
     assert budget["limits"]["context_files"] > 0
+
+
+def test_the_full_task_is_sent_once_and_the_prompt_keeps_only_an_anchor(service):
+    workspace = make_workspace(service)
+    gateway = ScriptedGateway(['{"final": "done"}'])
+    service.gateway = gateway
+    marker = "Refactor the login flow. " + "Detail. " * 200 + " UNIQUE-TAIL"
+    started = service.start_run(workspace["id"], {"message": marker, "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    system = gateway.calls[0]["messages"][0]["content"]
+    assert "Refactor the login flow." in system
+    assert "UNIQUE-TAIL" not in system
+    assert gateway.calls[0]["messages"][-1]["content"] == marker
+
+    budget = service.context_budget(workspace["id"], {"message": marker, "mode": "ask"})
+    assert any(section["id"] == "task" for section in budget["sections"])
+    assert budget["task"]["chars"] == len(marker)
+
+
+def test_a_truncated_active_file_is_labelled_in_the_prompt(service):
+    workspace = make_workspace(service)
+    service.write_file(workspace["id"], "long.txt", "x" * 7_000, version="")
+    active = service._active_file(workspace["id"], "long.txt")
+    assert active["truncated"] is True
+    assert len(active["content"]) == 6_000
+
+    tools = service._tools_for_mode("ask", workspace["id"])
+    sections = service._system_sections(
+        workspace["id"], "ask", tools, service.workspace_path(workspace["id"]),
+        active, {}, {})
+    text = next(section["text"] for section in sections if section["id"] == "active")
+    assert "truncated at line" in text and "file.read" in text
+
+    pieces, _prompt, _truncated = service._prompt_pieces(
+        workspace["id"], "ask", tools, service.workspace_path(workspace["id"]),
+        None, {}, "Review the notes", ["long.txt"], {})
+    opened = next(piece for piece in pieces if piece["id"] == "open:long.txt")
+    assert "Preview only" in opened["text"]
 
 
 def test_budget_uses_the_catalog_context_window_and_bytes(service):

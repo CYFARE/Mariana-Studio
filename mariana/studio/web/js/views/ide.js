@@ -14,6 +14,7 @@
   const THINKING_BODY_CHARS = 20_000;
   const THINKING_TAIL_CHARS = 2_400;
   const SCROLL_SLACK = 48;
+  const MAX_INSERTED_SELECTION = 40000;
   const BUDGET_RING = 2 * Math.PI * 9;
   const MODE_LABELS = { ask: "Ask", edit: "Edit", auto: "Auto" };
   const PROMPTS = [
@@ -27,6 +28,18 @@
 
   let layout = null;
   const expandedEntries = new WeakMap();
+  const MAX_RECENT_FILES = 20;
+  const DEFAULT_EDITOR_FONT = 13;
+  const OUTLINE_DEBOUNCE = 250;
+  const OUTLINE_KINDS = { function: "def", class: "class", type: "type", impl: "impl", tag: "tag" };
+  let sidebarTabs = null;
+  let commandsRegistered = false;
+  let outlineSignature = "";
+  let outlineTab = null;
+  let outlineElements = [];
+  let outlineActive = null;
+  let outlineKey = "";
+  let outlineTimer = null;
 
   const state = {
     info: null,
@@ -73,6 +86,7 @@
       planCollapsed: false,
       open: [],
       activePath: "",
+      closed: [],
       session: null,
       sessionId: "",
       sessionToken: 0,
@@ -126,6 +140,62 @@
   function projectName(id) {
     const info = (state.info && state.info.workspaces || []).find(item => item.id === id);
     return (info && info.name) || id.replace(/-/g, " ");
+  }
+
+  function editorFontSize() {
+    const value = Number(Studio.store.get("ide-editor-font", DEFAULT_EDITOR_FONT));
+    return Math.max(12, Math.min(22, Math.round(value) || DEFAULT_EDITOR_FONT));
+  }
+
+  function applyEditorFont(editor) {
+    if (!editor) return;
+    const size = editorFontSize();
+    if (editor.__codeFontSize === size) return;
+    editor.__codeFontSize = size;
+    Studio.setStyle(editor.element, { "--code-font-size": `${size}px` });
+    if (typeof editor.refreshMetrics === "function") editor.refreshMetrics();
+  }
+
+  function setEditorFontSize(value) {
+    const next = Math.max(12, Math.min(22, Math.round(Number(value) || DEFAULT_EDITOR_FONT)));
+    Studio.store.set("ide-editor-font", next);
+    const tab = activeTab(activeProject());
+    if (tab && tab.editor) applyEditorFont(tab.editor);
+    Studio.toast(`Editor font: ${next}px`, "info");
+  }
+
+  function recentPaths(project) {
+    if (!project) return [];
+    const stored = Studio.store.get(`ide-recent-${project.id}`, []);
+    return Array.isArray(stored) ? stored.filter(path => typeof path === "string" && path) : [];
+  }
+
+  function rememberRecent(project, path) {
+    if (!project || !path) return;
+    const next = [path, ...recentPaths(project).filter(item => item !== path)].slice(0, MAX_RECENT_FILES);
+    Studio.store.set(`ide-recent-${project.id}`, next);
+  }
+
+  function showExplorer(panel = "files") {
+    if (layout) {
+      const view = layout.read();
+      if (view && view.sidebar.collapsed) {
+        layout.setCollapsed("sidebar", false, false);
+        layout.apply();
+      }
+    }
+    if (sidebarTabs) sidebarTabs.select(panel);
+  }
+
+  function toggleFocusMode() {
+    if (!layout) return;
+    const view = layout.read();
+    if (!view) return;
+    const focused = view.sidebar.collapsed && view.agent.collapsed;
+    layout.setCollapsed("sidebar", !focused, false);
+    layout.setCollapsed("agent", !focused, false);
+    layout.apply();
+    Studio.toast(focused ? "Side panels restored." : "Focus mode: editor only.", "info");
   }
 
   function rememberProjects() {
@@ -195,6 +265,9 @@
     $("ide-status-file").textContent = tab
       ? (tab.kind === "binary" ? `${tab.path} · ${tab.mime || "binary"}` : tab.path)
       : "No file open";
+    const position = tab && tab.editor ? tab.editor.position : null;
+    $("ide-status-position").textContent = position
+      ? `Ln ${position.index + 1}, Col ${position.column}` : "";
     $("ide-voice").disabled = !project;
     $("ide-budget-open").disabled = !project;
     updateUsageBadge(project);
@@ -507,12 +580,18 @@
       .filter(item => !state.hiddenProjects.has(item.id) && !item.missing);
   }
 
+  let workspaceSelectKey = "";
+
   function selectOptions() {
     const select = $("ide-workspace");
     const previous = state.active;
     const values = [["", "Open project…"], ...visibleWorkspaces().map(item => [item.id, item.name])];
     if ((state.info && state.info.workspaces || []).length) values.push(["__manage__", "Manage recent projects…"]);
-    Studio.ui.selectOptions(select, values, previous);
+    const key = JSON.stringify([previous, values]);
+    if (key !== workspaceSelectKey) {
+      workspaceSelectKey = key;
+      Studio.ui.selectOptions(select, values, previous);
+    }
     select.value = previous || "";
   }
 
@@ -734,9 +813,18 @@
     return true;
   }
 
+  let projectsTabKey = "";
+
   function renderProjects() {
     selectOptions();
-    const root = Studio.ui.render($("ide-project-tabs"));
+    const root = $("ide-project-tabs");
+    const key = JSON.stringify([state.active, state.projects.map(id => {
+      const project = ensureProject(id);
+      return [id, projectName(id), project.open.some(tab => tab.dirty), Boolean(project.running)];
+    })]);
+    if (key === projectsTabKey && root.childElementCount) return;
+    projectsTabKey = key;
+    Studio.ui.render(root);
     if (!state.projects.length) {
       root.append(h("span", { class: "ide-project-empty muted tiny", text: "Open a project from the menu to begin." }));
       return;
@@ -755,6 +843,15 @@
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             activateProject(id);
+          } else if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+            event.preventDefault();
+            const index = state.projects.indexOf(id);
+            if (index < 0 || state.projects.length < 2) return;
+            const nextId = state.projects[(index + (event.key === "ArrowRight" ? 1 : -1) + state.projects.length) % state.projects.length];
+            activateProject(nextId).then(() => requestAnimationFrame(() => {
+              const active = $("ide-project-tabs").querySelector(".ide-project-tab.active");
+              if (active) active.focus();
+            }));
           }
         },
         oncontextmenu: event => projectMenu(event, project),
@@ -779,6 +876,9 @@
         for (const id of [...state.projects]) if (id !== project.id) await closeProject(id);
       } },
       "separator",
+      { label: "Reopen closed tab", icon: "undo", disabled: !(project.closed || []).length, onSelect: () => reopenClosedTab(project) },
+      { label: "Save all changed files", icon: "check", disabled: !project.open.some(tab => tab.dirty),
+        onSelect: () => saveAllDirty(project) },
       { label: "New file here", icon: "plus", onSelect: () => newFile(project, "") },
       { label: "Add provider…", icon: "globe",
         onSelect: () => Studio.providers.addEndpointDialog({ onSaved: fillModelSelect }) },
@@ -1164,6 +1264,7 @@
       const element = h("button", {
         class: `ide-tree-row dir${expanded ? " expanded" : ""}`, type: "button",
         "aria-expanded": String(expanded), title: node.path,
+        dataset: { path: node.path },
         onclick: () => {
           if (flat) {
             project.filter = "";
@@ -1185,6 +1286,7 @@
     const element = h("button", {
       class: `ide-tree-row file${project.activePath === node.path ? " active" : ""}${tab && tab.dirty ? " dirty" : ""}`,
       type: "button", title: node.path,
+      dataset: { path: node.path },
       onclick: () => openFile(node.path),
       oncontextmenu: event => treeMenu(event, project, node),
     },
@@ -1291,6 +1393,21 @@
     const root = $("ide-tree");
     root.scrollTop = Math.max(0, index * ROW_HEIGHT - root.clientHeight / 2 + ROW_HEIGHT);
     paintTreeWindow(project, true);
+  }
+
+  function focusTreeIndex(project, index) {
+    if (!project || index < 0 || index >= project.rows.length) return;
+    const root = $("ide-tree");
+    const top = index * ROW_HEIGHT;
+    if (top < root.scrollTop) root.scrollTop = top;
+    else if (top + ROW_HEIGHT > root.scrollTop + root.clientHeight) {
+      root.scrollTop = top + ROW_HEIGHT - root.clientHeight;
+    }
+    paintTreeWindow(project, true);
+    const row = project.rows[index];
+    const element = Array.from(root.querySelectorAll(".ide-tree-row"))
+      .find(item => item.dataset.path === row.node.path);
+    if (element) element.focus();
   }
 
   async function refreshTree(project, options = {}) {
@@ -1401,12 +1518,23 @@
     return project ? project.open.find(tab => tab.path === project.activePath) || null : null;
   }
 
+  let tabsKey = "";
+  let tabsProject = null;
+
   function renderTabs(project) {
     const root = $("ide-file-tabs");
     if (!project) {
+      tabsProject = null;
+      tabsKey = "";
       Studio.ui.render(root);
       return;
     }
+    const key = JSON.stringify([project.id, project.activePath,
+      project.open.map(tab => [tab.path, Boolean(tab.dirty), Boolean(tab.stale), Boolean(tab.partial)])]);
+    if (tabsProject === project && key === tabsKey && root.childElementCount) return;
+    tabsProject = project;
+    tabsKey = key;
+    const scrollLeft = root.scrollLeft;
     Studio.ui.render(root);
     if (!project.open.length) {
       root.append(h("span", { class: "ide-tabs-empty muted tiny", text: "No files open" }));
@@ -1432,6 +1560,22 @@
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             activateTab(project, tab.path);
+          } else if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+            event.preventDefault();
+            stepTab(project, event.key === "ArrowRight" ? 1 : -1);
+            requestAnimationFrame(() => {
+              const active = root.querySelector(".ide-file-tab.active");
+              if (active) active.focus();
+            });
+          } else if (event.key === "Home" || event.key === "End") {
+            event.preventDefault();
+            const target = event.key === "Home" ? project.open[0] : project.open[project.open.length - 1];
+            if (!target) return;
+            activateTab(project, target.path);
+            requestAnimationFrame(() => {
+              const active = root.querySelector(".ide-file-tab.active");
+              if (active) active.focus();
+            });
           }
         },
       },
@@ -1444,6 +1588,11 @@
       }, icon("x", "small")));
       root.append(wrapper);
     }
+    root.scrollLeft = scrollLeft;
+    const active = root.querySelector(".ide-file-tab.active");
+    if (active && typeof active.scrollIntoView === "function") {
+      requestAnimationFrame(() => active.scrollIntoView({ block: "nearest", inline: "nearest" }));
+    }
   }
 
   function tabMenu(event, project, tab) {
@@ -1455,10 +1604,12 @@
     Studio.overlay.menu({ x: event.clientX, y: event.clientY }, [
       ...views,
       { label: "File details…", icon: "info", onSelect: () => openFileInfo(project, tab) },
+      { label: "Reveal in explorer", icon: "folder", onSelect: () => openBreadcrumbPath(project, tab.path) },
       "separator",
       { label: "Find in file", icon: "search", disabled: !tab.editor, onSelect: () => tab.editor && tab.editor.openFind() },
       { label: "Go to line", icon: "file", disabled: !tab.editor, onSelect: () => tab.editor && tab.editor.goToLineDialog() },
       "separator",
+      { label: "Reopen closed tab", icon: "undo", disabled: !(project.closed || []).length, onSelect: () => reopenClosedTab(project) },
       { label: "Close", icon: "x", onSelect: () => closeTab(project, tab.path) },
       { label: "Close others", icon: "x", onSelect: () => closeOtherTabs(project, tab.path) },
       { label: "Close all", icon: "x", onSelect: () => closeAllTabs(project) },
@@ -1486,9 +1637,94 @@
     return ids;
   }
 
+  function openBreadcrumbPath(project, path) {
+    if (!project) return;
+    showExplorer("files");
+    if (!path) {
+      renderTree(project);
+      const root = $("ide-tree");
+      if (root) root.scrollTop = 0;
+      paintTreeWindow(project, true);
+      return;
+    }
+    revealPath(project, path);
+  }
+
+  function renderBreadcrumbs(project, tab) {
+    const root = $("ide-breadcrumbs");
+    if (!root) return;
+    if (!project || !tab) {
+      root.classList.add("hidden");
+      root.dataset.signature = "";
+      Studio.clear(root);
+      return;
+    }
+    root.classList.remove("hidden");
+    const workspace = projectName(project.id);
+    const signature = `${project.id}\u0000${workspace}\u0000${tab.path}`;
+    if (root.dataset.signature === signature) return;
+    root.dataset.signature = signature;
+    Studio.ui.render(root);
+    root.append(h("button", {
+      class: "ide-crumb ide-crumb-root", type: "button",
+      title: `Reveal ${workspace} in the explorer`,
+      onclick: () => openBreadcrumbPath(project, ""),
+    }, icon("folder", "small"), h("span", { class: "truncate", text: workspace })));
+    const parts = String(tab.path || "").split("/").filter(Boolean);
+    let prefix = "";
+    parts.forEach((part, index) => {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      root.append(h("span", { class: "ide-crumb-sep", "aria-hidden": "true", text: "/" }));
+      if (index === parts.length - 1) {
+        root.append(h("span", { class: "ide-crumb current", title: tab.path },
+          icon("file", "small"), h("span", { class: "truncate", text: part })));
+      } else {
+        root.append(h("button", {
+          class: "ide-crumb", type: "button", title: `Reveal ${prefix} in the explorer`,
+          onclick: () => openBreadcrumbPath(project, prefix),
+        }, h("span", { class: "truncate", text: part })));
+      }
+    });
+    root.append(h("span", { class: "grow" }), h("div", { class: "ide-breadcrumb-actions" },
+      Studio.ui.iconButton("copy", "Copy file path", () => Studio.copy(tab.path), { small: true }),
+      Studio.ui.iconButton("more", "File actions", event => {
+        const box = event.currentTarget.getBoundingClientRect();
+        tabMenu({ preventDefault() {}, clientX: box.left, clientY: box.bottom + 4 }, project, tab);
+      }, { small: true })));
+  }
+
+  function openTabsMenu(anchor, project) {
+    if (!project) return;
+    const items = [];
+    if (project.open.length) {
+      items.push({ heading: `${project.open.length} open file${project.open.length === 1 ? "" : "s"}` });
+      for (const tab of project.open) {
+        const active = tab.path === project.activePath;
+        items.push({
+          label: `${active ? "● " : ""}${tab.path.split("/").pop()}${tab.dirty ? " •" : ""}`,
+          icon: tab.kind === "text" ? "file" : "eye",
+          hint: active ? "Active" : tab.path,
+          onSelect: () => activateTab(project, tab.path),
+        });
+      }
+    } else items.push({ heading: "No open files" });
+    items.push("separator", {
+      label: "Reopen closed tab", icon: "undo", hint: "Ctrl+Shift+T",
+      disabled: !(project.closed || []).length, onSelect: () => reopenClosedTab(project),
+    }, {
+      label: "Save all changed files", icon: "check",
+      disabled: !project.open.some(tab => tab.dirty), onSelect: () => saveAllDirty(project),
+    }, {
+      label: "Close active tab", icon: "x", hint: "Ctrl+W",
+      disabled: !activeTab(project), onSelect: () => { const tab = activeTab(project); if (tab) closeTab(project, tab.path); },
+    });
+    Studio.overlay.menu(anchor, items, { label: "Open files", align: "end" });
+  }
+
   function renderViewBar(project) {
     const root = $("ide-view-bar");
     const tab = activeTab(project);
+    renderBreadcrumbs(project, tab);
     if (!tab) {
       root.classList.add("hidden");
       Studio.clear(root);
@@ -1511,7 +1747,8 @@
       h("button", {
         class: "ide-view-meta", type: "button", title: "File details and metadata",
         onclick: () => openFileInfo(project, tab),
-      }, icon("info", "small"), h("span", { class: "truncate", text: details.filter(Boolean).join(" · ") })));
+      }, icon("info", "small"), h("span", { class: "truncate", text: details.filter(Boolean).join(" · ") })),
+      Studio.ui.iconButton("menu", `Open files (${project.open.length})`, event => openTabsMenu(event.currentTarget, project), { small: true }));
   }
 
   function setTabView(project, tab, view) {
@@ -1638,11 +1875,17 @@
     const host = $("ide-editor-host");
     const tab = activeTab(project);
     renderViewBar(project);
+    renderOutline(project);
     if (!tab) {
       editorHostTab = null;
       Studio.ui.render(host, Studio.ui.empty({
         compact: true, icon: "file", title: "Open a file",
         text: "Pick a file from the explorer, press Ctrl+P, or ask the agent to create one.",
+        actions: [
+          Studio.ui.button("Quick open", { small: true, kind: "primary", onclick: openQuickOpen }),
+          Studio.ui.button("New file", { small: true, onclick: () => newFile(project, "") }),
+          Studio.ui.button("New chat", { small: true, onclick: () => newSession(project) }),
+        ],
       }));
       renderNotice(project);
       updateWorkspaceState();
@@ -1657,6 +1900,7 @@
     }
     if (tab.editor) {
       tab.editor.attach(host);
+      applyEditorFont(tab.editor);
     } else {
       const created = Studio.editor.create(host, {
         value: tab.content,
@@ -1674,18 +1918,22 @@
             renderProjects();
             updateWorkspaceState();
           }
+          scheduleOutline(project);
         },
         onSave: saveActive,
         onCursor(line, column) {
           if (isActive(project) && activeTab(project) === tab) {
-            $("ide-status-file").textContent = `${tab.path} · Ln ${line}, Col ${column}`;
+            $("ide-status-position").textContent = `Ln ${line}, Col ${column}`;
+            markOutlineLine(line);
           }
         },
       });
       tab.editor = created;
+      applyEditorFont(created);
       if (tab.partial) created.setReadOnly(true);
     }
     editorHostTab = tab;
+    markOutlineCursor(tab);
     renderNotice(project);
     updateWorkspaceState();
   }
@@ -1753,6 +2001,7 @@
         if (tab.view !== "code") mountEditor(project);
         renderNotice(project);
         updateWorkspaceState();
+        renderOutline(project);
       }
     } catch (error) {
       Studio.toast(error.message, "error");
@@ -1764,6 +2013,7 @@
     if (!project || !project.id) return;
     const existing = project.open.find(tab => tab.path === path);
     if (existing) {
+      rememberRecent(project, path);
       const switched = Boolean(line && existing.kind === "text" && existing.view !== "code");
       if (switched) existing.view = "code";
       activateTab(project, path);
@@ -1778,6 +2028,7 @@
       if (line && tab.kind === "text" && tab.view !== "code") tab.view = "code";
       project.open.push(tab);
       project.activePath = tab.path;
+      rememberRecent(project, tab.path);
       rememberProject(project);
       renderTabs(project);
       revealPath(project, tab.path);
@@ -1793,6 +2044,7 @@
   function activateTab(project, path) {
     if (!project || project.activePath === path) return;
     project.activePath = path;
+    rememberRecent(project, path);
     rememberProject(project);
     renderTabs(project);
     paintTreeWindow(project, true);
@@ -1820,6 +2072,9 @@
       });
       if (!discard) return;
     }
+    if (!options.force) {
+      project.closed = [path, ...(project.closed || []).filter(item => item !== path)].slice(0, 20);
+    }
     destroyEditor(tab);
     project.open = project.open.filter(item => item.path !== path);
     if (project.activePath === path) {
@@ -1835,6 +2090,22 @@
 
   async function closeOtherTabs(project, keep) {
     for (const tab of [...project.open]) if (tab.path !== keep) await closeTab(project, tab.path);
+  }
+
+  function reopenClosedTab(project) {
+    const path = project && project.closed && project.closed.length ? project.closed.shift() : "";
+    if (!path) {
+      Studio.toast("No closed tab to reopen.", "info");
+      return;
+    }
+    openFile(path);
+  }
+
+  function stepTab(project, delta) {
+    if (!project || project.open.length < 2) return;
+    const index = project.open.findIndex(tab => tab.path === project.activePath);
+    if (index < 0) return;
+    activateTab(project, project.open[(index + delta + project.open.length) % project.open.length].path);
   }
 
   async function closeAllTabs(project) {
@@ -1879,6 +2150,7 @@
         renderTabs(project);
         renderViewBar(project);
         renderNotice(project);
+        renderOutline(project);
         updateWorkspaceState();
         if (path === project.activePath) refreshContextPreview(project);
       }
@@ -2154,6 +2426,8 @@
     project.sessions.sort((left, right) => (Number(Boolean(right.pinned)) - Number(Boolean(left.pinned)))
       || ((right.updated || 0) - (left.updated || 0)));
   }
+
+  let sessionsSearchTimer = 0;
 
   function renderSessions(project) {
     if (!isActive(project)) return;
@@ -2554,14 +2828,15 @@
       root.append(h("div", { class: "muted tiny ide-transcript-note",
         text: `Showing the last ${visible.length} of ${entries.length} entries. Export the conversation for the full log.` }));
     }
-    for (const entry of visible) {
-      const node = renderEntry(project, entry);
+    const eagerFrom = Math.max(0, visible.length - 2);
+    visible.forEach((entry, index) => {
+      const node = renderEntry(project, entry, { lazy: index < eagerFrom });
       root.append(node);
       if (entry.role === "tool" && entry.pending) {
         const pending = project.pendingTools.get(entry.call);
         if (pending) pending.card = node;
       }
-    }
+    });
     project.followOutput = true;
     scrollTranscript(project, true);
   }
@@ -2824,6 +3099,17 @@
     if (meta.leaderNote) {
       body.append(h("p", { class: "muted tiny ide-swarm-leader", text: meta.leaderNote }));
     }
+    if (Array.isArray(meta.criteria) && meta.criteria.length) {
+      const rows = h("ul", { class: "swarm-criteria" });
+      for (const item of meta.criteria) rows.append(h("li", { text: item }));
+      body.append(h("details", { class: "ide-swarm-section", open: false },
+        h("summary", { text: `Success criteria · ${meta.criteria.length}` }), rows));
+    }
+    const openGaps = [...(meta.gaps || []), ...(meta.unmetCriteria || [])];
+    if (openGaps.length) {
+      body.append(Studio.ui.callout("warning",
+        h("span", { text: `Open gaps: ${openGaps.slice(0, 6).join("; ")}` })));
+    }
     if (!agents.length) {
       body.append(h("p", { class: "muted tiny",
         text: pending ? "The leader is planning the team…" : "No agents reported." }));
@@ -2839,14 +3125,29 @@
           icon(state === "failed" ? "alert" : state === "done" ? "check" : "sparkle", "small"));
       const label = agent.label || agent.agent || agent.id || "Agent";
       const detail = h("div", { class: "ide-swarm-body" });
+      const plan = Array.isArray(agent.plan) ? agent.plan : [];
+      const planDone = plan.filter(step => step.status === "done").length;
       const facts = [];
       if (agent.role) facts.push(agent.role);
+      if (plan.length) facts.push(`plan ${planDone}/${plan.length}`);
       if (agent.score !== undefined && agent.score !== null) facts.push(`${agent.score}/5`);
       if (agent.version && agent.version > 1) facts.push(`v${agent.version}`);
       if (agent.steps) facts.push(`${agent.steps} step${agent.steps === 1 ? "" : "s"}`);
+      const retried = agent.tool_retries ?? agent.toolRetries ?? 0;
+      if (retried) facts.push(`${retried} tool retr${retried === 1 ? "y" : "ies"}`);
       if (agent.elapsed) facts.push(`${agent.elapsed}s`);
       if (facts.length) detail.append(h("p", { class: "muted tiny ide-swarm-facts", text: facts.join(" · ") }));
       if (agent.task) detail.append(h("p", { class: "muted tiny", text: agent.task }));
+      if (plan.length) {
+        const steps = h("ol", { class: "swarm-plan" });
+        for (const step of plan) {
+          steps.append(h("li", {
+            class: `swarm-plan-step ${step.status || "pending"}`,
+            text: step.text || "",
+          }));
+        }
+        detail.append(steps);
+      }
       if (agent.lastTool) detail.append(h("p", { class: "muted tiny", text: `Last tool: ${agent.lastTool}` }));
       if (agent.note && !agent.output) detail.append(h("p", { class: "muted tiny", text: agent.note }));
       if (agent.error) {
@@ -2981,7 +3282,7 @@
         actions)));
   }
 
-  function renderEntry(project, entry) {
+  function renderEntry(project, entry, options = {}) {
     if (!entry || !entry.role) return h("div");
     if (entry.role === "user") {
       return h("article", { class: "ide-entry user" },
@@ -2994,7 +3295,7 @@
     }
     if (entry.role === "assistant") {
       const bubble = h("div", { class: "ide-bubble assistant" });
-      Studio.markdown.into(bubble, entry.text || "");
+      Studio.markdown.into(bubble, entry.text || "", options.lazy ? { lazy: true } : undefined);
       return h("article", { class: "ide-entry assistant" },
         h("div", { class: "ide-entry-head" },
           h("span", { class: "ide-entry-glyph" }, icon("sparkle", "small")),
@@ -3156,6 +3457,7 @@
     if (trimmed.startsWith("{") || trimmed.startsWith("```json")) {
       clearTimeout(project.live.timer);
       project.live.status.textContent = "preparing a tool call";
+      Studio.markdown.reset(project.live.preview);
       project.live.preview.classList.remove("markdown");
       project.live.preview.textContent = "Preparing a tool call…";
       scrollLive(project);
@@ -3166,7 +3468,10 @@
     project.live.timer = setTimeout(() => {
       if (!project.live || !isActive(project)) return;
       const visible = project.liveText.slice(-20000);
-      Studio.markdown.into(project.live.preview, visible, { enhance: false });
+      /* Past the preview window the prefix changes on every tick, so the
+         append-only block cache no longer applies. */
+      if (project.liveText.length > 20000) Studio.markdown.reset(project.live.preview);
+      Studio.markdown.stream(project.live.preview, visible);
       scrollLive(project);
       scrollTranscript(project);
     }, 120);
@@ -3322,6 +3627,9 @@
             messageCount: event.output.messages || 0,
             reviewCount: Array.isArray(event.output.reviews) ? event.output.reviews.length : 0,
             memoryCount: event.output.blackboard || 0,
+            criteria: event.output.success_criteria || [],
+            gaps: event.output.gaps || [],
+            unmetCriteria: event.output.unmet_criteria || [],
           };
           if (Array.isArray(event.output.reviews)) target.swarmReviews = event.output.reviews;
           target.swarmChanged = event.output.changed_files || [];
@@ -3389,11 +3697,14 @@
             agent: agent.id || agent.agent, label: agent.label, role: agent.role,
             task: agent.task, tools: agent.tools, writes: agent.writes,
             status: agent.status || "queued", score: agent.score, version: agent.version,
+            plan: Array.isArray(agent.plan) ? agent.plan : [],
+            depends_on: Array.isArray(agent.depends_on) ? agent.depends_on : [],
           }));
           entry.swarmMeta = {
             ...(entry.swarmMeta || {}),
             strategy: event.strategy, rounds: event.rounds || 0,
             leaderNote: event.notes || (entry.swarmMeta && entry.swarmMeta.leaderNote),
+            criteria: Array.isArray(event.success_criteria) ? event.success_criteria : [],
             phase: "work",
           };
         }
@@ -3408,6 +3719,7 @@
           entry.swarmMeta = {
             ...(entry.swarmMeta || {}), phase: event.phase || (entry.swarmMeta || {}).phase,
             leaderNote: event.text || event.message || (entry.swarmMeta || {}).leaderNote,
+            gaps: Array.isArray(event.gaps) ? event.gaps : (entry.swarmMeta || {}).gaps,
           };
         }
         refreshSwarmCard(project, event.swarm, false);
@@ -3465,6 +3777,17 @@
         }
         break;
       }
+      case "swarm_agent_plan": {
+        const state = swarmAgentState(project, event);
+        if (state) {
+          if (Array.isArray(event.plan)) state.agent.plan = event.plan;
+          state.agent.planVersion = event.version;
+          state.agent.note = event.message || state.agent.note;
+          refreshSwarmCard(project, event.swarm, true);
+          setStatus(project, event.message || "A member updated its plan.");
+        }
+        break;
+      }
       case "swarm_agent_delta": {
         const state = swarmAgentState(project, event);
         if (state) {
@@ -3482,6 +3805,9 @@
             : event.phase === "revise" ? "revising" : "tool";
           state.agent.lastTool = event.tool || "";
           state.agent.note = event.message || "";
+          if (Number(event.attempts) > 1) {
+            state.agent.toolRetries = (Number(state.agent.toolRetries) || 0) + 1;
+          }
           refreshSwarmCard(project, event.swarm, true);
           setStatus(project, `${state.agent.label} is using ${toolLabel(event.tool)}…`);
         }
@@ -3550,6 +3876,11 @@
           state.agent.score = event.score !== undefined ? event.score : state.agent.score;
           state.agent.version = event.version || state.agent.version;
           state.agent.steps = event.steps || state.agent.steps;
+          if (event.tool_calls !== undefined) state.agent.tool_calls = event.tool_calls;
+          if (event.tool_failures !== undefined) state.agent.tool_failures = event.tool_failures;
+          if (event.tool_retries !== undefined) state.agent.tool_retries = event.tool_retries;
+          if (Array.isArray(event.plan)) state.agent.plan = event.plan;
+          if (Array.isArray(event.depends_on)) state.agent.depends_on = event.depends_on;
           state.agent.text = "";
           if (event.phase) {
             state.entry.swarmMeta = { ...(state.entry.swarmMeta || {}), phase: event.phase, round: event.round || 0 };
@@ -3575,6 +3906,10 @@
             messageCount: event.messages ?? (entry.swarmMeta || {}).messageCount,
             reviewCount: event.reviews ?? (entry.swarmMeta || {}).reviewCount,
             memoryCount: event.blackboard ?? (entry.swarmMeta || {}).memoryCount,
+            criteria: Array.isArray(event.success_criteria)
+              ? event.success_criteria : (entry.swarmMeta || {}).criteria,
+            unmetCriteria: Array.isArray(event.unmet_criteria)
+              ? event.unmet_criteria : (entry.swarmMeta || {}).unmetCriteria,
           };
           if (Array.isArray(event.changed_files)) entry.swarmChanged = event.changed_files;
         }
@@ -4101,21 +4436,12 @@
     return name ? `${base}/${encodeURIComponent(name)}` : base;
   }
 
-  function useSkill(project, skill, view) {
-    const message = $("ide-message");
-    const directive = `Use the skill "${skill.id}" (${skill.name}) when it fits. Read it with skill.read first.`;
-    message.value = message.value ? `${directive}\n\n${message.value}` : directive;
-    onComposerInput();
-    if (view) view.close();
-    message.focus();
-  }
-
   function openSkillEditor(project, skill) {
     const isNew = !skill;
     const view = Studio.overlay.modal({
       key: `ide-skill-edit:${isNew ? "new" : skill.id}`,
       title: isNew ? "New coding skill" : `Edit ${skill.name}`,
-      subtitle: "A skill is a SKILL.md instruction pack the agent reads only when the task matches it.",
+      subtitle: "A skill is a SKILL.md instruction pack the agent loads automatically when the task matches it.",
       wide: true,
     });
     if (view.reused) return;
@@ -4222,7 +4548,7 @@
     const view = Studio.overlay.modal({
       key: "ide-skills",
       title: "Coding skills",
-      subtitle: "Skills are SKILL.md instruction packs the agent can load with skill.read.",
+      subtitle: "All skills are available to the agent automatically; it loads the relevant ones when a task needs them.",
       wide: true,
     });
     if (view.reused) return;
@@ -4241,7 +4567,7 @@
         if (!skills.length) {
           body.append(Studio.ui.empty({
             compact: true, icon: "sparkle", title: "No skills yet",
-            text: "Create one here, or add .agents/skills/<name>/SKILL.md inside the project or ~/.agents/skills/<name>/SKILL.md for every project.",
+            text: "Create one here, or add .agents/skills/<name>/SKILL.md inside the project or ~/.agents/skills/<name>/SKILL.md for every project. The agent uses it automatically.",
           }));
           return;
         }
@@ -4253,7 +4579,6 @@
               h("p", { class: "muted tiny", text: skill.description || "No description" }),
               h("code", { class: "tiny", text: skill.id })),
             h("div", { class: "row wrap" },
-              Studio.ui.button("Use", { small: true, kind: "primary", onclick: () => useSkill(project, skill, view) }),
               Studio.ui.button("Edit", { small: true, onclick: () => editSkill(project, skill.id) }),
               Studio.ui.button("Delete", { small: true, kind: "ghost",
                 onclick: () => removeSkill(project, skill) }))));
@@ -4267,54 +4592,454 @@
   }
 
   /* -- quick open and @-mentions ------------------------------------------- */
+  function openProjectSearch() {
+    const project = activeProject();
+    if (!project) return;
+    showExplorer("search");
+    const input = $("ide-search-query");
+    input.focus();
+    if (typeof input.select === "function") input.select();
+  }
+
+  function showIdeShortcuts() {
+    const groups = [
+      ["Files and tabs", [
+        ["Ctrl+P", "Quick open a file"],
+        ["Ctrl+Shift+O", "Go to a symbol in the active file"],
+        ["Ctrl+Shift+T", "Reopen the closed tab"],
+        ["Ctrl+W", "Close the active tab"],
+        ["Ctrl+PageUp / PageDown", "Previous or next tab"],
+        ["Ctrl+S", "Save the active file"],
+        ["Ctrl+Shift+F", "Search the project"],
+        ["Ctrl+Shift+E", "Focus the file explorer"],
+      ]],
+      ["Editing", [
+        ["Ctrl+F / Ctrl+H", "Find or replace in the file"],
+        ["Ctrl+G", "Go to a line"],
+        ["Ctrl+/", "Toggle a line comment"],
+        ["Alt+Up / Down", "Move selected lines"],
+        ["Ctrl+Shift+D", "Duplicate the line or selection"],
+        ["Ctrl+M", "Tab moves focus"],
+      ]],
+      ["Panels and commands", [
+        ["Ctrl+K or Ctrl+Shift+P", "Open the command palette"],
+        ["Ctrl+B", "Toggle the explorer"],
+        ["Ctrl+Shift+B", "Toggle the agent panel"],
+        ["Ctrl+= / Ctrl+- / Ctrl+0", "Editor font larger, smaller, reset"],
+        ["Ctrl+Shift+?", "Show these shortcuts"],
+      ]],
+      ["Agent", [
+        ["Ctrl+Enter", "Send the task"],
+        ["Shift+Enter", "Insert a line break"],
+      ]],
+    ];
+    const handle = Studio.overlay.modal({
+      key: "ide-shortcuts", title: "IDE keyboard shortcuts",
+      subtitle: "Every command in this list is also searchable in the command palette.",
+      wide: true,
+    });
+    if (handle.reused) return;
+    handle.body.append(h("div", { class: "grid-2" }, groups.map(([title, rows]) => h("section", { class: "stack tight" },
+      h("h3", { text: title }),
+      h("div", { class: "stack tight" }, rows.map(([keys, description]) => h("div", { class: "ide-shortcut-row" },
+        h("span", { text: description }), h("kbd", { text: keys }))))))));
+    handle.footer.append(Studio.ui.button("Done", { kind: "primary", onclick: handle.close }));
+  }
+
+  function registerPaletteCommands() {
+    if (commandsRegistered || !Studio.palette) return;
+    commandsRegistered = true;
+    const ide = () => Studio.views.current === "ide";
+    const project = () => ide() && Boolean(activeProject());
+    const tab = () => ide() && Boolean(activeTab(activeProject()));
+    const editor = () => {
+      const current = activeTab(activeProject());
+      return ide() && Boolean(current && current.editor);
+    };
+    const add = (label, hint, glyph, when, action, keywords = "") => Studio.palette.add({
+      label, hint: `IDE · ${hint}`, glyph, when, action, keywords,
+    });
+    add("Quick open a file", "Ctrl+P", "search", project, openQuickOpen);
+    add("Go to a symbol in the active file", "Ctrl+Shift+O", "search", tab, openSymbolPicker,
+      "outline jump navigate");
+    add("Show the file outline", "Action", "sidebar", tab, () => {
+      showExplorer("outline");
+      renderOutline(activeProject());
+    }, "symbols structure");
+    add("Search the project", "Ctrl+Shift+F", "search", project, openProjectSearch, "find grep");
+    add("Focus the file explorer", "Ctrl+Shift+E", "sidebar", project, () => {
+      showExplorer("files");
+      $("ide-file-filter").focus();
+    });
+    add("Save the active file", "Ctrl+S", "check", tab, saveActive);
+    add("Save all changed files", "Action", "check", project, () => {
+      const current = activeProject();
+      if (current) saveAllDirty(current);
+    }, "write");
+    add("Go to line", "Ctrl+G", "file", editor, () => {
+      const current = activeTab(activeProject());
+      if (current && current.editor) current.editor.goToLineDialog();
+    });
+    add("Find in the active file", "Ctrl+F", "search", editor, () => {
+      const current = activeTab(activeProject());
+      if (current && current.editor) current.editor.openFind(false);
+    });
+    add("Replace in the active file", "Ctrl+H", "edit", editor, () => {
+      const current = activeTab(activeProject());
+      if (current && current.editor) current.editor.openFind(true);
+    });
+    add("Insert the editor selection into the task", "Action", "edit", editor, insertEditorSelection, "snippet code");
+    add("Reopen the closed tab", "Ctrl+Shift+T", "undo", project, () => reopenClosedTab(activeProject()), "restore");
+    add("Close the active tab", "Ctrl+W", "x", tab, () => {
+      const current = activeProject();
+      const active = activeTab(current);
+      if (current && active) closeTab(current, active.path);
+    });
+    add("Next open tab", "Ctrl+PageDown", "chevron-right", project, () => stepTab(activeProject(), 1));
+    add("Previous open tab", "Ctrl+PageUp", "chevron-left", project, () => stepTab(activeProject(), -1));
+    add("Toggle the explorer", "Ctrl+B", "sidebar", ide, () => { if (layout) layout.toggle("sidebar"); });
+    add("Toggle the agent panel", "Ctrl+Shift+B", "chat", ide, () => { if (layout) layout.toggle("agent"); });
+    add("Toggle focus mode", "Editor only", "fit", ide, toggleFocusMode, "zen panes");
+    add("Increase the editor font", "Ctrl+=", "zoom-in", editor, () => setEditorFontSize(editorFontSize() + 1), "zoom text");
+    add("Decrease the editor font", "Ctrl+-", "zoom-out", editor, () => setEditorFontSize(editorFontSize() - 1), "zoom text");
+    add("Reset the editor font", "Ctrl+0", "refresh", editor, () => setEditorFontSize(DEFAULT_EDITOR_FONT), "zoom text");
+    add("Reveal the active file in the explorer", "Action", "folder", tab, () => {
+      const current = activeProject();
+      const active = activeTab(current);
+      if (current && active) openBreadcrumbPath(current, active.path);
+    });
+    add("Pin the active file to the agent context", "Action", "pin", tab, () => {
+      const current = activeProject();
+      const active = activeTab(current);
+      if (current && active) addContextPath(current, active.path);
+    }, "context");
+    add("New file", "Action", "plus", project, () => newFile(activeProject(), ""), "create");
+    add("New folder", "Action", "folder", project, () => newFolder(activeProject(), ""), "create");
+    add("New conversation", "Action", "chat", project, () => newSession(activeProject()));
+    add("Check the project", "Action", "check", project, () => $("ide-check").click(), "diagnostics");
+    add("Refresh the explorer", "Action", "refresh", project, () => {
+      const current = activeProject();
+      if (current) Studio.run(() => refreshTree(current, { deep: true }));
+    }, "reload");
+    add("Revert this conversation's edits", "Action", "undo", project, () => $("ide-revert").click(), "restore");
+    add("Show keyboard shortcuts", "Ctrl+Shift+?", "info", ide, showIdeShortcuts, "keys help");
+  }
+
   function openQuickOpen() {
     const project = activeProject();
     if (!project) return;
     const handle = Studio.overlay.modal({
       key: `ide-quick-open:${project.id}`, title: "Quick open",
-      subtitle: "Search every file in this project; Enter opens the first result.",
+      subtitle: "Search every file; use the arrow keys to choose and Enter to open.",
       narrow: false,
     });
     if (handle.reused) return;
-    const input = h("input", { type: "search", placeholder: "File name or path…", "aria-label": "Quick open file" });
-    const list = h("div", { class: "ide-quick-list" });
+    const input = h("input", {
+      type: "search", placeholder: "File name or path…", "aria-label": "Quick open file",
+      role: "combobox", "aria-expanded": "true", "aria-controls": "ide-quick-results",
+      autocomplete: "off", spellcheck: false,
+    });
+    const list = h("div", { class: "ide-quick-list", id: "ide-quick-results", role: "listbox", "aria-label": "Matching files" });
     let rows = [];
+    let selected = 0;
+    let shownQuery = "";
     let timer = null;
+    let token = 0;
+
+    function paint() {
+      Studio.ui.render(list);
+      if (!rows.length) {
+        list.append(h("p", { class: "muted tiny", text: input.value.trim() ? "No file matches." : "Type to search every file in this project." }));
+        input.removeAttribute("aria-activedescendant");
+        return;
+      }
+      selected = Math.max(0, Math.min(selected, rows.length - 1));
+      const tabs = new Map(project.open.map(tab => [tab.path, tab]));
+      rows.forEach((item, index) => {
+        const tab = tabs.get(item.path);
+        const suffix = tab && tab.dirty ? "Edited" : tab ? "Open" : item.recent ? "Recent" : item.bytes ? format.bytes(item.bytes) : "";
+        list.append(h("button", {
+          id: `ide-quick-option-${index}`, class: `ide-quick-row${index === selected ? " active" : ""}`,
+          type: "button", role: "option", "aria-selected": String(index === selected),
+          onclick: () => choose(index),
+        }, icon(tab && tab.kind !== "text" ? "eye" : "file", "small"),
+        h("span", { class: "grow truncate", text: item.path }),
+        suffix ? h("span", { class: "muted tiny", text: suffix }) : null));
+      });
+      input.setAttribute("aria-activedescendant", `ide-quick-option-${selected}`);
+    }
+
+    function choose(index) {
+      if (input.value.trim() !== shownQuery) { search(); return; }
+      const item = rows[index];
+      if (!item) return;
+      handle.close();
+      openFile(item.path);
+    }
+
+    function setRows(next, query) {
+      rows = next;
+      shownQuery = query;
+      selected = 0;
+      paint();
+    }
+
     async function search() {
-      try {
-        const data = await api(`/api/ide/workspaces/${encodeURIComponent(project.id)}/files`
-          + Studio.query({ query: input.value.trim(), limit: 80 }));
-        rows = data.files || [];
-        Studio.ui.render(list);
-        if (!rows.length) {
-          list.append(h("p", { class: "muted tiny", text: "No file matches." }));
+      const query = input.value.trim();
+      const request = ++token;
+      if (!query) {
+        const recent = recentPaths(project).map(path => ({ path, recent: true }));
+        const seen = new Set(recent.map(item => item.path));
+        const open = project.open.map(tab => ({ path: tab.path })).filter(item => !seen.has(item.path));
+        if (recent.length || open.length) {
+          setRows(recent.concat(open), query);
           return;
         }
-        for (const row of rows) {
-          list.append(h("button", {
-            class: "ide-quick-row", type: "button",
-            onclick: () => { handle.close(); openFile(row.path); },
-          }, icon("file", "small"), h("span", { class: "grow truncate", text: row.path }),
-          h("span", { class: "muted tiny", text: format.bytes(row.bytes) })));
-        }
+      }
+      try {
+        const data = await api(`/api/ide/workspaces/${encodeURIComponent(project.id)}/files`
+          + Studio.query({ query, limit: 80 }));
+        if (request !== token) return;
+        setRows(data.files || [], query);
       } catch (error) {
+        if (request !== token) return;
         Studio.ui.render(list, Studio.ui.callout("danger", h("span", { text: error.message })));
       }
     }
+
     input.addEventListener("input", () => {
       clearTimeout(timer);
-      timer = setTimeout(search, 160);
+      timer = setTimeout(search, 140);
     });
     input.addEventListener("keydown", event => {
-      if (event.key !== "Enter") return;
+      if (event.key === "ArrowDown") selected = Math.min(Math.max(0, rows.length - 1), selected + 1);
+      else if (event.key === "ArrowUp") selected = Math.max(0, selected - 1);
+      else if (event.key === "Home") selected = 0;
+      else if (event.key === "End") selected = Math.max(0, rows.length - 1);
+      else if (event.key === "Enter") { event.preventDefault(); choose(selected); return; }
+      else return;
       event.preventDefault();
-      if (rows.length) {
-        handle.close();
-        openFile(rows[0].path);
-      }
+      paint();
+      const active = list.children[selected];
+      if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
     });
     Studio.ui.render(handle.body, input, list);
     search();
+    input.focus();
+  }
+
+  /* -- outline and symbols -------------------------------------------------- */
+  /* The outline is heuristic and cached per tab until its text or language
+     changes, so opening the panel or moving the cursor never re-scans the file. */
+  function outlineFor(tab) {
+    if (!tab || tab.kind !== "text" || !Studio.symbols) return [];
+    if (tab.symbols && tab.symbolsSource === tab.content && tab.symbolsLanguage === tab.language) {
+      return tab.symbols;
+    }
+    const symbols = Studio.symbols.extract(tab.content, tab.language, tab.path);
+    tab.symbols = symbols;
+    tab.symbolsSource = tab.content;
+    tab.symbolsLanguage = tab.language;
+    return symbols;
+  }
+
+  function outlineKind(symbol) {
+    if (symbol.kind === "heading") return symbol.level ? `h${symbol.level}` : "h";
+    return OUTLINE_KINDS[symbol.kind] || symbol.kind || "sym";
+  }
+
+  function outlineNote(text) {
+    return h("p", { class: "muted tiny ide-outline-empty", text });
+  }
+
+  function scheduleOutline(project) {
+    if (!project || $("ide-outline-panel").classList.contains("hidden")) return;
+    clearTimeout(outlineTimer);
+    outlineTimer = setTimeout(() => {
+      outlineTimer = null;
+      if (isActive(project)) renderOutline(project);
+    }, OUTLINE_DEBOUNCE);
+  }
+
+  function markOutlineLine(line) {
+    if (!outlineElements.length) return;
+    let low = 0;
+    let high = outlineElements.length - 1;
+    let found = -1;
+    while (low <= high) {
+      const middle = (low + high) >> 1;
+      if (outlineElements[middle].line <= line) {
+        found = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    const target = found >= 0 ? outlineElements[found].element : null;
+    if (target === outlineActive) return;
+    if (outlineActive) outlineActive.classList.remove("active");
+    outlineActive = target;
+    if (outlineActive) outlineActive.classList.add("active");
+  }
+
+  function markOutlineCursor(tab) {
+    if (tab && tab.editor && editorHostTab === tab) markOutlineLine(tab.editor.position.index + 1);
+  }
+
+  function renderOutline(project) {
+    if ($("ide-outline-panel").classList.contains("hidden")) return;
+    const root = $("ide-outline");
+    const filter = $("ide-outline-filter");
+    const tab = project ? activeTab(project) : null;
+    const key = project && tab ? `${project.id}\u0000${tab.path}` : "";
+    if (key !== outlineKey) {
+      outlineKey = key;
+      filter.value = "";
+    }
+    const symbols = project ? outlineFor(tab) : [];
+    const query = filter.value.trim().toLowerCase();
+    const visible = query
+      ? symbols.filter(item => item.name.toLowerCase().includes(query)) : symbols;
+    const signature = JSON.stringify([
+      project ? project.id : "", tab ? tab.path : "", tab ? tab.language : "", query,
+      tab && tab.partial ? 1 : 0,
+      visible.map(item => [item.name, item.kind, item.level || 0, item.line, item.depth || 0]),
+    ]);
+    if (signature === outlineSignature && outlineTab === tab && root.childElementCount) {
+      markOutlineCursor(tab);
+      return;
+    }
+    outlineSignature = signature;
+    outlineTab = tab;
+    outlineElements = [];
+    outlineActive = null;
+    Studio.ui.render(root);
+    if (!project) {
+      root.append(outlineNote("Open a project to see its outline."));
+      return;
+    }
+    if (!tab) {
+      root.append(outlineNote("Open a file to see its symbols."));
+      return;
+    }
+    if (tab.kind !== "text") {
+      root.append(outlineNote("Binary files have no outline."));
+      return;
+    }
+    if (!symbols.length) {
+      root.append(outlineNote("No symbols found in this file."));
+      return;
+    }
+    if (!visible.length) {
+      root.append(outlineNote("No symbol matches the filter."));
+      return;
+    }
+    for (const symbol of visible) {
+      const row = h("button", {
+        class: "ide-outline-row", type: "button",
+        "data-depth": String(Math.min(6, Math.max(0, symbol.depth || 0))),
+        "data-line": String(symbol.line),
+        title: `${symbol.name} — line ${symbol.line}`,
+        onclick: () => gotoSymbol(project, tab, symbol),
+      }, h("span", { class: "ide-outline-kind", text: outlineKind(symbol) }),
+        h("span", { class: "grow truncate", text: symbol.name }),
+        h("span", { class: "ide-outline-line", text: String(symbol.line) }));
+      root.append(row);
+      outlineElements.push({ line: symbol.line, element: row });
+    }
+    if (tab.partial) {
+      root.append(outlineNote("Showing symbols in the loaded part of this large file."));
+    }
+    markOutlineCursor(tab);
+  }
+
+  function gotoSymbol(project, tab, symbol) {
+    if (!project || !tab || !symbol || tab.kind !== "text") return;
+    if (project.activePath !== tab.path) activateTab(project, tab.path);
+    if (tab.view !== "code") {
+      tab.view = "code";
+      renderViewBar(project);
+      mountEditor(project);
+    }
+    if (tab.editor) tab.editor.gotoLine(symbol.line);
+    markOutlineLine(symbol.line);
+  }
+
+  function openSymbolPicker() {
+    const project = activeProject();
+    const tab = activeTab(project);
+    if (!project || !tab || tab.kind !== "text") return;
+    const symbols = outlineFor(tab);
+    const handle = Studio.overlay.modal({
+      key: `ide-symbols:${project.id}:${tab.path}`, title: "Go to symbol",
+      subtitle: "Symbols in the active file. Arrow keys choose; Enter jumps to the line.",
+      narrow: false,
+    });
+    if (handle.reused) return;
+    const input = h("input", {
+      type: "search", placeholder: "Symbol name…", "aria-label": "Go to symbol",
+      role: "combobox", "aria-expanded": "true", "aria-controls": "ide-symbol-results",
+      autocomplete: "off", spellcheck: false,
+    });
+    const list = h("div", {
+      class: "ide-quick-list", id: "ide-symbol-results", role: "listbox", "aria-label": "Matching symbols",
+    });
+    let rows = [];
+    let selected = 0;
+
+    function paint() {
+      Studio.ui.render(list);
+      if (!rows.length) {
+        list.append(h("p", {
+          class: "muted tiny",
+          text: symbols.length ? "No symbol matches." : "This file has no symbols to jump to.",
+        }));
+        input.removeAttribute("aria-activedescendant");
+        return;
+      }
+      selected = Math.max(0, Math.min(selected, rows.length - 1));
+      rows.forEach((symbol, index) => {
+        list.append(h("button", {
+          id: `ide-symbol-option-${index}`,
+          class: `ide-quick-row${index === selected ? " active" : ""}`,
+          type: "button", role: "option", "aria-selected": String(index === selected),
+          onclick: () => choose(index),
+        }, h("span", { class: "ide-outline-kind", text: outlineKind(symbol) }),
+          h("span", { class: "grow truncate", text: symbol.name }),
+          h("span", { class: "muted tiny", text: `Ln ${symbol.line}` })));
+      });
+      input.setAttribute("aria-activedescendant", `ide-symbol-option-${selected}`);
+    }
+
+    function choose(index) {
+      const symbol = rows[index];
+      if (!symbol) return;
+      handle.close();
+      gotoSymbol(project, tab, symbol);
+    }
+
+    function filter() {
+      const query = input.value.trim().toLowerCase();
+      rows = query ? symbols.filter(item => item.name.toLowerCase().includes(query)) : symbols.slice();
+      selected = 0;
+      paint();
+    }
+
+    input.addEventListener("input", filter);
+    input.addEventListener("keydown", event => {
+      if (event.key === "ArrowDown") selected = Math.min(Math.max(0, rows.length - 1), selected + 1);
+      else if (event.key === "ArrowUp") selected = Math.max(0, selected - 1);
+      else if (event.key === "Home") selected = 0;
+      else if (event.key === "End") selected = Math.max(0, rows.length - 1);
+      else if (event.key === "Enter") { event.preventDefault(); choose(selected); return; }
+      else return;
+      event.preventDefault();
+      paint();
+      const active = list.children[selected];
+      if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+    });
+    Studio.ui.render(handle.body, input, list);
+    filter();
     input.focus();
   }
 
@@ -4388,6 +5113,48 @@
     });
     project.mention = { handle };
     search();
+    input.focus();
+  }
+
+  function codeFence(source) {
+    const runs = String(source || "").match(/`+/g) || [];
+    let size = 3;
+    for (const run of runs) size = Math.max(size, run.length + 1);
+    return "`".repeat(size);
+  }
+
+  function insertEditorSelection() {
+    const project = activeProject();
+    const tab = project && activeTab(project);
+    if (!tab || !tab.editor) {
+      Studio.toast("Open a code file in the editor first.", "info");
+      return;
+    }
+    const start = tab.editor.input.selectionStart;
+    const end = tab.editor.input.selectionEnd;
+    if (start === end) {
+      Studio.toast("Select the code to insert in the editor first.", "info");
+      return;
+    }
+    const selected = tab.editor.value.slice(start, end);
+    if (!selected.trim()) {
+      Studio.toast("The selection is empty.", "info");
+      return;
+    }
+    if (selected.length > MAX_INSERTED_SELECTION) {
+      Studio.toast(`Insert at most ${format.compact(MAX_INSERTED_SELECTION)} characters; select a smaller block.`, "info");
+      return;
+    }
+    const language = String(tab.language || "").replace(/[^\w+#.-]/g, "").slice(0, 40);
+    const fence = codeFence(selected);
+    const snippet = `From ${tab.path}:\n${fence}${language}\n${selected}\n${fence}`;
+    const input = $("ide-message");
+    const at = input.selectionStart === undefined ? input.value.length : input.selectionStart;
+    const insertionEnd = input.selectionEnd === undefined ? at : input.selectionEnd;
+    const before = input.value.slice(0, at);
+    const prefix = before && !/\n\s*$/.test(before) ? "\n\n" : "";
+    input.setRangeText(`${prefix}${snippet}\n`, at, insertionEnd, "end");
+    onComposerInput();
     input.focus();
   }
 
@@ -4601,10 +5368,8 @@
         icon: "chat", hint: agentAuto ? null : "Ctrl+Shift+B", disabled: agentAuto,
         title: agentAuto ? "Widen the window, stack the panes or reset the layout to make room" : null,
         onSelect: () => layout.toggle("agent") },
-      { label: "Editor only", icon: "file", onSelect: () => {
-        layout.setCollapsed("sidebar", true);
-        layout.setCollapsed("agent", true);
-      } },
+      { label: view.sidebar.collapsed && view.agent.collapsed ? "Show side panels" : "Focus editor only",
+        icon: "fit", onSelect: toggleFocusMode },
       "separator",
       { label: "Reset panel sizes", icon: "refresh", onSelect: () => layout.reset() },
     ], { label: "Layout options", align: "end" });
@@ -4653,6 +5418,7 @@
       }));
       $("ide-session-title").textContent = "No project";
     }
+    renderOutline(project || null);
     updateWorkspaceState();
   }
 
@@ -4672,9 +5438,12 @@
         "ide-new-folder": "folder", "ide-provider-menu": "globe", "ide-quick-open": "search",
         "ide-session-menu": "more", "ide-context-add": "pin", "ide-context-manage": "settings",
         "ide-prompt-menu": "sparkle", "ide-delete-session": "trash", "ide-search-run": "search",
+        "ide-use-selection": "edit",
       })) putIcon(id, name);
 
-      const sidebarTabs = Studio.ui.tabs($("ide-files-panel").parentElement.querySelector(".ide-sidebar-tabs"));
+      sidebarTabs = Studio.ui.tabs($("ide-files-panel").parentElement.querySelector(".ide-sidebar-tabs"), name => {
+        if (name === "outline") renderOutline(activeProject());
+      });
       sidebarTabs.select("files", false);
       const mode = Studio.ui.segmented($("ide-mode"), value => {
         state.mode = value;
@@ -4711,6 +5480,7 @@
       });
       $("ide-provider-menu").addEventListener("click", event => Studio.providers.menu(event.currentTarget));
       $("ide-quick-open").addEventListener("click", openQuickOpen);
+      $("ide-outline-filter").addEventListener("input", () => renderOutline(activeProject()));
       $("ide-new-workspace").addEventListener("click", newWorkspace);
       $("ide-open-folder").addEventListener("click", openFolder);
       $("ide-refresh").addEventListener("click", () => {
@@ -4727,6 +5497,11 @@
         if (layout) layout.toggle("agent");
       });
       $("ide-layout-menu").addEventListener("click", event => openLayoutMenu(event.currentTarget));
+      $("ide-file-tabs").addEventListener("wheel", event => {
+        if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+        event.preventDefault();
+        event.currentTarget.scrollLeft += event.deltaY;
+      }, { passive: false });
       $("ide-file-filter").addEventListener("input", onFilterInput);
       $("ide-new-file").addEventListener("click", () => newFile(activeProject(), ""));
       $("ide-new-folder").addEventListener("click", () => newFolder(activeProject(), ""));
@@ -4738,7 +5513,12 @@
         const project = activeProject();
         if (!project) return;
         project.sessionSearch = event.target.value;
-        renderSessions(project);
+        clearTimeout(sessionsSearchTimer);
+        sessionsSearchTimer = setTimeout(() => {
+          sessionsSearchTimer = 0;
+          const current = activeProject();
+          if (current) renderSessions(current);
+        }, 120);
       });
       $("ide-new-session").addEventListener("click", () => newSession(activeProject()));
       $("ide-delete-session").addEventListener("click", () => {
@@ -4769,6 +5549,7 @@
         if (project) openContextDialog(project);
         else Studio.toast("Open a project first.", "info");
       });
+      $("ide-use-selection").addEventListener("click", insertEditorSelection);
       $("ide-context-manage").addEventListener("click", () => {
         const project = activeProject();
         if (project) openContextDialog(project);
@@ -4837,6 +5618,38 @@
           state.treeFrame = null;
           paintTreeWindow(activeProject());
         });
+      }, { passive: true });
+      $("ide-tree").addEventListener("keydown", event => {
+        const project = activeProject();
+        if (!project) return;
+        const target = event.target.closest(".ide-tree-row");
+        if (!target || !target.dataset.path) return;
+        const index = project.rows.findIndex(row => row.node.path === target.dataset.path);
+        if (index < 0) return;
+        const row = project.rows[index];
+        if (event.key === "ArrowDown") { event.preventDefault(); focusTreeIndex(project, index + 1); return; }
+        if (event.key === "ArrowUp") { event.preventDefault(); focusTreeIndex(project, index - 1); return; }
+        if (event.key === "Home") { event.preventDefault(); focusTreeIndex(project, 0); return; }
+        if (event.key === "End") { event.preventDefault(); focusTreeIndex(project, project.rows.length - 1); return; }
+        if (row.flat) return;
+        if (event.key === "ArrowRight" && row.node.type === "dir") {
+          event.preventDefault();
+          if (!project.expanded.has(row.node.path)) {
+            toggleFolder(project, row.node).then(() => focusTreeIndex(project, index));
+          } else focusTreeIndex(project, index + 1);
+        } else if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          if (row.node.type === "dir" && project.expanded.has(row.node.path)) {
+            toggleFolder(project, row.node).then(() => focusTreeIndex(project, index));
+          } else {
+            for (let parent = index - 1; parent >= 0; parent -= 1) {
+              if (project.rows[parent].depth === row.depth - 1) {
+                focusTreeIndex(project, parent);
+                break;
+              }
+            }
+          }
+        }
       });
       $("ide-tree").addEventListener("contextmenu", event => {
         if (event.target.closest(".ide-tree-row")) return;
@@ -4874,6 +5687,62 @@
         if (Studio.views.current !== "ide" || !layout) return false;
         layout.toggle("agent");
       });
+      Studio.shortcut("mod+shift+p", () => {
+        if (Studio.views.current !== "ide" || !Studio.palette) return false;
+        Studio.palette.open();
+      });
+      Studio.shortcut("mod+shift+o", () => {
+        if (Studio.views.current !== "ide") return false;
+        openSymbolPicker();
+      });
+      Studio.shortcut("mod+shift+t", () => {
+        if (Studio.views.current !== "ide") return false;
+        const project = activeProject();
+        if (!project) return false;
+        reopenClosedTab(project);
+      });
+      Studio.shortcut("mod+shift+f", () => {
+        if (Studio.views.current !== "ide") return false;
+        openProjectSearch();
+      });
+      Studio.shortcut("mod+shift+e", () => {
+        if (Studio.views.current !== "ide") return false;
+        showExplorer("files");
+        $("ide-file-filter").focus();
+      });
+      Studio.shortcut("mod+pageup", () => {
+        if (Studio.views.current !== "ide") return false;
+        stepTab(activeProject(), -1);
+      });
+      Studio.shortcut("mod+pagedown", () => {
+        if (Studio.views.current !== "ide") return false;
+        stepTab(activeProject(), 1);
+      });
+      const increaseFont = () => {
+        if (Studio.views.current !== "ide") return false;
+        setEditorFontSize(editorFontSize() + 1);
+      };
+      Studio.shortcut("mod+=", increaseFont);
+      Studio.shortcut("mod+shift+=", increaseFont);
+      Studio.shortcut("mod++", increaseFont);
+      Studio.shortcut("mod+shift++", increaseFont);
+      Studio.shortcut("mod+-", () => {
+        if (Studio.views.current !== "ide") return false;
+        setEditorFontSize(editorFontSize() - 1);
+      });
+      Studio.shortcut("mod+shift+_", () => {
+        if (Studio.views.current !== "ide") return false;
+        setEditorFontSize(editorFontSize() - 1);
+      });
+      Studio.shortcut("mod+0", () => {
+        if (Studio.views.current !== "ide") return false;
+        setEditorFontSize(DEFAULT_EDITOR_FONT);
+      });
+      Studio.shortcut("mod+shift+?", () => {
+        if (Studio.views.current !== "ide") return false;
+        showIdeShortcuts();
+      });
+      registerPaletteCommands();
       window.addEventListener("beforeunload", event => {
         if (state.projects.some(id => (state.data.get(id) || { open: [] }).open.some(tab => tab.dirty))) {
           event.preventDefault();

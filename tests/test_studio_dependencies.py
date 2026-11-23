@@ -41,12 +41,30 @@ def test_status_lists_groups_and_missing_packages(registry, monkeypatch):
     assert [group["id"] for group in status["groups"]] == ["core", "finetune", "export", "data"]
     assert status["missing"] == ["finetune", "export", "data"]
     assert status["missing_packages"] == [
-        "transformers", "safetensors", "gguf", "onnx", "onnxruntime",
-        "datasets", "huggingface-hub", "pyarrow",
+        "transformers", "safetensors", "bitsandbytes", "accelerate",
+        "gguf", "onnx", "onnxruntime", "datasets", "huggingface-hub", "pyarrow",
     ]
     assert status["installed"] is False and status["auto_install"] is False
     assert status["pip"] is True and status["busy"] is False and status["job"] is None
     assert status["python"] == sys.executable
+
+
+def test_platform_markers_are_evaluated_conservatively(tmp_path, monkeypatch):
+    from mariana.studio import dependencies
+
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        'linux-only; platform_system == "Linux"\n'
+        'mac-only; platform_system == "Darwin"\n'
+        'always>=1\n'
+        'unknown; python_version < "3.12"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(dependencies.platform, "system", lambda: "Linux")
+    assert [item["name"] for item in dependencies._packages(path)[0]] == [
+        "linux-only", "always", "unknown"]
+    monkeypatch.setattr(dependencies.platform, "system", lambda: "Darwin")
+    assert [item["name"] for item in dependencies._packages(path)[0]] == [
+        "mac-only", "always", "unknown"]
 
 
 def test_auto_install_preference_and_environment_override(registry, monkeypatch):

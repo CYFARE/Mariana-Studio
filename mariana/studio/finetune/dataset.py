@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from array import array
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
@@ -31,7 +32,115 @@ MAX_OBJECT_BYTES = 256 << 20  # largest .json document parsed whole
 MIN_BLOCK_TOKENS = 8
 MAX_VALIDATION_EXAMPLES = 2000
 
-Example = tuple[list[int], list[int]]
+Example = tuple[Sequence[int], Sequence[int]]
+
+
+class ExampleStore(Sequence):
+    """Tokenized examples in two flat int32 tensors plus offsets.
+
+    A large corpus otherwise costs one Python int object per token (28 bytes or
+    more).  Storing both ids and labels contiguously cuts that to 8 bytes per
+    token and keeps random access and slicing cheap for the sampler.
+    """
+
+    def __init__(self, ids: torch.Tensor, labels: torch.Tensor, starts: array,
+                 lengths: array, buffers: tuple) -> None:
+        self._ids = ids
+        self._labels = labels
+        self._starts = starts
+        self._lengths = lengths
+        self._buffers = buffers  # frombuffer shares the array's memory
+        self.tokens = int(ids.numel()) if ids.numel() else 0
+
+    def __len__(self) -> int:
+        return len(self._starts)
+
+    def length(self, index: int) -> int:
+        return int(self._lengths[index])
+
+    @property
+    def lengths(self) -> array:
+        return self._lengths
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        start = int(self._starts[index])
+        stop = (int(self._starts[index + 1]) if index + 1 < len(self._starts)
+                else int(self._ids.numel()))
+        return self._ids[start:stop], self._labels[start:stop]
+
+
+class ExampleSubset(Sequence):
+    """A view over an :class:`ExampleStore`; splitting does not copy the tokens."""
+
+    def __init__(self, source: ExampleStore, indices: Iterable[int]) -> None:
+        self.source = source
+        self.indices = list(indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def length(self, index: int) -> int:
+        return self.source.length(self.indices[index])
+
+    @property
+    def lengths(self) -> list[int]:
+        return [self.source.length(index) for index in self.indices]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self.source[self.indices[item]]
+                    for item in range(*index.indices(len(self)))]
+        return self.source[self.indices[index]]
+
+
+class ExampleBuilder:
+    """Accumulate examples into compact arrays while enforcing memory caps."""
+
+    def __init__(self, max_tokens: int = 20_000_000, max_examples: int = 500_000):
+        self.max_tokens = max(0, int(max_tokens or 0))
+        self.max_examples = max(0, int(max_examples or 0))
+        self._ids = array("i")
+        self._labels = array("i")
+        self._starts = array("q")
+        self._lengths = array("q")
+        self.tokens = 0
+        self.skipped = 0
+
+    @property
+    def full(self) -> bool:
+        return bool((self.max_tokens and self.tokens >= self.max_tokens)
+                    or (self.max_examples and len(self._starts) >= self.max_examples))
+
+    def add(self, example: Example) -> bool:
+        ids, labels = example
+        length = len(ids)
+        if length == 0 or len(labels) != length:
+            return False
+        if self.full or (self.max_tokens and self.tokens + length > self.max_tokens):
+            self.skipped += 1
+            return False
+        self._starts.append(self.tokens)
+        self._lengths.append(length)
+        self._ids.extend(ids.tolist() if isinstance(ids, torch.Tensor) else list(ids))
+        self._labels.extend(labels.tolist() if isinstance(labels, torch.Tensor) else list(labels))
+        self.tokens += length
+        return True
+
+    def build(self) -> ExampleStore:
+        if self._ids:
+            ids = torch.frombuffer(self._ids, dtype=torch.int32)
+            labels = torch.frombuffer(self._labels, dtype=torch.int32)
+        else:
+            ids = torch.empty(0, dtype=torch.int32)
+            labels = torch.empty(0, dtype=torch.int32)
+        return ExampleStore(ids, labels, self._starts, self._lengths,
+                            (self._ids, self._labels))
 
 
 def transcript(messages: Iterable[dict]) -> str:
@@ -176,18 +285,24 @@ def find_chat_files(path: str | Path, sample_rows: int = 20) -> list[Path]:
 
 def load_chat_examples(files: Iterable[str | Path], max_examples: int | None = None) -> list[list[dict]]:
     """Read every chat example from ``files``; malformed rows are skipped, never fatal."""
-    examples: list[list[dict]] = []
+    return list(iter_chat_examples(files, max_examples))
+
+
+def iter_chat_examples(files: Iterable[str | Path],
+                       max_examples: int | None = None) -> Iterator[list[dict]]:
+    """Stream chat examples from ``files`` without materialising the whole dataset."""
+    seen = 0
     for path in files:
         try:
             for row in _iter_rows(Path(path)):
                 messages = normalize_row(row)
                 if messages:
-                    examples.append(messages)
-                    if max_examples and len(examples) >= max_examples:
-                        return examples
+                    yield messages
+                    seen += 1
+                    if max_examples and seen >= max_examples:
+                        return
         except OSError:
             continue
-    return examples
 
 
 def _token_ids(tokenizer, text: str) -> list[int]:
@@ -247,10 +362,9 @@ def encode_chat(tokenizer, messages: Sequence[dict], train_on: str = "assistant"
     return input_ids, labels
 
 
-def build_text_blocks(tokenizer, corpus_path: str | Path, block_size: int,
-                      max_tokens: int = 20_000_000) -> list[Example]:
-    """Tokenize a text file ~1 MB at a time and cut it into ``block_size``-token examples."""
-    examples: list[Example] = []
+def iter_text_blocks(tokenizer, corpus_path: str | Path, block_size: int,
+                     max_tokens: int = 20_000_000) -> Iterator[Example]:
+    """Tokenize a text file ~1 MB at a time and yield ``block_size``-token examples."""
     buffer: list[int] = []
     total = 0
     with open(corpus_path, encoding="utf-8", errors="replace") as handle:
@@ -262,25 +376,71 @@ def build_text_blocks(tokenizer, corpus_path: str | Path, block_size: int,
             buffer += _token_ids(tokenizer, piece)
             while len(buffer) >= block_size and total < max_tokens:
                 block, buffer = buffer[:block_size], buffer[block_size:]
-                examples.append((block, list(block)))
+                yield block, list(block)
                 total += block_size
     if len(buffer) >= MIN_BLOCK_TOKENS and total < max_tokens:
-        examples.append((buffer, list(buffer)))
-    return examples
+        yield buffer, list(buffer)
+
+
+def build_text_blocks(tokenizer, corpus_path: str | Path, block_size: int,
+                      max_tokens: int = 20_000_000) -> list[Example]:
+    """Materialise :func:`iter_text_blocks`; kept for callers that need a list."""
+    return list(iter_text_blocks(tokenizer, corpus_path, block_size, max_tokens))
 
 
 def split_examples(examples: Sequence[Example], val_fraction: float = 0.05,
-                   seed: int = 0) -> tuple[list[Example], list[Example]]:
-    """Shuffle deterministically and hold out a validation slice (never the whole set)."""
+                   seed: int = 0) -> tuple[Sequence[Example], Sequence[Example]]:
+    """Shuffle deterministically and hold out a validation slice (never the whole set).
+
+    A compact :class:`ExampleStore` is returned as two views, so splitting a
+    large token store does not duplicate its arrays.
+    """
     order = list(range(len(examples)))
     random.Random(seed).shuffle(order)
     held_out = 0
     if len(order) >= 2:
         held_out = min(max(1, int(len(order) * val_fraction)), len(order) - 1,
                        MAX_VALIDATION_EXAMPLES)
-    validation = [examples[index] for index in order[:held_out]]
-    training = [examples[index] for index in order[held_out:]]
+    validation_indices = order[:held_out]
+    training_indices = order[held_out:]
+    if isinstance(examples, ExampleStore):
+        return (ExampleSubset(examples, training_indices),
+                ExampleSubset(examples, validation_indices))
+    validation = [examples[index] for index in validation_indices]
+    training = [examples[index] for index in training_indices]
     return training, validation
+
+
+def example_lengths(examples: Sequence[Example]) -> Sequence[int]:
+    """Lengths used to group similar examples; compact stores avoid slicing tokens."""
+    lengths = getattr(examples, "lengths", None)
+    if lengths is not None:
+        return lengths
+    return [len(ids) for ids, _ in examples]
+
+
+def iter_batches(examples: Sequence[Example], batch_size: int, rng: random.Random,
+                 bucket: bool = True) -> Iterator[list[int]]:
+    """Endlessly yield shuffled batches, grouping similar lengths to cut padding.
+
+    Every example is used before an epoch repeats, unlike independent random
+    draws.  Sorting within a large block and shuffling the blocks keeps the
+    batches both efficient and varied.
+    """
+    size = max(1, int(batch_size))
+    lengths = example_lengths(examples)
+    while True:
+        order = list(range(len(examples)))
+        rng.shuffle(order)
+        if bucket and len(order) > size * 4:
+            span = size * 50
+            chunks = [order[start:start + span] for start in range(0, len(order), span)]
+            for chunk in chunks:
+                chunk.sort(key=lambda index: lengths[index])
+            rng.shuffle(chunks)
+            order = [index for chunk in chunks for index in chunk]
+        for start in range(0, len(order), size):
+            yield order[start:start + size]
 
 
 def collate(batch: Sequence[Example], pad_id: int) -> dict[str, torch.Tensor]:
@@ -290,7 +450,7 @@ def collate(batch: Sequence[Example], pad_id: int) -> dict[str, torch.Tensor]:
     labels = torch.full((len(batch), width), IGNORE_INDEX, dtype=torch.long)
     attention_mask = torch.zeros((len(batch), width), dtype=torch.long)
     for row, (ids, row_labels) in enumerate(batch):
-        input_ids[row, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-        labels[row, :len(row_labels)] = torch.tensor(row_labels, dtype=torch.long)
+        input_ids[row, :len(ids)] = torch.as_tensor(ids, dtype=torch.long)
+        labels[row, :len(row_labels)] = torch.as_tensor(row_labels, dtype=torch.long)
         attention_mask[row, :len(ids)] = 1
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}

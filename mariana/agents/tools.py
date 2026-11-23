@@ -46,6 +46,7 @@ DEFAULT_TEXT_CHARS = 20_000
 MAX_SEARCH_RESULTS = 500
 MAX_SEARCH_FILES = 2000
 READ_CHUNK_LINES = 200
+READ_CHUNK_CHARS = 3_600
 MAX_DIAGNOSTIC_FILES = 200
 MAX_DIAGNOSTIC_ISSUES = 1000
 IGNORED_DIRS = frozenset({
@@ -61,6 +62,62 @@ _BLOCK_TAGS = frozenset({
 
 class ToolError(ValueError):
     pass
+
+
+# Tools that change state.  They are never retried automatically: a timeout after
+# a write may still have applied the change, and repeating it could duplicate it.
+WRITE_ABILITY_TYPES = frozenset({"file.write", "file.edit", "file.delete", "shell.exec"})
+TOOL_ATTEMPTS = 2
+_RETRYABLE_MARKERS = (
+    "timed out", "timeout", "temporar", "try again", "rate limit", "too many requests",
+    "connection reset", "connection refused", "connection aborted", "broken pipe",
+    "network is unreachable", "name or service not known", "eof occurred",
+    "service unavailable", "bad gateway", "gateway timeout", "429", "502", "503", "504",
+)
+
+
+def retryable_tool_failure(error) -> bool:
+    """Whether a read-only tool failure is worth one automatic retry.
+
+    Deterministic failures (missing path, sandbox denial, unknown tool, invalid
+    input) are returned to the model immediately so it can correct the call.
+    """
+    text = str(error or "").lower()
+    return bool(text) and any(marker in text for marker in _RETRYABLE_MARKERS)
+
+
+def tool_failure_hint(tool_id: str, error) -> str:
+    """A short next action the model can use instead of repeating a failed call."""
+    text = str(error or "").lower()
+    if not text:
+        return ""
+    if "not found" in text or "no such file" in text or "does not exist" in text:
+        return "List the directory or project tree, then retry with an exact existing path."
+    if "outside" in text or "denied" in text or "permission" in text or "read-only" in text:
+        return "Choose a path or operation inside the granted workspace and scope."
+    if "unknown" in text and "tool" in text:
+        return "Use one of the available tool ids exactly as listed."
+    if "needs" in text or "required" in text or "invalid" in text or "must be" in text:
+        return "Provide the required input keys, then retry the call."
+    if retryable_tool_failure(text):
+        return "The endpoint did not answer reliably; retry once, or use another source."
+    return "Change the input or approach instead of repeating the same call."
+
+
+def nearest_tool_id(value: str, known) -> str:
+    """The closest available tool id, for an actionable unknown-tool message."""
+    import difflib
+
+    wanted = str(value or "").strip().lower()
+    candidates = [str(item) for item in known]
+    if not wanted or not candidates:
+        return ""
+    by_key = {re.sub(r"[^a-z0-9]", "", item.lower()): item for item in candidates}
+    key = re.sub(r"[^a-z0-9]", "", wanted)
+    if key in by_key:
+        return by_key[key]
+    matches = difflib.get_close_matches(key, list(by_key), n=1, cutoff=0.62)
+    return by_key[matches[0]] if matches else ""
 
 
 def describe_abilities() -> dict:
@@ -822,12 +879,40 @@ class _AbilityRunner:
         total = len(lines)
         start = min(start, max(1, total))
         end = max(start, min(max(1, total), end))
-        selected = "".join(lines[start - 1:end]) if lines else ""
-        return {
-            "path": str(path.relative_to(self.files)), "content": selected,
-            "start_line": start, "end_line": end, "total_lines": total,
-            "truncated": end < total,
+        selected: list[str] = []
+        used = 0
+        midline = False
+        for index in range(start - 1, end):
+            line = lines[index]
+            if not selected and len(line) > READ_CHUNK_CHARS:
+                # One generated line can exceed the whole read budget.  Return its
+                # prefix and say so, instead of pretending the rest was delivered.
+                selected.append(line[:READ_CHUNK_CHARS])
+                midline = True
+                break
+            if selected and used + len(line) > READ_CHUNK_CHARS:
+                break
+            selected.append(line)
+            used += len(line)
+            if used >= READ_CHUNK_CHARS:
+                break
+        body = "".join(selected)
+        included_end = start + len(selected) - 1 if selected else start
+        truncated = included_end < total
+        result = {
+            "path": str(path.relative_to(self.files)), "content": body,
+            "start_line": start, "end_line": included_end, "total_lines": total,
+            "truncated": truncated,
         }
+        if truncated and not midline:
+            result["next_start_line"] = included_end + 1
+        if midline:
+            result["content_cut_midline"] = True
+            result["hint"] = (
+                "This line is longer than the read budget; use file.search or "
+                "file.inspect to inspect the rest instead of re-reading the same line."
+            )
+        return result
 
     def file_write(self, params: dict, context: dict) -> dict:
         path = self._sandbox_path(
@@ -873,7 +958,14 @@ class _AbilityRunner:
             new = json.dumps(new, indent=2, ensure_ascii=False)
         if path.stat().st_size > MAX_FILE_BYTES:
             raise ToolError("File exceeds the 2 MB ability limit")
-        content = path.read_bytes().decode("utf-8", errors="replace")
+        raw = path.read_bytes()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolError(
+                f"{path.relative_to(self.files)} is not UTF-8 text; "
+                "file.edit refuses to rewrite it and lose bytes"
+            ) from None
         count = content.count(old)
         if count == 0:
             raise ToolError(

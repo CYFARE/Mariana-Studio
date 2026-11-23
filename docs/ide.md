@@ -77,9 +77,21 @@ folder's cached children without hiding it from the agent.
 
 Right-click a file or folder for open, new file/folder, rename, delete, copy
 path, download, pin to context, hide from the agent and close-tab actions.
-`Ctrl+P` opens every file in the project; `Ctrl+S` saves; `Ctrl+W` closes a tab;
+`Ctrl+P` opens a file picker that starts with recent files, follows the arrow
+keys and marks files that are already open or edited. `Ctrl+S` saves; `Ctrl+W`
+closes a tab; `Ctrl+Shift+T` reopens the last closed tab; `Ctrl+PageUp` and
+`Ctrl+PageDown` cycle tabs; `Ctrl+Shift+F` jumps to project search; and
+`Ctrl+Shift+P` (or `Ctrl+K`) opens the command palette with every IDE action.
 `Ctrl+Enter` sends a task. Typing `@` in the task box searches files and inserts
-the chosen path as pinned context.
+the chosen path as pinned context. The explorer is keyboard-navigable:
+Up/Down moves between rows, Right expands or enters a folder, Left collapses or
+moves to the parent, and Home/End jump to the ends. `Ctrl+Shift+E` focuses the
+file filter.
+
+The tab strip keeps its horizontal position across saves, scrolls the active tab
+into view, and scrolls sideways with the wheel. The menu button on the view bar
+lists every open file with its active/edited state and offers reopen, save-all
+and close actions.
 
 ### Editor
 
@@ -109,6 +121,17 @@ ASCII, plus the file's MIME type, size, modified time and image dimensions. The
 metadata button on the same bar lists the complete details; code edits remain a
 click away on the Code tab.
 
+Breadcrumbs above the view bar show the workspace, folders and file. Click a
+folder to reveal and expand it in the explorer, or use the actions at the end
+of the row to copy the path or open the tab menu. `Ctrl+=`, `Ctrl+-` and
+`Ctrl+0` scale the editor font between 12 and 22 pixels; the size is remembered
+for every project. The selection button in the agent composer inserts the
+current editor selection as a path-labelled, language-tagged fenced block, so
+reviewing a specific function does not require copying code by hand. The
+status bar keeps the file path and the cursor position in separate fields.
+`Ctrl+Shift+?` opens the shortcut reference; every command is also searchable in
+the palette.
+
 Click a line number to select that line. The status bar reports the cursor,
 the selected character and line count, the indentation and the file's line
 endings. Matching brackets are marked, unmatched ones are flagged, and the
@@ -137,6 +160,27 @@ selecting text first wraps the selection. Backspace removes an empty pair, and
 menu exposes clipboard actions, selection, find/replace, go-to-line, line
 commands, comment toggling, case conversion and the language/indent menus.
 
+### Outline and symbols
+
+The **Outline** tab in the explorer lists the declarations of the active file:
+functions and methods, classes, types, `impl` blocks, Markdown headings from
+H1 to H6, and headings or `id`-carrying elements in HTML/XML. Indentation shows
+nesting, and each row carries its kind and line number. Clicking a row switches
+a preview back to **Code** when needed and jumps the caret to that line; the
+symbol around the caret stays highlighted as you move through the file.
+
+`Ctrl+Shift+O` opens **Go to symbol**, a searchable list of the same symbols.
+Arrow keys, `Home`/`End` and `Enter` work as in quick open, and the picker
+jumps straight to the chosen line. The filter box above the outline narrows the
+list without touching the file. The palette also offers both actions.
+
+Extraction is a fast, language-aware heuristic rather than a syntax tree: it
+recognises declarations at the start of a line and deliberately skips comments,
+Markdown fences and unknown languages. It is capped at 400 symbols and cached
+per tab until the text or language changes, so typing with the panel open costs
+at most one rescan per 250 ms and the outline is never scanned while the panel
+is hidden.
+
 ### Window layout
 
 The explorer, editor and agent are three resizable panes. Drag a divider to set
@@ -144,8 +188,8 @@ a width, double-click it (or press `Enter` on it) to fold the pane, and use the
 arrow keys for 8-pixel steps. `Home` folds and `End` maximises; `Shift` makes the
 arrow steps larger. The layout menu pins the panes side by side, stacks the
 agent below the editor, returns to automatic stacking, hides either pane, or
-focuses the editor alone. `Ctrl+B` toggles the explorer and `Ctrl+Shift+B` the
-agent panel.
+toggles focus mode, which folds both side panes and restores them in one step.
+`Ctrl+B` toggles the explorer and `Ctrl+Shift+B` the agent panel.
 
 Sizes stick: a preferred width is remembered across reloads and restored when
 space returns. When the window is too narrow the panes shrink to their readable
@@ -232,6 +276,14 @@ template ignores that instruction and emit native markup — DeepSeek V4's
 `<｜｜DSML｜｜ invoke …>` blocks, for example — are parsed into the same canonical
 calls, including several parallel calls in one reply.
 
+Read-only tool calls are retried once when the failure looks temporary
+(timeout, connection reset, rate limit or a 5xx). Writes, deletes, shell
+commands and swarms are never retried automatically, because a timed-out write
+may already have landed. Deterministic failures return with a short recovery
+hint, an unknown tool id is matched to the closest enabled id, and a third
+identical call receives an explicit anti-loop hint. The retry count is visible
+as `attempts` on the `tool_result` event and in the transcript step.
+
 When tools are granted, Studio also sends native function definitions to
 OpenAI-compatible endpoints and to the Anthropic Messages API. Kimi, Grok,
 OpenAI, Qwen, Mistral, Groq, OpenRouter, Fireworks, Together and Claude can
@@ -243,12 +295,12 @@ malformed tool call is reported back to the model, which can correct it.
 | Tool | What it does |
 |---|---|
 | `file.tree` | Project listing with sizes; dependency folders are skipped. |
-| `file.read` | UTF-8 file contents in line ranges (200 lines by default). |
+| `file.read` | UTF-8 file contents in line ranges (200 lines or about 3,600 characters by default); the result reports `next_start_line` when more remain. |
 | `file.inspect` | Metadata, MIME type, dimensions, hex dump and a short preview for any file, including images. |
 | `file.write` | Atomic full write. |
 | `file.edit` | Exact, unique block replacement. Ambiguous matches are refused with the occurrence count. |
 | `file.search` | Literal or regular-expression search with file/line matches. |
-| `skill.read` | Load a `SKILL.md` instruction pack by id from `.agents/skills` or the user's `~/.agents/skills`. |
+| `skill.read` | Load one relevant `SKILL.md` automatically when its description matches the task; the agent follows the loaded instructions. |
 | `file.delete` | Delete a file (snapshotted before the call). |
 | `code.diagnostics` | Python syntax, JSON validity and optional `pyflakes` rules. Edits also run diagnostics automatically and return the issues with the tool result. |
 | `csv.read` | Read CSV/TSV records with column names, delimiters and a row cap. |
@@ -267,13 +319,17 @@ object per turn:
 {"final": "Changed the parser and diagnostics pass."}
 ```
 
-Several calls run in order. A plan updates the sticky checklist and emits a
-`plan` run event; it does not end the loop. Repeated identical calls produce a
-hint in the observation so the model changes approach. After a Python or JSON
-edit the service runs diagnostics on that file and appends an `ok`/`issues`
-block to the observation, so a broken change is visible without spending another
-tool round. The transcript renders tool results as summaries, clickable paths,
-issues and syntax-coloured content instead of one large JSON blob. A completed
+Several calls run in order for writes, deletes, shell commands and swarms.
+Independent read-only calls in one round (`file.read`, `file.search`, `file.tree`,
+`file.inspect`, diagnostics, data and web reads) run in parallel, up to four at a
+time, and their results are returned in the order the model asked for them. A
+plan updates the sticky checklist and emits a `plan` run event; it does not end
+the loop. Repeated identical calls produce a hint in the observation so the model
+changes approach. After a Python or JSON edit the service runs diagnostics on
+that file and appends an `ok`/`issues` block to the observation, so a broken
+change is visible without spending another tool round. The transcript renders
+tool results as summaries, clickable paths, issues and syntax-coloured content
+instead of one large JSON blob. A completed
 tool or swarm card collapses to its header; expanding it shows the input,
 result, diff and file action. Reasoning tokens stream into a collapsed
 `Thought` row that keeps its newest four lines visible while the model thinks
@@ -290,12 +346,15 @@ agent supplies tasks (or lets the leader choose them), a strategy
 (`auto`, `map_reduce`, `peer_review`, `debate`, `pipeline`), a feedback round
 count and a time budget. The leader then:
 
-1. plans roles, tools and — when writing is enabled — disjoint `writes` scopes;
-2. runs the members in parallel (or sequentially for a pipeline), with progress
-   events for every model round, tool call and message;
-3. assigns peer reviews, collects scores and concrete issues, and has each
-   reviewed member revise its work;
-4. synthesises one answer and reports the changed files.
+1. plans roles, tools, testable success criteria, a short plan per member and
+   — when writing is enabled — disjoint `writes` scopes;
+2. runs independent members in parallel, waits for `depends_on` waves, and
+   otherwise keeps the pipeline sequential, with progress events for every model
+   round, tool call, plan update and message;
+3. assigns peer reviews against the success criteria, collects scores and
+   concrete issues, and has each reviewed member revise its work;
+4. synthesises one answer, reports the changed files and lists any criterion it
+   could not verify.
 
 In Edit and Auto the members use the same sandbox, snapshots, diagnostics and
 shell opt-in as the parent, so every swarm file edit is visible in the session and
@@ -328,7 +387,13 @@ The swarm has its own IPC and memory:
   characters and a smaller-request suggestion instead of a silent cut.
 - If the board is full the automatic writes are skipped and the coding session
   continues; duplicate plan tasks are dropped with a warning instead of being
-  run twice.
+  run twice. A member's own plan persists across rounds and appears in the card;
+  a member that finishes with open steps is asked once to complete or justify
+  them, and an unresolved plan is reported as a warning.
+- Read-only swarm tools retry one temporary failure; writes and shell calls are
+  never retried. Deterministic failures carry a next-action hint, an unknown
+  tool id suggests the closest granted id, and a third identical call is called
+  out explicitly.
 - The parent sees a compact result: the synthesis, each member's status and
   output, review scores, message and blackboard counts, and changed files.
   Full live state is in the run snapshot and the swarm progress events. The
@@ -337,14 +402,30 @@ The swarm has its own IPC and memory:
 - The run is bounded even when a backend stops responding: the time budget is
   enforced on the coordinator side, unfinished members are finalised in the
   result, and late events from abandoned workers are dropped. An empty model
-  reply is retried once, and a failed peer review is reported without
-  discarding completed work.
+  reply or member final is retried once, a member that returns an empty final is
+  asked once for its complete finding before the fallback is used, and a failed
+  peer review is reported without discarding completed work. Repeated empty
+  replies go to a tool-free wrap-up; coordinator prompts are never presented as
+  the member's findings.
+- Native tool schemas cover only the tools a member was granted, and review
+  calls see read tools only. A revision prompt contains the member's previous
+  answer (with its context handle), so feedback is applied to the work itself.
+  Absolute or escaping write scopes are rejected before the member runs.
 - A member that keeps calling tools until its budget ends gets one bounded
   extension (half its budget, up to 8 extra rounds, never above 24) when it has
   already collected observations, then is asked once for a final answer
   **without tools**. If that call also fails, its last observations are shared
   with the leader, which still synthesises a reply. A research turn therefore
   does not fail just because a model was slow to stop.
+- The work deadline is earlier than the hard time budget: the last 10% (at
+  least 5 s, at most 90 s) is reserved for wrap-up and synthesis. At the work
+  deadline tools are refused, each member answers from the observations it has
+  collected, later dependency waves and the feedback loop are skipped with a
+  warning, and the leader still synthesises. If the reserve is exhausted too,
+  the answer is assembled from the members' results and the run completes with
+  `timed_out: true` instead of failing; only a run where no member produced
+  output fails with the time-budget error. The result, snapshot and `swarm_end`
+  event carry `timed_out`, and the card shows a **Time limit** badge.
 - Retrieval is not a single feed. A member granted `news.headlines`,
   `http.fetch` or `browser.fetch` receives the whole retrieval family when those
   tools are enabled, so an empty or blocked feed has a fallback. A task that
@@ -361,7 +442,8 @@ The swarm has its own IPC and memory:
 The system prompt contains the operating rules, the enabled tools, the current
 task, project instructions from `AGENTS.md` or `.mariana-ide.md` (first 4,000
 characters), a compact project map (file paths and sizes, about 6,000
-characters), available skills (ids, names and descriptions), the current plan
+characters), every available skill (ids, names and descriptions) with an
+instruction to load the relevant ones automatically, the current plan
 from earlier turns and every file this conversation already changed, and, when
 one is open in the editor, the first 6,000 characters of that file. Up to four
 other open files contribute 1,500 characters each. Pinned context adds up to 24
@@ -371,8 +453,11 @@ limit. The selected model's output budget is reserved as well: a request that
 would leave no room for the reply is flagged in the token dialog and consolidated
 before sending when possible. Tool observations are capped at 6,000 characters
 per call and 20,000 characters per round; long fields are shortened in place so
-the path, line range and truncation flags survive. Stored conversation history is
-trimmed to the last 40 messages of 8,000 characters each.
+the path, line range and truncation flags survive. A shortened `file.read`
+reports the real `end_line`, adds `next_start_line`, and flags
+`content_cut_midline` instead of silently skipping the rest of a very long line.
+Stored conversation history is trimmed to the last 40 messages of 8,000
+characters each.
 
 Context is explicit:
 
@@ -389,6 +474,10 @@ freed and emits a `context_consolidated` event. The system prompt also carries
 the current plan and this conversation's changed files, so paths and next steps
 survive consolidation. The run continues without a separate summarisation round,
 and the token dialog can consolidate a saved conversation on demand.
+- The task is sent once as the user message; the system prompt carries only a
+  short anchor, so a long request is not duplicated on every turn. A truncated
+  active-file or pinned-file preview is labelled and points to `file.read`, so
+  the model never edits from a silently shortened view.
 - The context dialog shows the estimated token cost before a run. Its window is
   the selected model's latest known maximum: the larger of catalog metadata
   (GGUF, Transformers config, Mariana checkpoints) and a live probe of a saved
@@ -465,6 +554,10 @@ A run streams server-sent events:
 | `swarm_start`, `swarm_plan`, `swarm_leader`, `swarm_round`, `swarm_agent_start`, `swarm_agent_step`, `swarm_agent_delta`, `swarm_agent_status`, `swarm_agent_tool`, `swarm_agent_end`, `swarm_message`, `swarm_memory`, `swarm_review`, `swarm_context`, `swarm_end` | Swarm progress; every event carries `swarm`, `round`, `phase` and, when it concerns one member, `agent`. `swarm_context` carries the grant or denial and the current pool snapshot. |
 | `log` | Status or a recoverable warning. |
 | `run_completed`, `run_failed`, `run_cancelled` | Terminal state; `output` is the final answer. |
+
+A run's event log ends at its `run_<status>` event. Progress reported by a
+worker after completion or cancellation is ignored, so snapshots, counters and
+`?since=` replays cannot grow past the terminal event.
 
 `assistant_end` carries the round's `reasoning`, `finish_reason` and the
 `empty`, `truncated` and `retrying` flags, so a client can distinguish a
@@ -565,11 +658,13 @@ curl -sN $BASE/api/ide/runs/$RUN/events
 - `git.inspect` runs fixed read-only Git commands with external diffs, text
   conversion, pager and fsmonitor disabled. It does not accept a shell string.
 - Skills are `SKILL.md` instruction packs discovered in the workspace's
-  `.agents/skills` and the user's `~/.agents/skills`. The coding agent can only
-  read them; the skills popup creates, edits and deletes workspace or user skills
-  through explicit CRUD routes. Only names and descriptions enter the prompt
-  until the model calls `skill.read`; nothing from a skill is executed, and
-  symlinked or oversized files are skipped.
+  `.agents/skills` and the user's `~/.agents/skills`. The coding agent chooses
+  which relevant skills to load; there is no manual apply step. Every skill's id,
+  name and description enters the prompt, and the model calls `skill.read` for
+  the ones that fit. The skills popup creates, edits and deletes workspace or
+  user skills through explicit CRUD routes. Only names and descriptions enter
+  the prompt until the model calls `skill.read`; nothing from a skill is
+  executed, and symlinked or oversized files are skipped.
 - The preview route resolves workspace paths with the same sandbox as the
   editor. Binary files are read-only, image data URLs are size-capped, and HTML
   or SVG is shown as an image rather than executed as a document.

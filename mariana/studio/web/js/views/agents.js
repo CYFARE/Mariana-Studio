@@ -14,6 +14,7 @@
      replaced in place invalidate it without a manual rebuild call. */
   const nodesById = { doc: null, list: null, length: 0, map: new Map() };
   const ACTIVE_RUNS = new Set(["queued", "running", "paused"]);
+  const DELTA_EVENTS = new Set(["assistant_delta", "reasoning_delta", "swarm_agent_delta"]);
   const SWARM_DEFAULTS = {
     max_agents: 6, max_steps: 8, max_rounds: 2, max_seconds: 300,
     max_messages: 200, max_message_chars: 4000, max_memory_entries: 120,
@@ -24,11 +25,13 @@
   const RUN_CONTROLS = ["agents-run"];
   const PRIMARY_FIELDS = {
     end: ["output"],
-    llm: ["model", "prompt", "format"],
-    agent: ["model", "goal", "abilities"],
-    swarm: ["model", "goal", "strategy", "rounds"],
+    llm: ["model", "prompt", "format", "fallback_model"],
+    agent: ["model", "goal", "abilities", "fallback_model"],
+    swarm: ["model", "goal", "criteria", "strategy", "rounds", "effort"],
     tool: ["ability", "input"],
     condition: ["expression"],
+    assert: ["expression", "message"],
+    validate: ["target", "schema", "mode"],
     transform: ["template", "format"],
     delay: ["seconds"],
     human: ["prompt", "kind", "choices"],
@@ -42,14 +45,34 @@
     undo: [], redo: [], clipboard: null, dirty: false, zoom: 1, pan: { x: 30, y: 30 },
     breakpoints: new Set(), drag: null, connection: null, run: null, feed: null, runToken: 0, eventSeq: 0,
     validationTimer: null, bottomTabs: null, sectionState: new Map(), recentTypes: [],
+    docVersion: 0,
     find: { open: false, query: "", matches: [], index: -1, ui: null },
     panMode: false, spaceHeld: false, follow: false,
-    guides: [], dropEdge: null, runFilter: "", lastRunNode: null, renaming: null, inspectorSelection: "", runPanelKey: "", lastClick: null,
+    guides: [], dropEdge: null, dragPoint: null, runFilter: "", lastRunNode: null, renaming: null, inspectorSelection: "", runPanelKey: "", lastClick: null,
+    runHideDeltas: null,
     nodeElements: new Map(), edgeElements: new Map(), connectionGhost: null, guideElements: { x: null, y: null }, nodeRenderPending: false,
   };
   let layout = null;
   let dockLayout = null;
   let minimapPalette = null;
+  let minimapTimer = 0;
+
+  /* The minimap is decorative; 10 fps is enough while dragging or panning and
+     keeps its per-node canvas work off the pointer-critical path. */
+  function scheduleMinimap(immediate = false) {
+    if (immediate) { cancelMinimap(); drawMinimapNow(); return; }
+    if (minimapTimer) return;
+    minimapTimer = setTimeout(() => {
+      minimapTimer = 0;
+      drawMinimapNow();
+    }, 100);
+  }
+
+  function cancelMinimap() {
+    if (!minimapTimer) return;
+    clearTimeout(minimapTimer);
+    minimapTimer = 0;
+  }
 
   function copy(value) { return JSON.parse(JSON.stringify(value)); }
 
@@ -149,6 +172,7 @@
   function mutate(task, render = true, label = "Edit") {
     pushHistory(label);
     task();
+    state.docVersion += 1;
     markDirty();
     if (render) renderAll();
     else { renderNodes(); renderEdges(); renderSelectionToolbar(); renderStatus(); renderHistoryControls(); }
@@ -176,6 +200,8 @@
   function loadDocument(document) {
     stopWatching();
     cancelAllFrames();
+    cancelRunEvents();
+    cancelMinimap();
     state.drag = null;
     state.connection = null;
     state.guides = [];
@@ -434,11 +460,12 @@
 
   function nearestEdge(doc, point, threshold = 24) {
     if (!doc) return -1;
+    const nodes = new Map((doc.nodes || []).map(node => [node.id, node]));
     let best = -1;
     let bestDistance = threshold * threshold;
     (doc.edges || []).forEach((edge, index) => {
-      const from = (doc.nodes || []).find(node => node.id === edge.from);
-      const to = (doc.nodes || []).find(node => node.id === edge.to);
+      const from = nodes.get(edge.from);
+      const to = nodes.get(edge.to);
       if (!from || !to) return;
       const source = outputPosition(from, edge.when);
       const target = inputPosition(to);
@@ -450,6 +477,14 @@
       }
     });
     return best;
+  }
+
+  function updateDropEdge() {
+    const point = state.dragPoint;
+    state.dragPoint = null;
+    if (!point || !state.doc) return;
+    const index = nearestEdge(state.doc, point, Math.max(14, 20 / state.zoom));
+    if (index !== state.dropEdge) { state.dropEdge = index; renderEdges(); }
   }
 
   function edgeMidpoint(doc, index) {
@@ -469,8 +504,29 @@
     return element;
   }
 
+  let edgesStructure = null;
+
   function renderEdges() {
-    const root = Studio.ui.render($("agents-edges"));
+    const root = $("agents-edges");
+    const parts = [];
+    let drawable = 0;
+    for (const edge of state.doc.edges) {
+      const from = nodeById(edge.from);
+      const to = nodeById(edge.to);
+      if (!from || !to) { parts.push("missing"); continue; }
+      drawable += 1;
+      parts.push(`${edge.from}\u0000${edge.to}\u0000${edge.when || ""}\u0000${edge.label || ""}`);
+    }
+    const structure = parts.join("\u0001");
+    /* Node edits and moves do not change the edge list; update the existing
+       SVG nodes instead of recreating every path and listener. */
+    if (edgesStructure !== null && structure === edgesStructure && state.edgeElements.size === drawable) {
+      for (const index of state.edgeElements.keys()) updateEdgeElement(index);
+      if (state.connection) ensureConnectionGhost();
+      return;
+    }
+    edgesStructure = structure;
+    Studio.ui.render(root);
     state.edgeElements.clear();
     state.connectionGhost = null;
     const defs = svg("defs");
@@ -495,32 +551,33 @@
         class: `agent-edge agent-edge-${edge.when || "always"}${state.edge === index ? " selected" : ""}${state.dropEdge === index ? " drop-target" : ""}`,
         "marker-end": `url(#agent-arrow-${tone})`,
       });
+      const cached = { path, hit, label: null, middle };
       hit.addEventListener("pointerdown", event => {
         if (event.button !== 0 || state.panMode || state.spaceHeld) return;
         event.preventDefault();
         $("agents-canvas").focus({ preventScroll: true });
         event.stopPropagation();
-        if (registerClick("edge", index, { x: event.clientX, y: event.clientY })) { openQuickAdd({ edge: index, point: middle }); return; }
+        if (registerClick("edge", index, { x: event.clientX, y: event.clientY })) { openQuickAdd({ edge: index, point: cached.middle }); return; }
         selectEdge(index);
       });
       hit.addEventListener("dblclick", event => {
         event.preventDefault(); event.stopPropagation();
-        openQuickAdd({ edge: index, point: middle });
+        openQuickAdd({ edge: index, point: cached.middle });
       });
       hit.addEventListener("contextmenu", event => { event.preventDefault(); event.stopPropagation(); selectEdge(index); edgeMenu(event, index); });
       root.append(hit, path);
-      let label = null;
       if (edge.when && edge.when !== "always" || edge.label) {
-        label = svg("text", { x: middle.x, y: middle.y - 7, class: "agent-edge-label", "text-anchor": "middle" });
+        const label = svg("text", { x: middle.x, y: middle.y - 7, class: "agent-edge-label", "text-anchor": "middle" });
         label.textContent = edge.label || edge.when;
         root.append(label);
+        cached.label = label;
       }
-      state.edgeElements.set(index, { path, hit, label });
+      state.edgeElements.set(index, cached);
     });
     if (state.connection) ensureConnectionGhost();
   }
 
-  function updateEdgeElement(index) {
+  function updateEdgeElement(index, paintState = true) {
     const cached = state.edgeElements.get(index);
     const edge = state.doc.edges[index];
     if (!cached || !edge) return;
@@ -531,16 +588,24 @@
     const d = edgePath(source, target);
     cached.path.setAttribute("d", d);
     if (cached.hit) cached.hit.setAttribute("d", d);
+    const middle = cubicPoint(source, target, 0.5);
+    cached.middle = middle;
     if (cached.label) {
-      const middle = cubicPoint(source, target, 0.5);
       cached.label.setAttribute("x", middle.x);
       cached.label.setAttribute("y", middle.y - 7);
     }
+    if (!paintState) return;
+    const selected = state.edge === index;
+    const tone = selected ? "selected"
+      : state.dropEdge === index ? "drop"
+      : edge.when === "true" ? "true" : edge.when === "false" ? "false" : "always";
+    cached.path.setAttribute("class", `agent-edge agent-edge-${edge.when || "always"}${selected ? " selected" : ""}${state.dropEdge === index ? " drop-target" : ""}`);
+    cached.path.setAttribute("marker-end", `url(#agent-arrow-${tone})`);
   }
 
   function updateEdgesTouching(ids) {
     state.doc.edges.forEach((edge, index) => {
-      if (ids.has(edge.from) || ids.has(edge.to)) updateEdgeElement(index);
+      if (ids.has(edge.from) || ids.has(edge.to)) updateEdgeElement(index, false);
     });
   }
 
@@ -576,20 +641,37 @@
   /* Selection only changes classes and the inspector, so it never needs to
      rebuild the canvas.  Re-rendering here replaced every node on each click,
      which made clicks feel sluggish and killed native double-click targets. */
+  function paintEdgeSelection(previous, next) {
+    for (const index of new Set([previous, next])) {
+      if (index === null || index === undefined) continue;
+      const cached = state.edgeElements.get(index);
+      const edge = state.doc && state.doc.edges[index];
+      if (!cached || !edge) continue;
+      const selected = index === next;
+      cached.path.classList.toggle("selected", selected);
+      cached.path.classList.toggle("drop-target", index === state.dropEdge);
+      const tone = selected ? "selected"
+        : index === state.dropEdge ? "drop"
+        : edge.when === "true" ? "true" : edge.when === "false" ? "false" : "always";
+      cached.path.setAttribute("marker-end", `url(#agent-arrow-${tone})`);
+    }
+  }
+
   function selectNode(id, additive = false) {
-    const hadEdge = state.edge !== null;
+    const previousEdge = state.edge;
     state.edge = null;
     if (additive) { if (state.selected.has(id)) state.selected.delete(id); else state.selected.add(id); }
     else state.selected = new Set([id]);
-    if (hadEdge) renderEdges();
+    if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
     paintSelection();
     renderInspector(); renderSelectionToolbar(); renderStatus();
   }
 
   function selectEdge(index) {
+    const previous = state.edge;
     state.edge = index;
     state.selected.clear();
-    renderEdges();
+    paintEdgeSelection(previous, index);
     paintSelection();
     renderInspector(); renderSelectionToolbar(); renderStatus();
   }
@@ -624,10 +706,16 @@
     switch (node.type) {
       case "start": return "Run input";
       case "end": return shortText(data.output || "Returns the previous output");
-      case "llm": return `${modelLabel(data.model)} · ${shortText(data.prompt || "Uses the previous output", 28)}`;
-      case "agent": return `${modelLabel(data.model)} · ${shortText(data.goal || "Goal from previous output", 28)}`;
+      case "llm": return `${modelLabel(data.model)}${data.fallback_model ? " + fallback" : ""} · ${shortText(data.prompt || "Uses the previous output", 28)}`;
+      case "agent": return `${modelLabel(data.model)}${data.fallback_model ? " + fallback" : ""} · ${shortText(data.goal || "Goal from previous output", 28)}`;
       case "tool": return `${abilityLabel(data.ability)}${data.input && Object.keys(data.input).length ? " · configured" : ""}`;
       case "condition": return shortText(data.expression || "true", 52);
+      case "assert": return shortText(data.expression || "true", 52);
+      case "validate": {
+        const schema = data.schema || {};
+        const type = Array.isArray(schema.type) ? schema.type.join(" / ") : schema.type || "value";
+        return `${data.mode === "warn" ? "Warn on" : "Require"} ${type}`;
+      }
       case "transform": return shortText(data.template || (data.assign && Object.keys(data.assign).length ? `Assigns ${Object.keys(data.assign).join(", ")}` : "Template"), 52);
       case "delay": return `Waits ${data.seconds === undefined ? 1 : data.seconds}s`;
       case "human": return shortText(data.prompt || (data.kind === "choice" ? "Choose an option" : data.kind === "text" ? "Ask for a response" : "Approve or reject"), 52);
@@ -639,6 +727,91 @@
     }
   }
 
+  let nodesRenderedDoc = null;
+  let nodesRenderedMeta = null;
+  let inspectorPosition = null;
+  let nodeSummaryCache = { doc: null, version: -1, agents: null, meta: null, models: -1, values: new Map() };
+
+  function summariesForNodes() {
+    const models = Studio.models ? Studio.models.sequence : 0;
+    if (nodeSummaryCache.doc !== state.doc || nodeSummaryCache.version !== state.docVersion
+        || nodeSummaryCache.agents !== state.agents || nodeSummaryCache.meta !== state.meta
+        || nodeSummaryCache.models !== models) {
+      nodeSummaryCache = {
+        doc: state.doc, version: state.docVersion, agents: state.agents,
+        meta: state.meta, models, values: new Map(),
+      };
+    }
+    return nodeSummaryCache.values;
+  }
+
+  function buildNodeElement(node, meta, summary, flags) {
+    const element = h("div", {
+      class: `agent-node agent-node-${meta.category || "flow"}${flags.selected ? " selected" : ""}${flags.issue ? " has-issue" : ""}${flags.breakpoint ? " breakpoint" : ""}${flags.found ? " find-match" : ""}${flags.current ? " find-current" : ""} ${flags.status}`,
+      dataset: { node: node.id }, style: { left: "0px", top: "0px", transform: `translate(${node.x}px, ${node.y}px)` }, tabIndex: 0, role: "button",
+      "aria-label": `${node.label}, ${meta.label}`, "aria-selected": String(flags.selected), title: `${meta.description} · Click to edit · Double-click to rename`, "aria-description": meta.description,
+      onkeydown: event => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectNode(node.id, event.shiftKey); }
+        else if (event.key === "F2") { event.preventDefault(); renameNode(node); }
+        else if (event.key === "ContextMenu") { event.preventDefault(); selectNode(node.id); const box = element.getBoundingClientRect(); nodeMenu({ clientX: box.left + 8, clientY: box.top + 8 }, node); }
+      },
+      ondblclick: event => { event.preventDefault(); event.stopPropagation(); startInlineRename(node, element); },
+      oncontextmenu: event => { event.preventDefault(); selectNode(node.id); nodeMenu(event, node); },
+    });
+    element.append(h("div", { class: "agent-node-head" }, h("span", { class: "node-glyph", text: meta.icon }), h("span", { class: "agent-node-title", text: node.label }),
+      Studio.ui.iconButton("bug", `Toggle breakpoint on ${node.label}`, event => { event.stopPropagation(); state.lastClick = null; toggleBreakpoint(node.id); }, { small: true }),
+      Studio.ui.iconButton("more", `More actions for ${node.label}`, event => {
+        event.stopPropagation();
+        state.lastClick = null;
+        const box = event.currentTarget.getBoundingClientRect();
+        selectNode(node.id);
+        nodeMenu({ clientX: box.left, clientY: box.bottom + 4 }, node);
+      }, { small: true })),
+      h("div", { class: "agent-node-type", title: `${meta.label} · ${node.id}`, text: summary }),
+      h("div", { class: "agent-node-live hidden", "aria-hidden": "true" }));
+    if (node.type !== "start") element.append(h("button", { class: "node-port input", type: "button", "aria-label": `Input to ${node.label}`, title: "Incoming connection", dataset: { input: node.id } }));
+    if (node.type !== "end") {
+      if (node.type === "condition") {
+        for (const when of ["true", "false"]) element.append(h("button", { class: `node-port output-${when}`, type: "button", "aria-label": `${when} output from ${node.label}`, title: when, dataset: { output: node.id, when } }));
+      } else element.append(h("button", { class: "node-port output", type: "button", "aria-label": `Output from ${node.label}`, title: "Drag to the next step", dataset: { output: node.id, when: "always" } }));
+    }
+    element.addEventListener("pointerdown", event => beginNodeDrag(event, node));
+    element.__agentView = {
+      node, id: node.id, label: node.label, summary, type: node.type,
+      category: meta.category || "flow", metaLabel: meta.label, metaIcon: meta.icon,
+      metaDescription: meta.description || "",
+      live: element.querySelector(".agent-node-live"),
+    };
+    return element;
+  }
+
+  function sameNodeView(element, node, meta, summary) {
+    const view = element.__agentView;
+    return Boolean(view)
+      && view.node === node
+      && view.id === node.id
+      && view.label === node.label
+      && view.summary === summary
+      && view.type === node.type
+      && view.category === (meta.category || "flow")
+      && view.metaLabel === meta.label
+      && view.metaIcon === meta.icon
+      && view.metaDescription === (meta.description || "");
+  }
+
+  function paintNodeElement(element, node, flags) {
+    const transform = `translate(${node.x}px, ${node.y}px)`;
+    if (element.style.transform !== transform) element.style.transform = transform;
+    element.classList.toggle("selected", flags.selected);
+    element.classList.toggle("has-issue", flags.issue);
+    element.classList.toggle("breakpoint", flags.breakpoint);
+    element.classList.toggle("find-match", flags.found);
+    element.classList.toggle("find-current", flags.current);
+    for (const name of RUN_NODE_STATES) element.classList.toggle(name, name === flags.status);
+    const selected = String(flags.selected);
+    if (element.getAttribute("aria-selected") !== selected) element.setAttribute("aria-selected", selected);
+  }
+
   function renderNodes() {
     if (state.renaming) return;
     /* A run may stream updates or validation may land mid-drag.  Replacing the
@@ -646,47 +819,100 @@
        the rebuild until the pointer is released. */
     if (state.drag) { state.nodeRenderPending = true; return; }
     state.nodeRenderPending = false;
-    const root = Studio.ui.render($("agents-nodes"));
-    state.nodeElements.clear();
+    const root = $("agents-nodes");
+    if (nodesRenderedDoc !== state.doc || nodesRenderedMeta !== state.meta) {
+      nodesRenderedDoc = state.doc;
+      nodesRenderedMeta = state.meta;
+      state.nodeElements.clear();
+      root.replaceChildren();
+    }
     const issueNodes = new Set(state.issues.filter(issue => issue.level === "error" && issue.node).map(issue => issue.node));
     const found = new Set(state.find.matches || []);
     const current = state.find.index >= 0 ? state.find.matches[state.find.index] : null;
+    const desired = [];
+    const live = new Set();
+    const summaries = summariesForNodes();
     for (const node of state.doc.nodes) {
+      live.add(node.id);
       const meta = state.meta.node_types[node.type] || { label: node.type, icon: "?" };
-      const status = state.run && state.run.nodes ? state.run.nodes[node.id] || "pending" : "pending";
-      const element = h("div", {
-        class: `agent-node agent-node-${meta.category || "flow"}${state.selected.has(node.id) ? " selected" : ""}${issueNodes.has(node.id) ? " has-issue" : ""}${state.breakpoints.has(node.id) ? " breakpoint" : ""}${found.has(node.id) ? " find-match" : ""}${current === node.id ? " find-current" : ""} ${status}`,
-        dataset: { node: node.id }, style: { left: "0px", top: "0px", transform: `translate(${node.x}px, ${node.y}px)` }, tabIndex: 0, role: "button",
-        "aria-label": `${node.label}, ${meta.label}`, "aria-selected": String(state.selected.has(node.id)), title: `${meta.description} · Click to edit · Double-click to rename`, "aria-description": meta.description,
-        onkeydown: event => {
-          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectNode(node.id, event.shiftKey); }
-          else if (event.key === "F2") { event.preventDefault(); renameNode(node); }
-          else if (event.key === "ContextMenu") { event.preventDefault(); selectNode(node.id); const box = element.getBoundingClientRect(); nodeMenu({ clientX: box.left + 8, clientY: box.top + 8 }, node); }
-        },
-        ondblclick: event => { event.preventDefault(); event.stopPropagation(); startInlineRename(node, element); },
-        oncontextmenu: event => { event.preventDefault(); selectNode(node.id); nodeMenu(event, node); },
-      });
-      element.append(h("div", { class: "agent-node-head" }, h("span", { class: "node-glyph", text: meta.icon }), h("span", { class: "agent-node-title", text: node.label }),
-        Studio.ui.iconButton("bug", `Toggle breakpoint on ${node.label}`, event => { event.stopPropagation(); state.lastClick = null; toggleBreakpoint(node.id); }, { small: true }),
-        Studio.ui.iconButton("more", `More actions for ${node.label}`, event => {
-          event.stopPropagation();
-          state.lastClick = null;
-          const box = event.currentTarget.getBoundingClientRect();
-          selectNode(node.id);
-          nodeMenu({ clientX: box.left, clientY: box.bottom + 4 }, node);
-        }, { small: true })),
-        h("div", { class: "agent-node-type", title: `${meta.label} · ${node.id}`, text: nodeSummary(node) }));
-      if (node.type !== "start") element.append(h("button", { class: "node-port input", type: "button", "aria-label": `Input to ${node.label}`, title: "Incoming connection", dataset: { input: node.id } }));
-      if (node.type !== "end") {
-        if (node.type === "condition") {
-          for (const when of ["true", "false"]) element.append(h("button", { class: `node-port output-${when}`, type: "button", "aria-label": `${when} output from ${node.label}`, title: when, dataset: { output: node.id, when } }));
-        } else element.append(h("button", { class: "node-port output", type: "button", "aria-label": `Output from ${node.label}`, title: "Drag to the next step", dataset: { output: node.id, when: "always" } }));
+      let summary = summaries.get(node.id);
+      if (summary === undefined) {
+        summary = nodeSummary(node);
+        summaries.set(node.id, summary);
       }
-      element.addEventListener("pointerdown", event => beginNodeDrag(event, node));
-      state.nodeElements.set(node.id, element);
-      root.append(element);
+      const flags = {
+        selected: state.selected.has(node.id),
+        issue: issueNodes.has(node.id),
+        breakpoint: state.breakpoints.has(node.id),
+        found: found.has(node.id),
+        current: current === node.id,
+        status: state.run && state.run.nodes ? state.run.nodes[node.id] || "pending" : "pending",
+      };
+      let element = state.nodeElements.get(node.id);
+      if (!element || !sameNodeView(element, node, meta, summary)) {
+        element = buildNodeElement(node, meta, summary, flags);
+        state.nodeElements.set(node.id, element);
+      } else paintNodeElement(element, node, flags);
+      desired.push(element);
+    }
+    for (const id of [...state.nodeElements.keys()]) {
+      if (!live.has(id)) state.nodeElements.delete(id);
+    }
+    const existing = Array.from(root.children);
+    let keep = 0;
+    while (keep < existing.length && keep < desired.length && existing[keep] === desired[keep]) keep += 1;
+    if (keep < existing.length || keep < desired.length) {
+      for (let index = existing.length - 1; index >= keep; index -= 1) existing[index].remove();
+      for (let index = keep; index < desired.length; index += 1) root.append(desired[index]);
     }
     renderHint();
+  }
+
+  const RUN_NODE_STATES = ["pending", "running", "ok", "error", "paused"];
+
+  /* Run snapshots change node status frequently.  Toggle the state classes on
+     the existing cards instead of replacing every node element each frame. */
+  let nodePreviewSeq = -1;
+  let nodePreviewRun = "";
+  let nodePreviewMap = new Map();
+
+  function runNodePreviews() {
+    if (!state.run) {
+      nodePreviewSeq = -1;
+      nodePreviewRun = "";
+      nodePreviewMap = new Map();
+      return nodePreviewMap;
+    }
+    const events = state.run.events || [];
+    const latest = events.length ? events[events.length - 1].seq || 0 : 0;
+    if (latest !== nodePreviewSeq || state.run.id !== nodePreviewRun) {
+      nodePreviewSeq = latest;
+      nodePreviewRun = state.run.id;
+      nodePreviewMap = nodeLivePreviews(state.run);
+    }
+    return nodePreviewMap;
+  }
+
+  function paintNodeLive(element, preview) {
+    const live = element.__agentView && element.__agentView.live;
+    if (!live) return;
+    const text = preview && preview.live && preview.text
+      ? `${preview.group ? `${preview.label}: ` : ""}${preview.text}`.slice(0, 160)
+      : "";
+    live.classList.toggle("hidden", !text);
+    if (live.textContent !== text) live.textContent = text;
+    element.classList.toggle("streaming", Boolean(text));
+  }
+
+  function paintRunNodes() {
+    const statuses = state.run && state.run.nodes ? state.run.nodes : null;
+    const previews = runNodePreviews();
+    for (const [id, element] of state.nodeElements) {
+      const status = (statuses && statuses[id]) || "pending";
+      for (const name of RUN_NODE_STATES) element.classList.toggle(name, name === status);
+      element.classList.toggle("breakpoint", state.breakpoints.has(id));
+      paintNodeLive(element, previews.get(id));
+    }
   }
 
   function viewportCenter() {
@@ -717,7 +943,12 @@
     }
     $("agents-canvas").focus({ preventScroll: true });
     if (event.shiftKey || event.ctrlKey || event.metaKey) { selectNode(node.id, true); return; }
-    if (!state.selected.has(node.id)) { state.selected = new Set([node.id]); state.edge = null; }
+    if (!state.selected.has(node.id)) {
+      state.selected = new Set([node.id]);
+      const previousEdge = state.edge;
+      state.edge = null;
+      if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
+    }
     const selectedNodes = state.doc.nodes.filter(item => state.selected.has(item.id));
     const others = state.doc.nodes.filter(item => !state.selected.has(item.id));
     state.drag = {
@@ -869,7 +1100,7 @@
     if (state.nodeRenderPending) { state.nodeRenderPending = false; renderNodes(); }
     if (drag.kind === "nodes") {
       if (drag.moved) { markDirty(); scheduleValidation(); }
-      renderInspector(); renderSelectionToolbar(); renderStatus();
+      refreshInspectorAfterDrag(); renderSelectionToolbar(); renderStatus();
     } else if (drag.kind === "marquee") {
       paintSelection();
       renderInspector(); renderSelectionToolbar(); renderStatus();
@@ -898,7 +1129,7 @@
     paintNodePositions(drag.positions.map(item => item.node.id));
     updateEdgesTouching(state.selected);
     renderGuides();
-    frame("minimap", drawMinimapNow);
+    scheduleMinimap();
   }
 
   function beginCanvasPointer(event) {
@@ -922,7 +1153,9 @@
       if (!additive) state.selected.clear();
       const box = h("div", { class: "agent-selection-box" }); $("agents-canvas").append(box);
       state.drag = { kind: "marquee", start: { x: event.clientX, y: event.clientY }, box, moved: true, additive, base: new Set(state.selected) };
+      const previousEdge = state.edge;
       state.edge = null;
+      if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
       paintSelection();
     } else return;
     event.preventDefault();
@@ -1239,10 +1472,10 @@
 
   function selectAllNodes() {
     if (!state.doc) return;
-    const hadEdge = state.edge !== null;
+    const previousEdge = state.edge;
     state.edge = null;
     state.selected = new Set(state.doc.nodes.map(node => node.id));
-    if (hadEdge) renderEdges();
+    if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
     paintSelection();
     renderInspector(); renderSelectionToolbar(); renderStatus();
   }
@@ -1278,7 +1511,7 @@
     markDirty();
     paintNodePositions(state.selected);
     updateEdgesTouching(state.selected);
-    frame("minimap", drawMinimapNow);
+    scheduleMinimap();
     scheduleValidation();
   }
 
@@ -1410,7 +1643,7 @@
   function paintTransform() {
     Studio.setStyle($("agents-world"), { transform: `translate(${state.pan.x}px, ${state.pan.y}px) scale(${state.zoom})` });
     $("agents-zoom").textContent = `${Math.round(state.zoom * 100)}%`;
-    frame("minimap", drawMinimapNow);
+    scheduleMinimap();
   }
 
   function setZoom(value, center) {
@@ -1791,6 +2024,7 @@
 
   function renderInspector() {
     const root = $("agents-inspector");
+    inspectorPosition = null;
     const signature = state.edge !== null ? `edge:${state.edge}` : `nodes:${[...state.selected].sort().join(",")}`;
     const scrollTop = state.inspectorSelection === signature ? root.scrollTop : 0;
     state.inspectorSelection = signature;
@@ -1824,6 +2058,8 @@
     }
     if (nodes.length === 1) {
       const node = nodes[0]; const meta = state.meta.node_types[node.type] || { label: node.type, description: "Unknown node type.", fields: [] };
+      const positionValue = h("span", { text: `${Math.round(node.x)}, ${Math.round(node.y)}` });
+      inspectorPosition = positionValue;
       const outgoing = state.doc.edges.map((edge, index) => ({ edge, index })).filter(item => item.edge.from === node.id);
       const incoming = state.doc.edges.map((edge, index) => ({ edge, index })).filter(item => item.edge.to === node.id);
       const rerenderOnChange = new Set(["kind", "action"]);
@@ -1849,7 +2085,7 @@
         : h("p", { class: "help", text: meta.fields.length ? "This node only has advanced options." : "This node has no configuration; it only marks the flow." })));
       root.append(agentSection("advanced", "Advanced options", [
         ...advanced.map(renderField),
-        Studio.ui.kv([["Node id", node.id], ["Position", `${Math.round(node.x)}, ${Math.round(node.y)}`]]),
+        Studio.ui.kv([["Node id", node.id], ["Position", positionValue]]),
       ], null, false));
       root.append(agentSection("connections", "Connections", [
         h("div", { class: "stack tight" }, outgoing.length || incoming.length ? [
@@ -1953,27 +2189,74 @@
     );
   }
 
+  /* Merge the already-ordered event history with one snapshot's batch in O(n).
+     The stream is `since=`-based, so only the small batch needs normalising;
+     re-sorting the whole run on every frame was wasted work. */
+  function mergeRunEvents(previous, incoming) {
+    if (!incoming.length) return previous;
+    const batch = incoming.length > 1
+      ? Array.from(new Map(incoming.map(event => [event.seq, event])).values())
+        .sort((a, b) => (a.seq || 0) - (b.seq || 0))
+      : incoming;
+    if (!previous.length) return batch;
+    const merged = [];
+    let left = 0;
+    let right = 0;
+    while (left < previous.length && right < batch.length) {
+      const before = previous[left];
+      const after = batch[right];
+      const beforeSeq = before.seq || 0;
+      const afterSeq = after.seq || 0;
+      if (beforeSeq < afterSeq) { merged.push(before); left += 1; }
+      else if (afterSeq < beforeSeq) { merged.push(after); right += 1; }
+      else { merged.push(after); left += 1; right += 1; }
+    }
+    while (left < previous.length) { merged.push(previous[left]); left += 1; }
+    while (right < batch.length) { merged.push(batch[right]); right += 1; }
+    return merged;
+  }
+
   function acceptRun(snapshot) {
-    const previous = state.run && state.run.id === snapshot.id ? state.run.events || [] : [];
+    const sameRun = state.run && state.run.id === snapshot.id;
+    const previous = sameRun ? state.run.events || [] : [];
+    const previousNodes = sameRun ? state.run.nodes || null : null;
+    const previousBreakpoints = state.breakpoints;
+    const previousSelection = [...state.selected].sort().join(",");
+    if (!sameRun) {
+      nodePreviewSeq = -1;
+      nodePreviewRun = "";
+      nodePreviewMap = new Map();
+    }
     if (state.run && state.run.id !== snapshot.id) state.lastRunNode = null;
-    const events = previous.concat(snapshot.events || []);
-    const unique = Array.from(new Map(events.map(event => [event.seq, event])).values()).sort((a, b) => a.seq - b.seq);
+    const unique = mergeRunEvents(previous, snapshot.events || []);
     state.run = { ...snapshot, events: unique };
-    state.eventSeq = Math.max(state.eventSeq, snapshot.event_count || 0, ...unique.map(event => event.seq || 0));
+    const latestSeq = unique.length ? unique[unique.length - 1].seq || 0 : 0;
+    state.eventSeq = Math.max(state.eventSeq, snapshot.event_count || 0, latestSeq);
     if (snapshot.debug) state.breakpoints = new Set(snapshot.breakpoints || []);
     const paused = snapshot.status === "paused";
     if (snapshot.current_node && snapshot.current_node !== state.lastRunNode && (state.follow || paused)) {
       state.lastRunNode = snapshot.current_node;
       state.selected = new Set([snapshot.current_node]);
+      const previousEdge = state.edge;
       state.edge = null;
+      if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
       focusNode(snapshot.current_node);
     }
     /* Snapshots can arrive several times per frame; coalesce the expensive
-       panels so a streaming run cannot stall canvas dragging. */
+       panels so a streaming run cannot stall canvas dragging.  Nodes are
+       repainted in place, and the inspector is only rebuilt when the data it
+       shows (selection, node outcome, breakpoints) actually changed; a
+       rebuild would also drop focus from a field being edited. */
+    const nodes = state.run.nodes || {};
+    const nodesChanged = previousNodes === null
+      ? Object.keys(nodes).some(id => nodes[id] && nodes[id] !== "pending")
+      : Object.keys(nodes).some(id => (previousNodes[id] || "pending") !== nodes[id]);
+    const breakpointsChanged = snapshot.debug
+      && [...previousBreakpoints].sort().join(",") !== [...state.breakpoints].sort().join(",");
+    const selectionChanged = previousSelection !== [...state.selected].sort().join(",");
     frame("run-panel", renderRun);
-    frame("run-nodes", renderNodes);
-    frame("run-inspector", renderInspector);
-    renderStatus();
+    frame("run-nodes", paintRunNodes);
+    if (!sameRun || nodesChanged || breakpointsChanged || selectionChanged) frame("run-inspector", renderInspector);
     if (snapshot.awaiting_input || paused) showDetails("run");
   }
 
@@ -2065,22 +2348,524 @@
     } catch (error) { Studio.toast(error.message, "error"); }
   }
 
+  let runView = null;
+  let runEventsTimer = 0;
+  let runEventsCache = null;
+  const runEventText = new WeakMap();
+
+  function cancelRunEvents() {
+    if (!runEventsTimer) return;
+    clearTimeout(runEventsTimer);
+    runEventsTimer = 0;
+  }
+
+  function eventSummary(event) {
+    const type = String(event.type || "event");
+    const node = String(event.node || event.agent || "");
+    const detail = event.input && typeof event.input === "object"
+      ? event.input.path || event.input.command || event.input.query || event.input.name || ""
+      : "";
+    const tool = event.ability || event.tool || "tool";
+    const tokens = Number(event.usage && event.usage.completion_tokens) || 0;
+    switch (type) {
+      case "node_started": return `Started ${event.label || node || "node"}`;
+      case "node_finished": return `Finished ${node || "node"}${event.elapsed_ms ? ` in ${event.elapsed_ms} ms` : ""}`;
+      case "node_failed": return `Failed ${node || "node"}: ${event.error || "error"}`;
+      case "tool_call": return `${tool}${detail ? ` · ${detail}` : ""}`;
+      case "tool_result": return `${tool} ${event.ok === false ? "failed" : "returned"}`;
+      case "assistant_start": return "Model turn started";
+      case "assistant_delta": return `Streaming ${String(event.text || "").length} characters`;
+      case "reasoning_delta": return `Thinking · ${String(event.text || "").length} characters`;
+      case "assistant_end": return `Model turn finished${tokens ? ` · ${tokens} tokens` : ""}`;
+      case "plan": return `Plan updated · ${Array.isArray(event.plan) ? event.plan.length : 0} steps`;
+      case "log": return event.message || event.level || "Log message";
+      case "swarm_agent_start": return `${event.label || node} started`;
+      case "swarm_agent_end": return `${event.label || node} ${event.ok === false ? "failed" : "finished"}`;
+      case "swarm_agent_tool": return `${event.label || node} used ${event.tool || "a tool"}`;
+      case "swarm_review": return `${event.reviewer} reviewed ${event.target} · ${event.score}/5`;
+      case "swarm_round": return `${format.title(String(event.phase || "round"))}${event.round ? ` ${event.round}` : ""}`;
+      case "swarm_end": return `Swarm ${event.ok === false ? "failed" : "finished"}`;
+      default: return event.message || type;
+    }
+  }
+
+  function runEventRow(event, currentNode) {
+    const details = { ...event }; delete details.seq; delete details.at; delete details.type;
+    return h("div", { class: `run-event${event.node ? " clickable" : ""}${event.node === currentNode ? " current" : ""}${event.level === "error" ? " error" : ""}`, title: event.node ? "Select and focus this node" : null, onclick: event.node ? () => { selectNode(event.node); focusNode(event.node); } : null },
+      h("span", { class: "event-time", text: String(event.at || "").split("T").pop() }),
+      h("div", { class: "grow" },
+        h("div", { class: "row between" }, h("strong", { text: `${event.type}${event.node ? ` · ${event.node}` : ""}` }),
+          Studio.ui.iconButton("copy", "Copy event JSON", copyEvent => { copyEvent.stopPropagation(); Studio.copy(JSON.stringify(event, null, 2), "Event copied"); }, { small: true })),
+        h("p", { class: "run-event-summary", text: eventSummary(event) }),
+        h("details", { class: "run-event-details", onclick: click => click.stopPropagation() },
+          h("summary", { text: "Details" }),
+          h("pre", { class: "muted", text: JSON.stringify(details, null, 1) }))));
+  }
+
+  /* Event rows are the expensive part of the run panel.  New events arrive in
+     order, so prepend only the fresh ones and trim the oldest; a filter change
+     or a reconnecting snapshot still rebuilds the short visible window. */
   function renderRunEvents(host, run) {
     const query = state.runFilter.trim().toLowerCase();
-    const events = (run.events || []).filter(event => !query || JSON.stringify(event).toLowerCase().includes(query)).slice(-140).reverse();
+    const hideDeltas = Boolean(state.runHideDeltas);
+    const all = run.events || [];
+    const latestSeq = all.length ? all[all.length - 1].seq || 0 : 0;
+    let cache = runEventsCache;
+    const reusable = cache && cache.host === host && cache.query === query
+      && cache.hideDeltas === hideDeltas && latestSeq >= cache.lastSeq && all.length >= cache.count;
+    if (reusable) {
+      for (const row of cache.rows) {
+        row.element.classList.toggle("current", Boolean(row.node) && row.node === run.current_node);
+      }
+      const fresh = [];
+      for (let index = all.length - 1; index >= 0; index -= 1) {
+        const event = all[index];
+        if ((event.seq || 0) <= cache.lastSeq) break;
+        fresh.push(event);
+      }
+      fresh.reverse();
+      for (const event of fresh) {
+        if (hideDeltas && DELTA_EVENTS.has(event.type)) continue;
+        if (query && !eventHaystack(event).includes(query)) continue;
+        const element = runEventRow(event, run.current_node);
+        host.prepend(element);
+        cache.rows.unshift({ element, node: event.node });
+      }
+      while (cache.rows.length > 140) cache.rows.pop().element.remove();
+      if (cache.rows.length && cache.placeholder) {
+        cache.placeholder.remove();
+        cache.placeholder = null;
+      }
+      cache.lastSeq = Math.max(cache.lastSeq, latestSeq);
+      cache.count = all.length;
+      return;
+    }
+    const events = all
+      .filter(event => !(hideDeltas && DELTA_EVENTS.has(event.type)))
+      .filter(event => !query || eventHaystack(event).includes(query))
+      .slice(-140).reverse();
     Studio.ui.render(host);
+    cache = { host, query, hideDeltas, lastSeq: latestSeq, count: all.length, rows: [], placeholder: null };
+    runEventsCache = cache;
     if (!events.length) {
-      host.append(h("p", { class: "muted small", text: query ? "No event matches this filter." : "The run has not emitted events yet." }));
+      cache.placeholder = h("p", { class: "muted small", text: query
+        ? "No event matches this filter."
+        : hideDeltas
+          ? "Token deltas are hidden. Uncheck “Hide token deltas” to inspect them; live text is shown above."
+          : "The run has not emitted events yet." });
+      host.append(cache.placeholder);
       return;
     }
     for (const event of events) {
-      const details = { ...event }; delete details.seq; delete details.at; delete details.type;
-      host.append(h("div", { class: `run-event${event.node ? " clickable" : ""}${event.node === run.current_node ? " current" : ""}`, title: event.node ? "Select and focus this node" : null, onclick: event.node ? () => { selectNode(event.node); focusNode(event.node); } : null },
-        h("span", { class: "event-time", text: String(event.at || "").split("T").pop() }),
-        h("div", { class: "grow" }, h("div", { class: "row between" }, h("strong", { text: `${event.type}${event.node ? ` · ${event.node}` : ""}` }),
-          Studio.ui.iconButton("copy", "Copy event JSON", copyEvent => { copyEvent.stopPropagation(); Studio.copy(JSON.stringify(event, null, 2), "Event copied"); }, { small: true })),
-          h("pre", { class: "muted", text: JSON.stringify(details, null, 1) }))));
+      const element = runEventRow(event, run.current_node);
+      cache.rows.push({ element, node: event.node });
+      host.append(element);
     }
+  }
+
+  function eventHaystack(event) {
+    let text = runEventText.get(event);
+    if (text === undefined) {
+      text = JSON.stringify(event).toLowerCase();
+      runEventText.set(event, text);
+    }
+    return text;
+  }
+
+  function scheduleRunEvents(run, immediate = false) {
+    if (!runView) return;
+    if (immediate) {
+      cancelRunEvents();
+      renderRunEvents(runView.eventsHost, run);
+      return;
+    }
+    if (runEventsTimer) return;
+    runEventsTimer = setTimeout(() => {
+      runEventsTimer = 0;
+      if (runView && state.run) renderRunEvents(runView.eventsHost, state.run);
+    }, 120);
+  }
+
+  /* The live pane follows the current model turn and every active swarm
+     member.  Deltas are hidden from the event log by default, so this is the
+     readable tail of a streaming run instead of a wall of JSON frames. */
+  function livePreview(value) {
+    const text = String(value || "");
+    const trimmed = text.trimStart();
+    if (trimmed.startsWith("{") || trimmed.startsWith("```")) {
+      return "Preparing a tool call…";
+    }
+    return text.slice(-6000);
+  }
+
+  function runLiveBlocks(run) {
+    const blocks = new Map();
+    const labels = new Map();
+    let order = 0;
+    let current = null;
+    let previousAt = NaN;
+    const ensure = (key, label, node) => {
+      let block = blocks.get(key);
+      if (!block) {
+        block = { key, label, node, text: "", reasoning: "", note: "", live: false, order: 0,
+          startedAt: 0, firstAt: 0, firstTextAt: 0, lastAt: 0, chars: 0, rate: 0, latency: null,
+          totalChars: 0, reasoningChars: 0 };
+        blocks.set(key, block);
+      }
+      return block;
+    };
+    const turn = (event) => {
+      const key = `node:${String(event.node || "")}:${event.iteration || 0}`;
+      if (!current || current.key !== key) {
+        if (current) current.live = false;
+        const node = String(event.node || "");
+        current = ensure(key, labels.get(node) || node || "model", node);
+        current.startedAt = Number.isFinite(previousAt) ? previousAt : 0;
+      }
+      return current;
+    };
+    for (const event of run.events || []) {
+      const type = event.type;
+      const node = String(event.node || "");
+      const at = Date.parse(event.at || "");
+      if (type === "node_started") {
+        if (node) labels.set(node, event.label || node);
+        if (current) current.live = false;
+        current = null;
+      } else if (type === "assistant_delta") {
+        current = turn(event);
+        current.text = `${current.text}${event.text || ""}`.slice(-6000);
+        current.totalChars += (event.text || "").length;
+        if (Number.isFinite(at)) {
+          if (!current.firstAt) current.firstAt = at;
+          if (!current.firstTextAt) current.firstTextAt = at;
+          current.lastAt = at;
+        }
+        current.chars = current.totalChars;
+        current.note = "writing";
+        current.live = true;
+        current.order = ++order;
+      } else if (type === "reasoning_delta") {
+        current = turn(event);
+        current.reasoning = `${current.reasoning}${event.text || ""}`.slice(-4000);
+        current.reasoningChars += (event.text || "").length;
+        if (Number.isFinite(at)) {
+          if (!current.firstAt) current.firstAt = at;
+          current.lastAt = at;
+        }
+        current.note = "thinking";
+        current.live = true;
+        current.order = ++order;
+      } else if (type === "tool_call" || type === "tool_result") {
+        if (current) {
+          current.note = type === "tool_call"
+            ? `using ${event.ability || event.tool || "a tool"}…`
+            : `${event.ability || event.tool || "tool"} ${event.ok === false ? "failed" : "returned"}`;
+          current.order = ++order;
+        }
+      } else if (type === "node_finished" || type === "node_failed") {
+        if (current) {
+          current.live = false;
+          current.note = type === "node_failed" ? "failed" : "done";
+          current.order = ++order;
+        }
+      } else if (type === "swarm_agent_start") {
+        const id = String(event.agent || event.label || "leader");
+        current = ensure(`agent:${id}`, event.label || id, node);
+        current.text = "";
+        current.reasoning = "";
+        current.note = event.message || "started";
+        current.startedAt = Number.isFinite(at) ? at : 0;
+        current.firstAt = 0;
+        current.firstTextAt = 0;
+        current.lastAt = 0;
+        current.chars = 0;
+        current.rate = 0;
+        current.latency = null;
+        current.totalChars = 0;
+        current.reasoningChars = 0;
+        current.live = true;
+        current.order = ++order;
+      } else if (type === "swarm_agent_delta") {
+        const id = String(event.agent || event.label || "leader");
+        const block = ensure(`agent:${id}`, event.label || id, node);
+        block.text = `${block.text}${event.text || ""}`.slice(-6000);
+        block.totalChars += (event.text || "").length;
+        if (Number.isFinite(at)) {
+          if (!block.firstAt) block.firstAt = at;
+          if (!block.firstTextAt) block.firstTextAt = at;
+          block.lastAt = at;
+        }
+        block.chars = block.totalChars;
+        block.note = event.phase === "review" ? "reviewing" : "writing";
+        block.live = true;
+        block.order = ++order;
+        current = block;
+      } else if (type === "swarm_agent_status") {
+        const id = String(event.agent || event.label || "leader");
+        const block = ensure(`agent:${id}`, event.label || id, node);
+        block.note = event.message || block.note;
+        block.order = ++order;
+      } else if (type === "swarm_agent_tool") {
+        const id = String(event.agent || event.label || "leader");
+        const block = ensure(`agent:${id}`, event.label || id, node);
+        block.note = event.message || `using ${event.tool || "a tool"}…`;
+        block.live = true;
+        block.order = ++order;
+      } else if (type === "swarm_agent_end") {
+        const id = String(event.agent || event.label || "leader");
+        const block = ensure(`agent:${id}`, event.label || id, node);
+        block.note = event.ok === false ? "failed" : "finished";
+        block.live = false;
+        block.order = ++order;
+      } else if (type === "swarm_end") {
+        for (const block of blocks.values()) {
+          if (block.key.startsWith("agent:")) block.live = false;
+        }
+      }
+      previousAt = Number.isFinite(at) ? at : previousAt;
+    }
+    const rows = [...blocks.values()].filter(block => block.text || block.reasoning);
+    for (const block of rows) {
+      block.chars = block.totalChars || block.text.length;
+      block.reasoningChars = block.reasoningChars || block.reasoning.length;
+      block.latency = block.firstAt && block.startedAt
+        ? Math.max(0, (block.firstAt - block.startedAt) / 1000) : null;
+      block.rate = block.firstTextAt && block.lastAt > block.firstTextAt && block.chars
+        ? Math.round(block.chars / ((block.lastAt - block.firstTextAt) / 1000)) : 0;
+    }
+    return rows
+      .sort((left, right) => right.order - left.order)
+      .slice(0, 6);
+  }
+
+  function nodeLivePreviews(run) {
+    const blocks = runLiveBlocks(run);
+    const counts = new Map();
+    for (const block of blocks) {
+      if (!block.node || !block.key.startsWith("agent:")) continue;
+      counts.set(block.node, (counts.get(block.node) || 0) + 1);
+    }
+    const previews = new Map();
+    for (const block of blocks) {
+      if (!block.node) continue;
+      const existing = previews.get(block.node);
+      const better = !existing
+        || (block.live && !existing.live)
+        || (block.live === existing.live && block.order > existing.order);
+      if (!better) continue;
+      const group = block.key.startsWith("agent:");
+      const count = counts.get(block.node) || 0;
+      previews.set(block.node, {
+        order: block.order,
+        label: group && count > 1 ? `${count} agents · ${block.label}` : block.label,
+        group,
+        text: livePreview(block.text) || (block.reasoning ? "Thinking…" : ""),
+        live: block.live,
+      });
+    }
+    return previews;
+  }
+
+  function runTokenTotal(run) {
+    let total = 0;
+    for (const event of run.events || []) {
+      if (!["assistant_end", "swarm_agent_end", "node_finished"].includes(event.type)) continue;
+      const usage = event.usage || (event.output && event.output.usage);
+      total += Number(usage && usage.completion_tokens) || 0;
+    }
+    return total;
+  }
+
+  function renderRunLive(view, run) {
+    const active = activeRun();
+    view.live.classList.toggle("hidden", !active);
+    if (!active) {
+      view.liveKey = "";
+      view.liveSeq = -1;
+      return;
+    }
+    const events = run.events || [];
+    const latest = events.length ? events[events.length - 1].seq || 0 : 0;
+    if (view.liveSeq !== latest) {
+      view.liveSeq = latest;
+      view.liveBlocks = runLiveBlocks(run);
+    }
+    const blocks = view.liveBlocks || [];
+    const streaming = blocks.filter(block => block.live).length;
+    if (blocks.length) {
+      view.liveStatus.textContent = streaming ? `${streaming} streaming` : "Waiting for the next step…";
+    } else {
+      const last = events[events.length - 1];
+      view.liveStatus.textContent = last ? eventSummary(last) : "Waiting for model output…";
+    }
+    view.liveSpinner.classList.toggle("hidden", !streaming);
+    const key = blocks.map(block => [block.key, block.text.length, block.chars,
+      block.reasoning.length, block.reasoningChars, block.live ? 1 : 0, block.note].join(":")).join("|");
+    if (key === view.liveKey) return;
+    view.liveKey = key;
+    const previousTop = view.liveBody.scrollTop;
+    Studio.ui.render(view.liveBody);
+    for (const block of blocks) {
+      const reasoning = block.reasoning
+        ? h("details", { class: "run-live-reasoning", open: block.live && !block.text },
+          h("summary", { text: `Thinking · ${(block.reasoningChars || block.reasoning.length).toLocaleString()} chars` }),
+          h("div", { class: "reasoning-live", text: block.reasoning.slice(-3000) }))
+        : null;
+      const metrics = [];
+      if (block.chars) metrics.push(`${block.chars.toLocaleString()} chars`);
+      if (block.rate) metrics.push(`${block.rate} ch/s`);
+      if (block.latency !== null && block.latency !== undefined) {
+        metrics.push(`${block.latency.toFixed(1)}s to first`);
+      }
+      view.liveBody.append(h("section", { class: "run-live-block" },
+        h("div", { class: "run-live-block-head" },
+          block.live ? h("span", { class: "spinner", "aria-hidden": "true" })
+            : h("span", { class: "swarm-glyph" }, Studio.icon(block.note === "failed" ? "alert" : "check", "small")),
+          h("strong", { class: "grow", text: block.label }),
+          h("span", { class: "muted tiny", text: block.note || "" })),
+        metrics.length ? h("p", { class: "run-live-metrics muted tiny", text: metrics.join(" · ") }) : null,
+        reasoning,
+        block.text ? h("div", { class: "run-live-text", text: livePreview(block.text) }) : null));
+    }
+    if (view.liveFollow.checked) view.liveBody.scrollTop = view.liveBody.scrollHeight;
+    else view.liveBody.scrollTop = previousTop;
+  }
+
+  /* Build the panel once per run.  Streaming snapshots then update the few
+     values that changed instead of recreating the filter input (and the
+     caret), the disclosure bodies and every event row several times a second. */
+  function buildRunView(run) {
+    if (state.runHideDeltas === null) {
+      state.runHideDeltas = Studio.store.get("agents-run-hide-deltas", true) !== false;
+    }
+    const statusHost = h("span");
+    statusHost.append(Studio.ui.status(run.status));
+    const steps = Studio.ui.badge(`${run.steps || 0} steps`);
+    const elapsed = Studio.ui.badge(format.duration(run.elapsed || 0));
+    const tokens = Studio.ui.badge("0 tokens");
+    tokens.classList.add("hidden");
+    const liveIndicator = h("span", { class: "run-live-indicator hidden" },
+      h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { text: "Live" }));
+    const stop = Studio.ui.button("Stop", { small: true, kind: "danger", onclick: () => runAction("cancel") });
+    const nodeLabel = h("span", { class: "muted tiny" });
+    const header = h("div", { class: "row between wrap" }, h("div", { class: "row wrap" }, statusHost, h("strong", { text: run.id }), steps, elapsed, tokens, liveIndicator,
+      run.dry_run ? Studio.ui.badge("Test mode", "accent") : null, run.debug ? Studio.ui.badge("Debugger", "accent") : null, stop), nodeLabel);
+    const extras = h("div", { class: "stack tight" });
+    const filter = h("input", { id: "agents-run-filter", type: "search", value: state.runFilter, placeholder: "Filter events by node, type or text…", "aria-label": "Filter run events" });
+    const eventsHost = h("div", { class: "stack tight" });
+    filter.addEventListener("input", () => {
+      state.runFilter = filter.value;
+      cancelRunEvents();
+      if (state.run) renderRunEvents(eventsHost, state.run);
+    });
+    const follow = Studio.form.control({ type: "checkbox", value: state.follow });
+    follow.addEventListener("change", () => {
+      state.follow = follow.checked;
+      if (state.follow && state.run && state.run.current_node) focusNode(state.run.current_node);
+    });
+    const hideDeltas = Studio.form.control({ type: "checkbox", value: state.runHideDeltas });
+    hideDeltas.addEventListener("change", () => {
+      state.runHideDeltas = hideDeltas.checked;
+      Studio.store.set("agents-run-hide-deltas", hideDeltas.checked);
+      cancelRunEvents();
+      if (state.run) renderRunEvents(eventsHost, state.run);
+    });
+    const toolbar = h("div", { class: "agent-run-toolbar" }, filter,
+      h("label", { class: "check" }, follow, "Follow running node"),
+      h("label", { class: "check" }, hideDeltas, "Hide token deltas"),
+      Studio.ui.button("Run history", { small: true, onclick: () => { stopWatching(); state.run = null; state.eventSeq = 0; state.lastRunNode = null; state.runPanelKey = ""; renderRun(); } }),
+      Studio.ui.button("Copy run JSON", { small: true, onclick: () => { if (state.run) Studio.copy(JSON.stringify(state.run, null, 2), "Run copied"); } }));
+    const liveStatus = h("span", { class: "muted tiny", "aria-live": "polite" });
+    const liveBody = h("div", { class: "run-live-body", "aria-live": "off" });
+    const liveFollow = Studio.form.control({ type: "checkbox", value: true });
+    liveFollow.addEventListener("change", () => {
+      if (liveFollow.checked) liveBody.scrollTop = liveBody.scrollHeight;
+    });
+    liveBody.addEventListener("scroll", () => {
+      const pinned = liveBody.scrollHeight - liveBody.scrollTop - liveBody.clientHeight < 24;
+      liveFollow.checked = pinned;
+    }, { passive: true });
+    const liveSpinner = h("span", { class: "spinner", "aria-hidden": "true" });
+    const live = h("div", { class: "run-live hidden" },
+      h("div", { class: "run-live-head" }, liveSpinner,
+        h("strong", { class: "grow", text: "Live output" }), liveStatus,
+        Studio.ui.iconButton("copy", "Copy live output", () => {
+          if (!state.run) return;
+          const text = runLiveBlocks(state.run)
+            .map(block => `${block.label}\n${block.text}`).join("\n\n");
+          Studio.copy(text || "No live output yet", "Live output copied");
+        }, { small: true }),
+        h("label", { class: "check" }, liveFollow, "Follow")),
+      liveBody);
+    const outputBody = h("div", { class: "disclosure-body" });
+    const output = h("details", { class: "disclosure", open: true }, h("summary", { text: "Final output" }), outputBody);
+    const varsBody = h("div", { class: "disclosure-body" });
+    const variables = h("details", { class: "disclosure" }, h("summary", { text: "Variables" }), varsBody);
+    const root = h("div", { class: "stack tight" }, header, extras, toolbar, live, output, variables, eventsHost);
+    return {
+      id: run.id, root, statusHost, statusValue: run.status, steps, elapsed, tokens, liveIndicator, stop, nodeLabel,
+      extras, extraKey: null, filter, eventsHost, live, liveStatus, liveBody, liveSpinner, liveFollow,
+      liveKey: "", liveSeq: -1, liveBlocks: [],
+      output, outputBody, outputText: null, varsBody, varsText: null,
+    };
+  }
+
+  function syncRunView(view, run) {
+    if (view.statusValue !== run.status) {
+      view.statusValue = run.status;
+      view.statusHost.replaceChildren(Studio.ui.status(run.status));
+    }
+    view.steps.textContent = `${run.steps || 0} steps`;
+    view.elapsed.textContent = format.duration(run.elapsed || 0);
+    const totalTokens = runTokenTotal(run);
+    view.tokens.textContent = `${totalTokens.toLocaleString()} tokens`;
+    view.tokens.classList.toggle("hidden", !totalTokens);
+    view.liveIndicator.classList.toggle("hidden", !activeRun());
+    view.stop.classList.toggle("hidden", !activeRun());
+    view.nodeLabel.textContent = run.error || run.current_node || "";
+    const request = run.awaiting_input || null;
+    const extraKey = [run.error || "", run.status, run.debug ? "debug" : "", run.current_node || "",
+      request ? JSON.stringify(request) : ""].join("\u0000");
+    if (extraKey !== view.extraKey) {
+      view.extraKey = extraKey;
+      Studio.ui.render(view.extras);
+      if (run.error) view.extras.append(Studio.ui.callout("danger", h("strong", { text: "Run failed" }), h("p", { class: "small", text: run.error })));
+      if (run.status === "paused" && run.debug) {
+        view.extras.append(h("div", { class: "callout warning stack" }, h("strong", { text: `Paused at ${run.current_node || "a breakpoint"}` }),
+          h("div", { class: "row wrap" }, Studio.ui.button("Step one node", { kind: "primary", onclick: () => runAction("step") }), Studio.ui.button("Resume", { onclick: () => runAction("resume") }))));
+      }
+      if (request) {
+        const form = h("div", { class: "callout warning stack" }, h("strong", { text: request.prompt || "Input required" }));
+        if (request.kind === "approve") form.append(h("div", { class: "row" }, Studio.ui.button("Approve", { kind: "primary", onclick: () => provideInput(true) }), Studio.ui.button("Reject", { kind: "danger", onclick: () => provideInput(false) })));
+        else if (request.kind === "choice") {
+          const select = h("select", {}, (request.choices || []).map(choice => h("option", { value: choice, text: choice })));
+          form.append(h("div", { class: "input-action" }, select, Studio.ui.button("Submit", { kind: "primary", onclick: () => provideInput(select.value) })));
+        } else {
+          const input = h("input", { value: request.default || "", "aria-label": "Human response" });
+          form.append(h("div", { class: "input-action" }, input, Studio.ui.button("Submit", { kind: "primary", onclick: () => provideInput(input.value) })));
+          input.addEventListener("keydown", event => { if (event.key === "Enter") provideInput(input.value); });
+        }
+        view.extras.append(form);
+      }
+    }
+    if (run.output === null || run.output === undefined) {
+      view.output.classList.add("hidden");
+    } else {
+      view.output.classList.remove("hidden");
+      const text = JSON.stringify(run.output, null, 2);
+      if (text !== view.outputText) {
+        view.outputText = text;
+        Studio.ui.render(view.outputBody, Studio.ui.code(text));
+      }
+    }
+    const varsText = JSON.stringify(run.vars || {}, null, 2);
+    if (varsText !== view.varsText) {
+      view.varsText = varsText;
+      Studio.ui.render(view.varsBody, Studio.ui.code(varsText));
+    }
+    renderRunLive(view, run);
+    scheduleRunEvents(run, !activeRun());
   }
 
   function renderRun() {
@@ -2088,53 +2873,46 @@
     $("agents-run").disabled = !state.ready || running;
     $("agents-run").title = running ? "A run is already active" : "Run this agent";
     const panelElement = $("agents-run-panel");
-    const previousScroll = panelElement.scrollTop;
-    const root = Studio.ui.render(panelElement);
-    if (!state.run) { loadRunHistory(); renderStatus(); return; }
+    if (!state.run) {
+      cancelRunEvents();
+      runView = null;
+      state.runPanelKey = "";
+      paintRunNodes();
+      loadRunHistory();
+      renderStatus();
+      return;
+    }
     const run = state.run;
-    const panelKey = run.id;
-    const scrollTop = state.runPanelKey === panelKey ? previousScroll : 0;
-    state.runPanelKey = panelKey;
-    const hadFocus = document.activeElement && document.activeElement.id === "agents-run-filter";
-    const caret = hadFocus ? document.activeElement.selectionStart : 0;
-    root.append(h("div", { class: "row between wrap" }, h("div", { class: "row wrap" }, Studio.ui.status(run.status), h("strong", { text: run.id }),
-      Studio.ui.badge(`${run.steps} steps`), Studio.ui.badge(format.duration(run.elapsed)), run.dry_run ? Studio.ui.badge("Test mode", "accent") : null, run.debug ? Studio.ui.badge("Debugger", "accent") : null,
-      running ? Studio.ui.button("Stop", { small: true, kind: "danger", onclick: () => runAction("cancel") }) : null),
-      h("span", { class: "muted tiny", text: run.error || run.current_node || "" })));
-    if (run.error) root.append(Studio.ui.callout("danger", h("strong", { text: "Run failed" }), h("p", { class: "small", text: run.error })));
-    if (run.status === "paused" && run.debug) {
-      root.append(h("div", { class: "callout warning stack" }, h("strong", { text: `Paused at ${run.current_node || "a breakpoint"}` }),
-        h("div", { class: "row wrap" }, Studio.ui.button("Step one node", { kind: "primary", onclick: () => runAction("step") }), Studio.ui.button("Resume", { onclick: () => runAction("resume") }))));
+    if (!runView || runView.id !== run.id || !panelElement.contains(runView.root)) {
+      cancelRunEvents();
+      const previousScroll = panelElement.scrollTop;
+      const scrollTop = state.runPanelKey === run.id ? previousScroll : 0;
+      state.runPanelKey = run.id;
+      runView = buildRunView(run);
+      Studio.ui.render(panelElement, runView.root);
+      renderRunEvents(runView.eventsHost, run);
+      panelElement.scrollTop = scrollTop;
     }
-    if (run.awaiting_input) {
-      const request = run.awaiting_input;
-      const form = h("div", { class: "callout warning stack" }, h("strong", { text: request.prompt || "Input required" }));
-      if (request.kind === "approve") form.append(h("div", { class: "row" }, Studio.ui.button("Approve", { kind: "primary", onclick: () => provideInput(true) }), Studio.ui.button("Reject", { kind: "danger", onclick: () => provideInput(false) })));
-      else if (request.kind === "choice") {
-        const select = h("select", {}, (request.choices || []).map(choice => h("option", { value: choice, text: choice })));
-        form.append(h("div", { class: "input-action" }, select, Studio.ui.button("Submit", { kind: "primary", onclick: () => provideInput(select.value) })));
-      } else {
-        const input = h("input", { value: request.default || "", "aria-label": "Human response" });
-        form.append(h("div", { class: "input-action" }, input, Studio.ui.button("Submit", { kind: "primary", onclick: () => provideInput(input.value) })));
-        input.addEventListener("keydown", event => { if (event.key === "Enter") provideInput(input.value); });
-      }
-      root.append(form);
-    }
-    const filter = h("input", { id: "agents-run-filter", type: "search", value: state.runFilter, placeholder: "Filter events by node, type or text…", "aria-label": "Filter run events" });
-    const eventsHost = h("div", { class: "stack tight" });
-    filter.addEventListener("input", () => { state.runFilter = filter.value; renderRunEvents(eventsHost, run); });
-    const follow = Studio.form.control({ type: "checkbox", value: state.follow });
-    follow.addEventListener("change", () => { state.follow = follow.checked; if (state.follow && run.current_node) focusNode(run.current_node); });
-    root.append(h("div", { class: "agent-run-toolbar" }, filter, h("label", { class: "check" }, follow, "Follow running node"),
-      Studio.ui.button("Run history", { small: true, onclick: () => { stopWatching(); state.run = null; state.eventSeq = 0; state.lastRunNode = null; state.runPanelKey = ""; renderRun(); } }),
-      Studio.ui.button("Copy run JSON", { small: true, onclick: () => Studio.copy(JSON.stringify({ ...run, events: run.events }, null, 2), "Run copied") })));
-    if (run.output !== null && run.output !== undefined) root.append(h("details", { class: "disclosure", open: true }, h("summary", { text: "Final output" }), h("div", { class: "disclosure-body" }, Studio.ui.code(JSON.stringify(run.output, null, 2)))));
-    root.append(h("details", { class: "disclosure" }, h("summary", { text: "Variables" }), h("div", { class: "disclosure-body" }, Studio.ui.code(JSON.stringify(run.vars || {}, null, 2)))));
-    root.append(eventsHost);
-    renderRunEvents(eventsHost, run);
-    if (hadFocus) { filter.focus(); filter.setSelectionRange(caret, caret); }
-    root.scrollTop = scrollTop;
+    syncRunView(runView, run);
     renderStatus();
+  }
+
+  function inspectorSignature() {
+    return state.edge !== null ? `edge:${state.edge}` : `nodes:${[...state.selected].sort().join(",")}`;
+  }
+
+  function refreshInspectorAfterDrag() {
+    if (inspectorSignature() === state.inspectorSelection) paintInspectorPosition();
+    else renderInspector();
+  }
+
+  function paintInspectorPosition() {
+    const value = inspectorPosition;
+    if (!value || !value.isConnected || !state.doc || state.selected.size !== 1) return;
+    const node = nodeById([...state.selected][0]);
+    if (!node) return;
+    const text = `${Math.round(node.x)}, ${Math.round(node.y)}`;
+    if (value.textContent !== text) value.textContent = text;
   }
 
   function renderSchedule() {
@@ -2400,11 +3178,13 @@
     canvas.addEventListener("dragover", event => {
       if (!state.doc || !state.meta || !event.dataTransfer.types.includes("application/x-mariana-node")) return;
       event.preventDefault();
-      const index = nearestEdge(state.doc, screenToWorld(event), Math.max(14, 20 / state.zoom));
-      if (index !== state.dropEdge) { state.dropEdge = index; renderEdges(); }
+      state.dragPoint = screenToWorld(event);
+      frame("drop-edge", updateDropEdge);
     });
     canvas.addEventListener("dragleave", event => {
       if (event.relatedTarget && canvas.contains(event.relatedTarget)) return;
+      cancelFrame("drop-edge");
+      state.dragPoint = null;
       if (state.dropEdge !== null) { state.dropEdge = null; renderEdges(); }
     });
     canvas.addEventListener("drop", event => {
@@ -2412,6 +3192,8 @@
       const type = event.dataTransfer.getData("application/x-mariana-node");
       if (!type) return;
       event.preventDefault();
+      cancelFrame("drop-edge");
+      state.dragPoint = null;
       const point = screenToWorld(event);
       const index = state.dropEdge === null ? nearestEdge(state.doc, point, Math.max(14, 20 / state.zoom)) : state.dropEdge;
       state.dropEdge = null;
@@ -2614,8 +3396,10 @@
           if (state.find.open) { closeFind(); $("agents-canvas").focus(); event.preventDefault(); return; }
           if (state.connection) { cancelConnection(); event.preventDefault(); return; }
           if (state.panMode) { state.panMode = false; updatePanMode(); event.preventDefault(); return; }
+          const previousEdge = state.edge;
           state.selected.clear(); state.edge = null; state.connection = null;
-          renderEdges(); paintSelection(); renderInspector(); renderSelectionToolbar(); renderStatus();
+          if (previousEdge !== null) paintEdgeSelection(previousEdge, null);
+          paintSelection(); renderInspector(); renderSelectionToolbar(); renderStatus();
           return;
         }
         if (!idle() || !canvasKeyboardTarget(event.target)) return;
@@ -2634,10 +3418,10 @@
       });
       document.addEventListener("keyup", event => {
         if (event.key === " " && state.spaceHeld) { state.spaceHeld = false; updatePanMode(); }
-        else if (event.key.startsWith("Arrow") && state.selected.size && Studio.views.current === "agents" && !Studio.isTyping(event.target)) renderInspector();
+        else if (event.key.startsWith("Arrow") && state.selected.size && Studio.views.current === "agents" && !Studio.isTyping(event.target)) paintInspectorPosition();
       });
-      window.addEventListener("resize", () => frame("minimap", drawMinimapNow));
-      Studio.on("theme", () => { minimapPalette = null; frame("minimap", drawMinimapNow); });
+      window.addEventListener("resize", () => scheduleMinimap(true));
+      Studio.on("theme", () => { minimapPalette = null; scheduleMinimap(true); });
       window.addEventListener("blur", () => {
         if (state.spaceHeld) { state.spaceHeld = false; updatePanMode(); }
         const drag = state.drag;
@@ -2648,7 +3432,7 @@
         $("agents-canvas").classList.remove("panning");
         state.guides = []; renderGuides();
         cancelConnection();
-        if (drag && drag.kind === "nodes" && drag.moved) { markDirty(); scheduleValidation(); renderInspector(); }
+        if (drag && drag.kind === "nodes" && drag.moved) { markDirty(); scheduleValidation(); refreshInspectorAfterDrag(); }
         if (state.nodeRenderPending) { state.nodeRenderPending = false; renderNodes(); }
       });
       window.addEventListener("beforeunload", event => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
@@ -2657,7 +3441,7 @@
     deactivate() {
       state.renaming = null; state.panMode = false; state.spaceHeld = false; state.lastClick = null;
       state.drag = null; state.guides = []; state.nodeRenderPending = false;
-      cancelAllFrames(); cancelConnection();
+      cancelAllFrames(); cancelRunEvents(); cancelConnection(); cancelMinimap();
       for (const element of state.nodeElements.values()) element.classList.remove("dragging", "connect-source", "connect-target");
       renderGuides();
       $("agents-canvas").classList.remove("panning");
@@ -2685,7 +3469,7 @@
           const data = await api(`/api/agents/${encodeURIComponent(state.agents[0].id)}`);
           loadDocument(data.agent); if (data._meta.active_run) watchRun(data._meta.active_run, true);
         } else loadDocument(blankAgent());
-      } else { renderAll(); renderSchedule(); renderSpec(); }
+      } else { renderAll(); renderRun(); renderSchedule(); renderSpec(); }
       if (parameters.action) {
         const action = parameters.action;
         window.history.replaceState(null, "", "#/agents");
@@ -2694,6 +3478,6 @@
     },
   });
 
-  Studio.agents = { parseRunInput, findNodes, rankNodeTypes, alignPositions, distributePositions, nearestEdge, edgeMidpoint, worldPoint, zoomedPan };
+  Studio.agents = { parseRunInput, findNodes, rankNodeTypes, alignPositions, distributePositions, nearestEdge, edgeMidpoint, worldPoint, zoomedPan, runLiveBlocks, nodeLivePreviews };
   if (Studio.palette && Studio.palette.add) registerDesignerCommands();
 })();

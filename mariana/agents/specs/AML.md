@@ -1,4 +1,4 @@
-# Agent Management Language (AML) v1.6
+# Agent Management Language (AML) v1.8
 
 AML is a portable, human-readable format for describing an agent as a directed
 flowchart with abilities, model settings, schedules and run controls. The
@@ -6,7 +6,7 @@ canonical encoding is JSON; YAML is accepted on import when PyYAML is
 installed. Studio stores the normalized JSON form.
 
 - Media type: `application/vnd.mariana.aml+json`
-- Current version: `1.6` (a superset of `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changelog](#9-changelog))
+- Current version: `1.8` (a superset of `1.7`, `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changelog](#9-changelog))
 - Transport for execution: [Agent Management Protocol (AMP)](./AMP.md)
 - Studio location: **Agents** workspace → **Spec** panel
 
@@ -19,7 +19,7 @@ debug an automation entirely through HTTP.
 
 ```json
 {
-  "aml": "1.6",
+  "aml": "1.8",
   "kind": "agent",
   "id": "daily-digest",
   "name": "Daily digest",
@@ -73,7 +73,7 @@ debug an automation entirely through HTTP.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `aml` | string | yes | `"1.6"`, `"1.5"`, `"1.4"`, `"1.3"`, `"1.2"`, `"1.1"` or `"1.0"`. Documents are normalized to `1.6`; any other value validates with a warning. |
+| `aml` | string | yes | `"1.8"`, `"1.7"`, `"1.6"`, `"1.5"`, `"1.4"`, `"1.3"`, `"1.2"`, `"1.1"` or `"1.0"`. Documents are normalized to `1.8`; any other value validates with a warning. |
 | `kind` | string | yes | Must be `"agent"`. |
 | `id` | slug | recommended | Lowercase letters, digits and dashes. Derived from `name` when omitted. |
 | `name` | string | yes | Display name, max 120 chars. |
@@ -143,11 +143,13 @@ type-specific. Unknown top-level node keys are ignored.
 |---|---|---|---|
 | `start` | trigger | Exactly one per agent. Receives the run input as `input`. | `{}` |
 | `end` | output | Finishes the run. | `{"output": "<template>"}` |
-| `llm` | intelligence | Calls a model once. | `model`, `system`, `prompt`, `format` (`text`/`json`), `temperature`, `max_tokens` |
-| `agent` | intelligence | **AI agent** (1.1): a model that chooses abilities itself until it has an answer. | `model`, `system`, `goal`, `abilities` (ids; empty = all granted), `max_iterations` (1–40), `temperature`, `max_tokens` |
+| `llm` | intelligence | Calls a model once. | `model`, `system`, `prompt`, `format` (`text`/`json`), `temperature`, `max_tokens`, `fallback_model` |
+| `agent` | intelligence | **AI agent** (1.1): a model that chooses abilities itself until it has an answer. | `model`, `system`, `goal`, `abilities` (ids; empty = all granted), `max_iterations` (1–40), `temperature`, `max_tokens`, `fallback_model` |
 | `swarm` | intelligence | **Agent swarm** (1.4): a leader model plans a team, members work, talk, remember and review, then the leader synthesises. | `model`, `leader_model`, `system`, `goal`, `agents`, `tools`, `strategy`, `rounds`, `max_agents`, `max_steps`, `max_seconds`, `write`, `memory`, `ipc` |
 | `tool` | action | Executes a granted ability. | `ability` (ability id), `input` (template/JSON) |
 | `condition` | logic | Boolean branch. | `{"expression": "<safe expression>"}` |
+| `assert` | logic | **Assert** (1.7): fail the run when a safe expression is false; a guardrail for a contract. | `expression`, `message` (template; `{{ expression }}` and `{{ value }}` are available) |
+| `validate` | logic | **Validate JSON** (1.7): check a value against the bounded schema subset, then stop or warn. | `target` (template; empty = `last`), `schema`, `mode` (`fail`/`warn`) |
 | `transform` | logic | Render or assign variables. | `template`, `format` (`text`/`json`), `assign` |
 | `delay` | flow | Wait 0–300 seconds. | `{"seconds": 2}` |
 | `human` | flow | **Human input** (1.1): pause until a person approves or answers. | `prompt`, `kind` (`approve`/`text`/`choice`), `choices`, `default`, `timeout` (0–86400 s, 0 = forever) |
@@ -195,6 +197,11 @@ of §5 apply to every call.
 AML 1.2 raises the tool-round limit to 40 and adds the coding abilities below,
 so an `agent` node can inspect, edit and verify a project directly.
 
+Both `llm` and `agent` nodes accept `fallback_model`. If the main model call
+fails, the runtime logs the failure and retries that call with the fallback; an
+agent node keeps using the fallback for its remaining tool rounds. An empty
+fallback, or one equal to the main model, is ignored and reported as a warning.
+
 #### `swarm`: a leader-led team of agents
 
 A `swarm` node runs one bounded, leader-driven run. A leader model reads the
@@ -211,16 +218,21 @@ the final answer. The leader may be a different model (`leader_model`).
   "data": {
     "model": "",
     "goal": "{{ input.message }}",
+    "criteria": "Every claim cites a file path.\nThe answer states what was not verified.",
     "system": "Prefer primary sources and quote exact paths.",
     "agents": [
       {"id": "reader", "label": "Reader", "role": "investigator",
-       "task": "Read the affected module", "tools": ["read", "search"]},
+       "task": "Read the affected module", "tools": ["read", "search"],
+       "writes": [], "plan": ["Locate the entry point", "Collect evidence"]},
       {"id": "checker", "label": "Checker", "role": "verifier",
-       "task": "Check the tests and call sites", "read_only": true}
+       "task": "Check the tests and call sites", "read_only": true,
+       "depends_on": ["reader"]}
     ],
     "tools": [],
     "strategy": "peer_review",
     "rounds": 1,
+    "effort": "high",
+    "reflection": true,
     "max_agents": 4,
     "max_steps": 6,
     "max_seconds": 240,
@@ -236,11 +248,14 @@ the final answer. The leader may be a different model (`leader_model`).
 | `model` | agent model | Model for members. |
 | `leader_model` | `model` | Model for the leader. |
 | `goal` | `last` | Task for the whole swarm. |
+| `criteria` | – | Optional acceptance checks, one per line. The leader must verify them in the final answer; empty lets it derive testable criteria from the goal. |
 | `system` | – | Extra instructions shared by every member. |
-| `agents` | `[]` | Optional `[{id, label, role, task, instruction, tools, writes, read_only}]`. Empty lets the leader choose the team. A writing member needs a `writes` scope; omit it to keep that member read-only. |
+| `agents` | `[]` | Optional `[{id, label, role, task, instruction, tools, writes, read_only, context_chars, depends_on, plan}]`. Empty lets the leader choose the team, its plans and dependencies. A writing member needs a `writes` scope; omit it to keep that member read-only. |
 | `tools` | all granted | Ability ids members may use. `[]` means every granted ability. |
 | `strategy` | `auto` | `auto`, `map_reduce`, `peer_review`, `debate` or `pipeline`. |
 | `rounds` | `1` | Peer-review/revision rounds, 0–4. The leader may choose fewer, never more. Each round reviews then revises. |
+| `effort` | `""` | `low`, `medium`, `high` or empty (provider default). Sent as `reasoning_effort` where the endpoint supports it, for planning, member work, review decisions and synthesis. |
+| `reflection` | `true` | Ask a member once to finish or justify open plan steps before it returns its answer. |
 | `max_agents` | `4` | Team size, 1–8. |
 | `max_steps` | `6` | Model rounds per member per phase, 1–12. |
 | `max_seconds` | `240` | Active time budget, 10–1800. |
@@ -250,25 +265,32 @@ the final answer. The leader may be a different model (`leader_model`).
 
 The team shape is the leader's decision, using the goal and any `agents` the
 caller supplied. Explicit member tasks win; the leader can add roles, tools,
-write scopes and extra members up to `max_agents`. `strategy: "pipeline"` runs
-members in order and gives each one the previous outputs; every other strategy
-starts in parallel.
+write scopes, plans and extra members up to `max_agents`. `depends_on` turns the
+team into a small DAG: members whose dependencies are still running wait, and
+each dependency wave runs concurrently. Unknown ids, self-dependencies and
+cycles are removed by the coordinator with a warning. `strategy: "pipeline"`
+runs members in order and gives each one the previous outputs; every other
+strategy uses dependency waves (members without dependencies start together).
 
 **Leader protocol.** The leader answers with one JSON object per phase:
 
 ```json
 {"strategy": "map_reduce|peer_review|debate|pipeline", "rounds": 0,
+ "success_criteria": ["testable check"],
  "agents": [{"id": "...", "label": "...", "role": "...", "task": "...",
               "instruction": "...", "tools": ["ability-id"], "writes": ["src/"],
-              "read_only": true, "context_chars": 16000}],
+              "read_only": true, "context_chars": 16000,
+              "depends_on": ["<member-id>"],
+              "plan": [{"text": "<step>", "status": "pending|active|done"}]}],
  "notes": "..."}
 
 {"reviews": [{"reviewer": "member-id", "target": "member-id", "focus": "..."}],
  "reason": "..."}
 
-{"continue": true, "reason": "..."}
+{"continue": true, "reason": "...", "gaps": ["unmet requirement"]}
 
-{"final": "...", "summary": "...", "warnings": [], "confidence": 0.0}
+{"final": "...", "summary": "...", "warnings": [],
+ "unmet_criteria": ["criterion without evidence"], "confidence": 0.0}
 ```
 
 **Member protocol.** A member answers with one JSON object per turn; a plain
@@ -292,10 +314,18 @@ reply becomes its final answer. Actions may be supplied together in an
 ```
 
 A member sees its unread messages, a compact blackboard digest, its own peer-results
-digest, the leader's per-member instruction (if any), and the tools it was assigned
-before every model round. A malformed turn is reported back with the expected shape,
-so a small model can recover. The leader's `rounds` choice is capped by the node's
-`rounds` value.
+digest, its current plan, the leader's success criteria, the leader's per-member
+instruction (if any), and the tools it was assigned before every model round. A
+malformed turn is reported back with the expected shape, so a small model can
+recover. The leader's `rounds` choice is capped by the node's `rounds` value.
+
+**Planning and reflection.** A member's `plan` action replaces its plan, is
+persisted in the snapshot and result, and may contain at most 12 steps; if a
+model marks several active steps, only the first stays active. The plan is
+included in every following prompt. When `reflection` is true and a member is
+about to finish with open steps, the coordinator asks it once to complete them
+or state why they are unnecessary. If it still finishes, the run records a
+warning. The leader's plan seeds the team's starting plans on the blackboard.
 
 **Tool grants.** The runtime never offers a tool the node did not grant. A member
 that names any retrieval tool receives the whole retrieval family
@@ -307,9 +337,20 @@ still enforces the scope on every write. `tools: ["*"]` on a member grants every
 tool the node was given, an omitted list does the same, and `tools: ["none"]`
 grants no tools to a member that only reasons over the briefing.
 
+**Tool reliability.** A read-only call whose failure looks temporary (timeout,
+connection reset, rate limit, 5xx) is retried once with a status event and the
+attempt count in `swarm_agent_tool`. Writes are never retried automatically,
+because a timed-out write may already have landed. Deterministic failures
+(missing path, sandbox denial, invalid input, unknown tool) return immediately
+with a short next-action hint; an unknown tool id is matched to the closest
+granted id when one is unambiguous. Repeated identical calls earn a hint after
+the third attempt. Every member reports `tool_calls`, `tool_failures` and
+`tool_retries`, and the same retry/hint rules apply to an `agent` node.
+
 **Shared knowledge.** Before the work phase the runtime seeds the blackboard with
-`swarm.goal` and `swarm.plan` (strategy, rounds and each member's id, label, role,
-task and instruction), authored by `leader`. When a member finishes a work or
+`swarm.goal` and `swarm.plan` (strategy, rounds, success criteria and each
+member's id, label, role, task, instruction, dependencies and plan), authored by
+`leader`. When a member finishes a work or
 revision phase its result is written to `result.<member-id>` (label, role, score,
 version, summary and output) as that member, so peers never need to ask for it.
 Member and reviewer prompts include a short peer-results digest
@@ -381,6 +422,60 @@ the run stops waiting at the deadline even when a backend ignores cancellation;
 unfinished members are finalised in the result. An empty model reply is retried
 once before it fails a member step or a leader step.
 
+#### `assert`: a contract that stops a bad run
+
+An `assert` node evaluates its `expression` with the same safe expression
+language as a condition. A truthy result passes the previous output through as
+`{ok: true, value, expression}`. A false result fails the node with
+`Assertion failed at <node>: <message>`; the message is a template and may use
+`{{ expression }}` and `{{ value }}`. The normal `retry` policy and
+top-level `on_error` setting still apply.
+
+```json
+{
+  "id": "has-sources",
+  "type": "assert",
+  "data": {
+    "expression": "contains(lower(last.text), 'sources')",
+    "message": "The report must include a Sources section"
+  }
+}
+```
+
+#### `validate`: structured-output guardrail
+
+A `validate` node checks `target` (or `last` when the target is empty) against a
+bounded JSON Schema subset. The supported keywords are `type`, `required`,
+`properties`, `additionalProperties` (boolean), `items`, `enum`, `const`,
+`anyOf`, `minimum`, `maximum`, `minLength`, `maxLength`, `minItems`, `maxItems`
+and `pattern`. Unknown keywords are validation errors rather than silently
+ignored constraints.
+
+`mode: "fail"` fails the node with up to five `path: message` details.
+`mode: "warn"` continues and returns `{valid, errors, value, mode}`, so a
+condition can branch on `nodes.<id>.valid`. Every execution emits a
+`validation` run event with the error list bounded for the stream.
+
+```json
+{
+  "id": "check-report",
+  "type": "validate",
+  "data": {
+    "target": "{{ nodes.report.json }}",
+    "mode": "fail",
+    "schema": {
+      "type": "object",
+      "required": ["title", "items"],
+      "properties": {
+        "title": {"type": "string", "minLength": 3},
+        "items": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  }
+}
+```
+
 #### `human`: wait for a person
 
 The run reports `status: "paused"` with `awaiting_input` set until someone
@@ -412,9 +507,11 @@ Node outputs:
 - `start`: the run input.
 - `llm`: `{"text", "model", "usage", "elapsed", "prompt_format"}`. With `format: "json"`, the parsed value is also returned as `json`; a reply with no JSON value fails the node with an actionable error.
 - `agent`: `{"text", "iterations", "steps": [{"iteration", "ability", "input", "output" | "error"}], "model", "usage", "exhausted"}`.
-- `swarm`: `{"ok", "swarm", "final", "summary", "text", "strategy", "round", "phase", "agents", "completed", "failed", "messages", "reviews", "blackboard", "context", "context_items", "context_handles", "changed_files", "usage", "warnings", "elapsed"}`. `text` is the leader's synthesised answer, suitable for an `end` node. `context` reports the pool capacity, used and free characters plus each member's grant; `context_handles` lists recent temporary handles by label and size.
+- `swarm`: `{"ok", "swarm", "final", "summary", "text", "strategy", "round", "phase", "agents", "completed", "failed", "messages", "reviews", "blackboard", "context", "context_items", "context_handles", "changed_files", "success_criteria", "unmet_criteria", "gaps", "usage", "warnings", "elapsed"}`. `text` is the leader's synthesised answer, suitable for an `end` node. `success_criteria` lists the caller's and leader's checks; `unmet_criteria` and `gaps` report what the leader could not verify. `context` reports the pool capacity, used and free characters plus each member's grant; `context_handles` lists recent temporary handles by label and size.
 - `tool`: the ability result (for example `{"status", "headers", "body", "json"}` from `http.fetch`).
 - `condition`: `{"result": true|false, "value", "expression"}`.
+- `assert`: `{"ok": true, "value", "expression"}`; a false assertion fails the node with the rendered message.
+- `validate`: `{"valid", "errors": [{"path", "rule", "message"}], "value", "mode"}`; conditions can branch on `valid` in warn mode.
 - `transform`: `{"value", "assigned"}`.
 - `delay`: `{"delayed": seconds, "dry_run": bool}`.
 - `memory`: `{"key", "value", ...}` or `{"keys", "values"}`.
@@ -637,7 +734,7 @@ input. Overlapping runs for the same agent are skipped.
 
 ```json
 {
-  "aml": "1.6",
+  "aml": "1.8",
   "kind": "agent",
   "id": "support-triage",
   "name": "Support triage",
@@ -673,6 +770,45 @@ input. Overlapping runs for the same agent are skipped.
 ---
 
 ## 9. Changelog
+
+### 1.8
+
+AML 1.8 is additive. Every 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1 and 1.0
+document is valid and runs unchanged.
+
+- Swarm leaders now produce testable `success_criteria`, a per-member `plan`
+  and optional `depends_on` edges. Members without dependencies run together;
+  dependent waves wait for their inputs. Cycles are removed with a warning.
+- New `swarm` node fields: `criteria` (caller acceptance checks), `effort`
+  (`low`, `medium`, `high` or provider default) and `reflection` (one plan
+  self-check before a member finishes).
+- A member's `plan` action is persisted, exposed in snapshots/results and
+  replayed in every prompt; finishing with open steps triggers one reflection
+  turn and a warning if the steps remain open.
+- Leaders report `gaps` after a review round and `unmet_criteria` at synthesis;
+  both reach revisions, the final result and the swarm card.
+- Read-only tool failures with a temporary error are retried once in swarms and
+  agent nodes. Writes are never retried. Deterministic failures carry a short
+  recovery hint, and an unknown tool id is matched to the closest granted id.
+- New `swarm_agent_plan` event carries the structured plan, its version and its
+  completion count.
+
+### 1.7
+
+AML 1.7 is additive. Every 1.6, 1.5, 1.4, 1.3, 1.2, 1.1 and 1.0 document is
+valid and runs unchanged.
+
+- New `assert` node: evaluate a safe expression and fail with an actionable
+  message when it is false. The message can interpolate `{{ expression }}` and
+  `{{ value }}`.
+- New `validate` node: validate a value against a bounded JSON Schema subset
+  (`type`, `required`, `properties`, `additionalProperties`, `items`, `enum`,
+  `const`, `anyOf`, numeric and length bounds, `pattern`). `mode: "fail"` stops
+the node; `mode: "warn"` exposes `valid` and `errors` for a condition.
+- The new `validation` run event reports the validation result without making a
+template parse the full error list.
+- `llm` and `agent` nodes accept `fallback_model`. A provider failure retries the
+  call with the fallback; an agent keeps the fallback for its remaining rounds.
 
 ### 1.6
 

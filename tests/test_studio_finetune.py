@@ -110,7 +110,7 @@ def test_hugging_face_plans_estimate_what_trains(tmp_path, service, corpus):
     info = service.inspect("models/third-party")
     assert info["engine"] == "hf" and info["layers"] == 3 and info["ctx_len"] == 128
     assert info["default_name"] == "third-party-tuned" and info["chat_template"] is False
-    assert set(info["presets"]) == {"quick", "balanced", "deep"}
+    assert set(info["presets"]) == {"quick", "balanced", "low_vram", "deep"}
 
     plan = service.plan({"base": "models/third-party", "folder": str(corpus), "preset": "quick"})
     assert plan["engine"] == "hf" and plan["config"]["engine"] == "hf"
@@ -137,6 +137,58 @@ def test_hugging_face_plans_estimate_what_trains(tmp_path, service, corpus):
     assert wide["config"]["name"] == "wide"  # a stray .pt suffix is not a folder name
     assert any("will be reduced" in warning for warning in wide["warnings"])
     assert hf.estimate_trainable(tmp_path / "missing", "lora", "auto", 8, 1) == (0, 0)
+
+
+def test_low_vram_preset_is_quantized_and_compact(tmp_path, service, corpus, monkeypatch):
+    fake_transformer(tmp_path / "models" / "third-party")
+    monkeypatch.setattr(hf, "has_module", lambda name: True)
+    plan = service.plan({"base": "models/third-party", "folder": str(corpus),
+                         "preset": "low_vram"})
+    trainer = plan["config"]["trainer"]
+    assert plan["ready"] is True
+    assert trainer["method"] == "lora" and trainer["quantization"] == "4bit"
+    assert trainer["batch"] == 1 and trainer["grad_accum"] == 8
+    assert trainer["gradient_checkpointing"] is True and trainer["auto_memory"] is True
+    assert trainer["merge"] is False
+    assert any(row[0] == "Estimated peak" for row in plan["summary"])
+
+
+def test_quantized_plans_explain_a_missing_bitsandbytes(tmp_path, service, corpus, monkeypatch):
+    fake_transformer(tmp_path / "models" / "third-party")
+    monkeypatch.setattr(hf, "has_module", lambda name: name == "transformers")
+    config = {"base": "models/third-party", "folder": str(corpus), "quantization": "4bit"}
+    plan = service.plan(config)
+    assert plan["ready"] is False and "bitsandbytes" in plan["requirement"]
+    assert any("bitsandbytes" in warning for warning in plan["warnings"])
+    with pytest.raises(ModelError, match="bitsandbytes"):
+        service.start(config)
+
+
+def test_precision_fp16_and_method_quantization_validation(tmp_path, service, corpus):
+    fake_transformer(tmp_path / "models" / "third-party")
+    base = {"base": "models/third-party", "folder": str(corpus)}
+    assert service.plan({**base, "precision": "fp16"})["config"]["trainer"]["precision"] == "fp16"
+    with pytest.raises(ValueError, match="LoRA"):
+        service.plan({**base, "method": "full", "quantization": "4bit"})
+    with pytest.raises(ValueError, match="Precision must be"):
+        service.plan({**base, "precision": "fp8"})
+
+
+def test_large_models_warn_about_low_vram_options(tmp_path, service, corpus, monkeypatch):
+    folder = tmp_path / "models" / "huge"
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text(json.dumps({
+        "model_type": "gpt2", "n_positions": 2048, "n_embd": 4096,
+        "n_layer": 32, "n_head": 32,
+    }), encoding="utf-8")
+    write_safetensors(folder / "model.safetensors", {"wte.weight": (32_000, 218_750)})
+    monkeypatch.setattr(hf, "has_module", lambda name: True)
+    base = {"base": "models/huge", "folder": str(corpus)}
+    lora = service.plan({**base, "method": "lora", "quantization": "none"})
+    assert any("4-bit" in warning for warning in lora["warnings"])
+    assert any(row[0] == "4-bit peak" for row in lora["summary"])
+    full = service.plan({**base, "method": "full"})
+    assert any("6-8 GB" in warning or "VRAM" in warning for warning in full["warnings"])
 
 
 def test_hugging_face_plans_detect_chat_data_and_validate(tmp_path, service, corpus):

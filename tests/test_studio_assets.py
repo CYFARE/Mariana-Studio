@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import shutil
 import subprocess
+import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
 
-from mariana.studio.assets import CONTENT_SECURITY_POLICY, WEB, read_asset, render_index
+from mariana.studio.assets import (
+    CONTENT_SECURITY_POLICY, WEB, clear_asset_cache, read_asset, read_asset_entry, render_index,
+)
 from tests.helpers import studio
 
 
@@ -73,8 +77,102 @@ def test_frontend_modules_load_in_dependency_order():
     assert order["/js/components.js"] < order["/js/views/home.js"] < order["/js/boot.js"]
     assert order["/js/ui.js"] < order["/js/split.js"] < order["/js/views/ide.js"] < order["/js/boot.js"]
     assert order["/js/highlight.js"] < order["/js/editor.js"] < order["/js/views/ide.js"] < order["/js/boot.js"]
+    assert order["/js/symbols.js"] < order["/js/views/ide.js"]
     assert order["/js/tokens.js"] < order["/js/views/ide.js"]
+    assert order["/js/accelerate.js"] < order["/js/training-viz.js"]
     assert order["/js/voice.js"] < order["/js/views/ide.js"]
+
+
+def test_theme_defaults_to_the_system_and_restores_a_stored_choice():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+function themeFor(dark, stored) {
+  const sandbox = {
+    window: {
+      matchMedia: () => ({ matches: dark }),
+      localStorage: { getItem: () => stored },
+    },
+    document: { documentElement: { dataset: {} } },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+  const data = sandbox.document.documentElement.dataset;
+  return [data.theme, data.themeMode];
+}
+console.log(JSON.stringify({
+  systemDark: themeFor(true, null),
+  systemLight: themeFor(false, null),
+  systemStored: themeFor(true, JSON.stringify("system")),
+  storedLight: themeFor(true, JSON.stringify("light")),
+  storedDark: themeFor(false, JSON.stringify("dark")),
+  legacyDark: themeFor(false, "dark"),
+}));
+"""
+    result = node_script(script, WEB / "js/theme.js")
+    assert result == {
+        "systemDark": ["dark", "system"], "systemLight": ["light", "system"],
+        "systemStored": ["dark", "system"],
+        "storedLight": ["light", "light"], "storedDark": ["dark", "dark"],
+        "legacyDark": ["dark", "dark"],
+    }
+    boot = (WEB / "js/boot.js").read_text(encoding="utf-8")
+    for marker in ("System", "Light", "Dark", '"#i-monitor"', "themeMode"):
+        assert marker in boot, marker
+
+
+def test_home_leads_with_one_primary_action_and_recent_work():
+    source = (WEB / "js/views/home.js").read_text(encoding="utf-8")
+    for marker in ("home-welcome", "home-stats", "home-actions", "home-grid",
+                   "Continue chatting", "Recent conversations", "Recent jobs",
+                   "No chat-ready model yet"):
+        assert marker in source, marker
+    assert "hero(" not in source and "actionCard(" not in source
+    css = (WEB / "css/views.css").read_text(encoding="utf-8")
+    for marker in (".home-welcome", ".home-stat", ".home-action", ".home-grid"):
+        assert marker in css, marker
+
+
+def test_mobile_navigation_is_a_disclosure_with_escape_and_focus_return():
+    page = render_index()
+    assert 'id="shell-menu"' in page
+    assert 'aria-expanded="false"' in page and 'aria-controls="sidebar"' in page
+    boot = (WEB / "js/boot.js").read_text(encoding="utf-8")
+    for marker in ("setMenu", 'aria-expanded', '"Escape"',
+                   "Open navigation", "Close navigation"):
+        assert marker in boot, marker
+
+
+def test_chat_empty_state_offers_starters_and_model_recovery():
+    source = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
+    for marker in ("function applyPrompt", "applyPrompt(PROMPTS[index][1])",
+                   "Find a model", "Choose another model", "Model settings",
+                   "setConversationList"):
+        assert marker in source, marker
+    page = (WEB / "views/chat.html").read_text(encoding="utf-8")
+    assert 'id="chat-conversations"' in page
+    assert 'id="chat-list-close"' in page
+    assert 'aria-expanded="false"' in page
+    css = (WEB / "css/views.css").read_text(encoding="utf-8")
+    assert "#chat-conversations { display: none; }" in css
+    assert "#chat-conversations { display: inline-grid; }" in css
+
+
+def test_workspace_tabs_remember_the_last_section():
+    models = (WEB / "js/views/models.js").read_text(encoding="utf-8")
+    assert 'let lastTab = "library"' in models
+    assert "parameters.tab || lastTab" in models
+    assert "Clear filters" in models
+    finetune = (WEB / "js/views/finetune.js").read_text(encoding="utf-8")
+    assert "state.lastTab = name" in finetune
+    assert "state.lastTab || \"setup\"" in finetune
+
+
+def test_training_actions_stay_reachable_while_scrolling():
+    for name in ("train", "finetune"):
+        page = (WEB / "views" / f"{name}.html").read_text(encoding="utf-8")
+        assert "sticky-actions" in page, name
+    css = (WEB / "css/views.css").read_text(encoding="utf-8")
+    assert ".sticky-actions" in css and "position: sticky" in css
 
 
 def test_every_model_picker_uses_the_shared_provider_flow():
@@ -597,6 +695,99 @@ console.log(JSON.stringify({ hostile: render(hostile), formatted, link: render('
     assert "&lt;x&gt;" in result["formatted"] and '<a href="https://example.com?a=1&amp;b=2"' in result["link"]
 
 
+def test_markdown_blocks_preserve_streaming_prefixes():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const sandbox = { window: { Studio: { copy() {} } }, document: { addEventListener() {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const md = sandbox.window.Studio.markdown;
+const early = md.blocks("first paragraph\n\nsecond");
+const later = md.blocks("first paragraph\n\nsecond more\n\nthird");
+const fenced = md.blocks("```js\nlet a = 1;\n```\n\n- x\n- y");
+console.log(JSON.stringify({
+  join: later.join("") === md.render("first paragraph\n\nsecond more\n\nthird"),
+  stable: early[0] === later[0],
+  extendsTail: early[1] !== later[1],
+  fence: fenced[0].includes("code-block") && fenced.join("") === md.render("```js\nlet a = 1;\n```\n\n- x\n- y"),
+  stream: typeof md.stream,
+}));
+"""
+    result = node_script(script, WEB / "js/markdown.js")
+    assert result == {"join": True, "stable": True, "extendsTail": True, "fence": True, "stream": "function"}
+
+
+def test_markdown_stream_assembly_matches_full_render():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+function makeElement() {
+  const children = [];
+  return {
+    classList: { add() {} },
+    children,
+    replaceChildren() { for (const node of children) node.parent = null; children.length = 0; },
+    append(node) { node.parent = this; children.push(node); },
+  };
+}
+function makeTemplate() {
+  let html = "";
+  return {
+    set innerHTML(value) { html = value; },
+    get content() {
+      if (!html) return { firstElementChild: null };
+      const node = {
+        html, parent: null,
+        remove() {
+          if (!this.parent) return;
+          const index = this.parent.children.indexOf(this);
+          if (index >= 0) this.parent.children.splice(index, 1);
+          this.parent = null;
+        },
+      };
+      return { firstElementChild: node };
+    },
+  };
+}
+const sandbox = {
+  window: { Studio: { copy() {} } },
+  document: { addEventListener() {}, createElement() { return makeTemplate(); } },
+  console,
+};
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const md = sandbox.window.Studio.markdown;
+const element = makeElement();
+const steps = [
+  "",
+  "# Title",
+  "# Title\n\nA paragraph",
+  "# Title\n\nA paragraph\n\n- one",
+  "# Title\n\nA paragraph\n\n- one\n- two\n\nTail",
+  "# Title\n\nA paragraph\n\n- one\n- two\n\nTail\n\n```js\nlet a = 1;",
+  "# Title\n\nA paragraph\n\n- one\n- two\n\nTail\n\n```js\nlet a = 1;\n```\n\nAfter",
+];
+let mismatches = 0;
+for (const text of steps) {
+  md.stream(element, text);
+  const joined = element.children.map(node => node.html).join("");
+  if (joined !== md.render(text)) { mismatches += 1; console.log("MISMATCH", JSON.stringify(text)); }
+}
+md.stream(element, "# Short");
+if (element.children.map(node => node.html).join("") !== md.render("# Short")) mismatches += 1;
+console.log(JSON.stringify({ steps: steps.length + 1, mismatches, blocks: element.children.length }));
+"""
+    result = node_script(script, WEB / "js/markdown.js")
+    assert result == {"steps": 8, "mismatches": 0, "blocks": 1}
+
+
+def test_chat_reuses_message_dom_and_streams_blocks():
+    source = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
+    assert "Studio.markdown.stream" in source
+    assert "function messageCacheMatches" in source and "messageCacheDoc" in source
+    assert "__actionsKey" in source
+    assert "function renderChatList" in source and "chatListState" in source
+
+
 def test_meter_updates_in_place_for_live_statistics():
     script = r"""
 const fs = require("fs"), vm = require("vm");
@@ -634,7 +825,31 @@ console.log(JSON.stringify({ before, after: { className: meter.className, width:
     }
 
 
-def test_agents_run_panel_follows_the_amp_event_stream():
+def test_agent_canvas_reuses_node_elements_between_renders():
+    source = (WEB / "js/views/agents.js").read_text(encoding="utf-8")
+    for name in ("buildNodeElement", "paintNodeElement", "sameNodeView"):
+        assert f"function {name}" in source, f"{name} not found"
+    assert "nodesRenderedDoc" in source and "nodesRenderedMeta" in source
+    body = re.search(r"function renderNodes\(\) \{(.*?)\n  \}\n", source, re.S)
+    assert body, "renderNodes not found"
+    assert "buildNodeElement" in body.group(1) and "paintNodeElement" in body.group(1)
+    assert "state.nodeElements.clear();" in body.group(1)
+    assert "function mergeRunEvents" in source
+
+
+def test_long_panels_reuse_rows_and_defer_expensive_paint():
+    agents = (WEB / "js/views/agents.js").read_text(encoding="utf-8")
+    assert "host.prepend(element)" in agents
+    assert "function scheduleMinimap" in agents
+    assert "function paintInspectorPosition" in agents
+    assert "function summariesForNodes" in agents
+    markdown = (WEB / "js/markdown.js").read_text(encoding="utf-8")
+    assert "function queueHighlight" in markdown and "requestIdleCallback" in markdown
+    artifacts = (WEB / "js/artifacts.js").read_text(encoding="utf-8")
+    assert "const messageCache = new WeakMap()" in artifacts
+
+
+def test_agent_run_panel_follows_the_amp_event_stream():
     source = (WEB / "js/views/agents.js").read_text(encoding="utf-8")
     assert "Studio.subscribe" in source
     assert "/events?since=" in source
@@ -652,7 +867,8 @@ def test_agent_dragging_updates_in_place_once_per_frame():
     paint = re.search(r"function paintNodeDrag\(\) \{(.*?)\n  \}\n", source, re.S)
     assert paint, "paintNodeDrag not found"
     assert "updateEdgesTouching" in paint.group(1)
-    assert "drawMinimapNow" in paint.group(1)
+    assert "scheduleMinimap" in paint.group(1)
+    assert "function scheduleMinimap" in source
     assert "translate(${node.x}px, ${node.y}px)" in source
 
 
@@ -665,6 +881,121 @@ def test_agent_selection_and_nudging_update_without_rebuilding_the_canvas():
     move = re.search(r"function onPointerMove\(event\) \{(.*?)\n  \}\n", source, re.S)
     assert move, "onPointerMove not found"
     assert "/ 20) * 20" not in move.group(1), "dragging should follow the pointer, not a 20px grid"
+
+
+def test_agent_run_snapshots_update_the_panel_in_place():
+    source = (WEB / "js/views/agents.js").read_text(encoding="utf-8")
+    accept = re.search(r"function acceptRun\(snapshot\) \{(.*?)\n  \}\n", source, re.S)
+    assert accept, "acceptRun not found"
+    assert 'frame("run-nodes", paintRunNodes)' in accept.group(1)
+    assert 'frame("run-nodes", renderNodes)' not in accept.group(1), \
+        "run snapshots must repaint node state, not rebuild every node"
+    for name in ("buildRunView", "syncRunView", "paintRunNodes"):
+        assert f"function {name}" in source, f"{name} not found"
+    assert "runEventsCache" in source, "event rows should be cached between snapshots"
+
+
+def test_chat_streaming_renders_are_coalesced():
+    source = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
+    assert "function scheduleLiveReply" in source
+    assert "function cancelLiveReply" in source
+    assert "cancelLiveReply();" in source
+    assert "if (scrollFrame) return;" in source
+    assert "function scheduleChatList" in source
+    assert 'scheduleSwarmCard(assistant, event.type === "done" || event.type === "error")' in source
+
+
+def test_run_live_blocks_follow_model_and_swarm_deltas():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const Studio = { views: { register() {} } };
+const sandbox = { window: { Studio }, document: {}, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const events = [
+  { type: "node_started", node: "solve", label: "Solve", seq: 1 },
+  { type: "assistant_delta", node: "solve", iteration: 1, text: "Hel", seq: 2 },
+  { type: "assistant_delta", node: "solve", iteration: 1, text: "lo", seq: 3 },
+  { type: "reasoning_delta", node: "solve", iteration: 1, text: "Plan", seq: 4 },
+  { type: "tool_call", node: "solve", iteration: 1, ability: "file.read", seq: 5 },
+  { type: "tool_result", node: "solve", iteration: 1, ability: "file.read", ok: true, seq: 6 },
+  { type: "assistant_delta", node: "solve", iteration: 2, text: "Second", seq: 7 },
+  { type: "swarm_agent_start", node: "team", agent: "a1", label: "Reader", seq: 8 },
+  { type: "swarm_agent_delta", node: "team", agent: "a1", text: "file A", seq: 9 },
+  { type: "swarm_agent_delta", node: "team", agent: "a2", text: "file B", seq: 10 },
+  { type: "swarm_agent_end", node: "team", agent: "a1", ok: true, seq: 11 }
+];
+const blocks = Studio.agents.runLiveBlocks({ events });
+const previews = Object.fromEntries([...Studio.agents.nodeLivePreviews({ events })].map(([key, value]) => [key, {
+  label: value.label, text: value.text, live: value.live, group: value.group
+}]));
+console.log(JSON.stringify({
+  blocks: blocks.map(block => ({
+    label: block.label, text: block.text, reasoning: block.reasoning,
+    live: block.live, note: block.note
+  })),
+  previews,
+}));
+"""
+    result = node_script(script, WEB / "js/views/agents.js")
+    assert result["blocks"][0] == {"label": "Reader", "text": "file A", "reasoning": "",
+                                   "live": False, "note": "finished"}
+    assert result["blocks"][1] == {"label": "a2", "text": "file B", "reasoning": "",
+                                   "live": True, "note": "writing"}
+    assert result["blocks"][2] == {"label": "Solve", "text": "Second", "reasoning": "",
+                                   "live": True, "note": "writing"}
+    assert result["previews"]["solve"] == {"label": "Solve", "text": "Second",
+                                          "live": True, "group": False}
+    assert result["previews"]["team"] == {"label": "2 agents · a2", "text": "file B",
+                                         "live": True, "group": True}
+
+
+def test_live_blocks_count_past_the_preview_window():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const Studio = { views: { register() {} } };
+const sandbox = { window: { Studio }, document: {}, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const long = "x".repeat(6500);
+const blocks = Studio.agents.runLiveBlocks({ events: [
+  { type: "node_started", node: "big", label: "Big" },
+  { type: "assistant_delta", node: "big", iteration: 1, text: long },
+  { type: "reasoning_delta", node: "big", iteration: 1, text: "r".repeat(4500) }
+]});
+console.log(JSON.stringify({
+  chars: blocks[0].chars,
+  preview: blocks[0].text.length,
+  reasoning: blocks[0].reasoningChars,
+  reasoningPreview: blocks[0].reasoning.length
+}));
+"""
+    result = node_script(script, WEB / "js/views/agents.js")
+    assert result == {"chars": 6500, "preview": 6000,
+                      "reasoning": 4500, "reasoningPreview": 4000}
+
+
+def test_chat_streaming_exposes_live_status_and_reasoning():
+    source = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
+    for marker in ("function streamLive", "function beginLive", "function scheduleReasoning",
+                   "stream-phase", "stream-metrics", "New output ↓", "aria-live"):
+        assert marker in source, marker
+    style = (WEB / "css/views.css").read_text(encoding="utf-8")
+    for marker in (".stream-live {", ".stream-reasoning", "stream-blink", "#chat-scroll.streaming"):
+        assert marker in style, marker
+
+
+def test_agent_run_panel_streams_live_output_and_filters_deltas():
+    source = (WEB / "js/views/agents.js").read_text(encoding="utf-8")
+    for marker in ("function runLiveBlocks", "function renderRunLive", "function eventSummary",
+                   "function nodeLivePreviews", "agent-node-live", "run-live-metrics",
+                   "Copy live output", "Hide token deltas", "DELTA_EVENTS", "run-live-indicator",
+                   "run-live hidden"):
+        assert marker in source, marker
+    style = (WEB / "css/agents.css").read_text(encoding="utf-8")
+    for marker in (".run-live {", ".run-live-body", ".run-live-text", ".run-live-metrics",
+                   ".agent-node-live", ".run-event-summary", ".run-live-indicator"):
+        assert marker in style, marker
 
 
 def test_agent_connections_have_a_wide_target_and_cancel_cleanly():
@@ -793,6 +1124,81 @@ console.log(JSON.stringify({
     assert result["nearEdge"] == 0 and result["farEdge"] == -1
     assert result["order"] == ["llm", "note", "agent"]
     assert result["query"] == ["llm"]
+
+
+def test_chart_decimation_runs_in_javascript_and_wasm():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const sandbox = { window: { Studio: {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const accel = sandbox.window.Studio.accelerate;
+const points = [[0, 0], [1, 1], [2, 9], [3, 2], [4, 3], [5, 4], [6, 5], [7, 6], [8, 7], [9, 8]];
+const js = accel.test.decimateJs(points, 0, 9, 3);
+const vertices = Array.from(accel.test.buildVertices([
+  {points: [[0, 0], [10, 0]], color: "#ff0000", width: 2},
+]));
+const wasm = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[2])), {}).exports;
+const s = new Float64Array(wasm.memory.buffer, wasm.steps_in(), points.length);
+const v = new Float64Array(wasm.memory.buffer, wasm.values_in(), points.length);
+points.forEach((point, index) => { s[index] = point[0]; v[index] = point[1]; });
+const count = wasm.decimate(points.length, 0, 9, 3);
+const os = new Float64Array(wasm.memory.buffer, wasm.steps_out(), count);
+const ov = new Float64Array(wasm.memory.buffer, wasm.values_out(), count);
+const native = Array.from({length: count}, (_, index) => [os[index], ov[index]]);
+console.log(JSON.stringify({
+  js, native, vertices,
+  color: accel.test.parseColor("rgb(255, 0, 0)"),
+  magic: Array.from(fs.readFileSync(process.argv[2]).subarray(0, 4)),
+}));
+"""
+    result = node_script(script, WEB / "js/accelerate.js", WEB / "wasm/chart.wasm")
+    expected = [[0, 0], [2, 9], [3, 2], [5, 4], [6, 5], [9, 8]]
+    assert result["js"] == expected
+    assert result["native"] == expected
+    assert result["color"] == [1, 0, 0, 1]
+    assert result["magic"] == [0, 97, 115, 109]
+    assert len(result["vertices"]) == 36
+    assert result["vertices"][0:6] == [-1, 1, 1, 0, 0, 1]
+
+
+def test_static_assets_are_cached_compressed_and_revalidated(tmp_path):
+    clear_asset_cache()
+    try:
+        first = read_asset_entry("/js/editor.js")
+        second = read_asset_entry("/js/editor.js")
+        assert first is second
+        assert first.etag.startswith('W/"') and first.gzip
+        page = read_asset_entry("/")
+        assert page and page.gzip and page.etag
+        wasm = read_asset_entry("/wasm/chart.wasm")
+        assert wasm and wasm.content_type == "application/wasm"
+        assert wasm.gzip and wasm.etag.startswith('W/"')
+        assert gzip.decompress(wasm.gzip) == wasm.body
+        with studio(tmp_path) as (_, base):
+            request = urllib.request.Request(base + "/js/editor.js",
+                                             headers={"Accept-Encoding": "gzip"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                body = response.read()
+                assert response.headers["Content-Encoding"] == "gzip"
+                assert response.headers["Vary"] == "Accept-Encoding"
+                assert gzip.decompress(body) == first.body
+            with urllib.request.urlopen(base + "/", timeout=15) as response:
+                assert "wasm-unsafe-eval" in response.headers["Content-Security-Policy"]
+                page_etag = response.headers["ETag"]
+            request = urllib.request.Request(base + "/wasm/chart.wasm",
+                                             headers={"Accept-Encoding": "gzip"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                assert response.headers["Content-Type"] == "application/wasm"
+                assert response.headers["Content-Encoding"] == "gzip"
+                assert gzip.decompress(response.read()) == wasm.body
+            request = urllib.request.Request(base + "/", headers={"If-None-Match": page_etag})
+            with pytest.raises(urllib.error.HTTPError) as revalidated:
+                urllib.request.urlopen(request, timeout=15)
+            assert revalidated.value.code == 304
+            assert revalidated.value.headers["ETag"] == page_etag
+    finally:
+        clear_asset_cache()
 
 
 def test_chart_log_parser_and_axis_helpers_behave_on_real_metrics():
@@ -1202,6 +1608,54 @@ def test_ide_can_hide_recent_projects_without_deleting_them():
     assert "hiddenProjects" in source
 
 
+def test_symbol_outline_indexes_declarations_by_language():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const sandbox = { window: { Studio: {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const symbols = sandbox.window.Studio.symbols;
+const strip = items => items.map(item => [item.name, item.kind, item.line, item.depth]);
+console.log(JSON.stringify({
+  python: strip(symbols.extract("import os\n\nclass Widget:\n    def render(self):\n        pass\n\ndef main():\n    pass\n", "Python", "a.py")),
+  javascript: strip(symbols.extract("export function load() {}\nconst save = (value) => value;\nclass Store {}\n", "JavaScript", "a.js")),
+  markdown: strip(symbols.extract("# Title\n\n```\n# not a heading\n```\n## Part\n", "Markdown", "a.md")),
+  markup: strip(symbols.extract("<h1>Hello</h1>\n<section id=\"main\">\n</section>\n", "HTML", "a.html")),
+  unknown: strip(symbols.extract("value = 1\n", "Text", "a.txt")),
+  families: [symbols.familyFor("", "README.md"), symbols.familyFor("TypeScript", "a.ts"), symbols.familyFor("Rust", "a.rs")]
+}));
+"""
+    result = node_script(script, WEB / "js/symbols.js")
+    assert result["python"] == [
+        ["Widget", "class", 3, 0], ["render", "function", 4, 1], ["main", "function", 7, 0],
+    ]
+    assert result["javascript"] == [
+        ["load", "function", 1, 0], ["save", "function", 2, 0], ["Store", "class", 3, 0],
+    ]
+    assert result["markdown"] == [["Title", "heading", 1, 0], ["Part", "heading", 6, 1]]
+    assert result["markup"] == [["Hello", "heading", 1, 0], ["section#main", "tag", 2, 0]]
+    assert result["unknown"] == []
+    assert result["families"] == ["markdown", "javascript", "rust"]
+
+
+def test_ide_navigation_affordances_are_wired():
+    source = (WEB / "js/views/ide.js").read_text(encoding="utf-8")
+    for name in ("renderBreadcrumbs", "openTabsMenu", "reopenClosedTab", "recentPaths",
+                 "registerPaletteCommands", "applyEditorFont", "insertEditorSelection", "showIdeShortcuts",
+                 "renderOutline", "openSymbolPicker", "gotoSymbol"):
+        assert f"function {name}" in source, f"{name} not found"
+    assert "Studio.palette.add" in source
+    page = (WEB / "views/ide.html").read_text(encoding="utf-8")
+    for dom_id in ("ide-breadcrumbs", "ide-status-position", "ide-use-selection",
+                   "ide-outline-panel", "ide-outline", "ide-outline-filter"):
+        assert f'id="{dom_id}"' in page, f"{dom_id} missing"
+    css = (WEB / "css/ide.css").read_text(encoding="utf-8")
+    assert ".ide-breadcrumbs" in css and "--code-font-size" in css and ".ide-shortcut-row" in css
+    assert ".ide-outline-row" in css and ".ide-outline-kind" in css
+    editor = (WEB / "js/editor.js").read_text(encoding="utf-8")
+    assert "refreshMetrics" in editor
+
+
 def test_ide_exposes_source_render_hex_and_metadata_views():
     page = render_index()
     assert 'id="ide-view-bar"' in page
@@ -1227,6 +1681,9 @@ def test_ide_context_ring_skills_editor_and_swarm_cards():
         "swarm_agent_start", "swarm_agent_end",
     ):
         assert marker in source, marker
+    assert "function useSkill" not in source
+    assert 'button("Use"' not in source
+    assert "available to the agent automatically" in source
     css = (WEB / "css/ide.css").read_text(encoding="utf-8")
     assert ".ide-budget-ring" in css and ".ide-swarm-agent" in css
 
@@ -1300,6 +1757,41 @@ def test_chat_starts_in_swarm_mode_and_offers_a_solo_retry():
     assert "agent-workspace/chats/" in source
 
 
+def test_workspace_files_become_preview_artifacts():
+    script = r"""
+const fs = require("fs"), vm = require("vm");
+const sandbox = { window: { Studio: {} }, console };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox);
+const artifacts = sandbox.window.Studio.artifacts;
+const page = artifacts.workspaceArtifact({
+  path: "index.html", name: "index.html", kind: "text", language: "html",
+  mime: "text/html", bytes: 42, version: 123, content: "<!DOCTYPE html><title>Home</title>",
+});
+const image = artifacts.workspaceArtifact({
+  path: "photo.png", name: "photo.png", kind: "image", language: "png",
+  mime: "image/png", bytes: 8, data_url: "data:image/png;base64,AAAA",
+});
+const code = artifacts.workspaceArtifact({
+  path: "app.js", name: "app.js", kind: "text", language: "js",
+  mime: "text/javascript", bytes: 12, content: "const x = 1;",
+});
+console.log(JSON.stringify({
+  page: { kind: page.kind, title: page.title, previewable: page.previewable, size: page.size, version: page.version },
+  image: { kind: image.kind, title: image.title, previewable: image.previewable },
+  code: { kind: code.kind, title: code.title, previewable: code.previewable, language: code.language },
+}));
+"""
+    result = node_script(script, WEB / "js/artifacts.js")
+    assert result == {
+        "page": {"kind": "html", "title": "index.html", "previewable": True, "size": 42,
+                 "version": 123},
+        "image": {"kind": "image", "title": "photo.png", "previewable": True},
+        "code": {"kind": "code", "title": "app.js", "previewable": False,
+                 "language": "js"},
+    }
+
+
 def test_chat_swarm_tools_are_scoped_and_opt_in():
     source = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
     assert 'Studio.store.get("chat-tools"' in source
@@ -1309,6 +1801,17 @@ def test_chat_swarm_tools_are_scoped_and_opt_in():
     assert "tools: { ...state.tools }" in source
     page = render_index()
     assert 'id="chat-mode-swarm"' in page
+
+
+def test_chat_previews_files_a_swarm_writes():
+    chat = (WEB / "js/views/chat.js").read_text(encoding="utf-8")
+    artifacts = (WEB / "js/artifacts.js").read_text(encoding="utf-8")
+    swarm = (WEB / "js/swarm.js").read_text(encoding="utf-8")
+    assert "async function loadWorkspaceFiles" in chat
+    assert "/api/chats/${encodeURIComponent(chatId)}/file" in chat
+    assert ".meta.changedFiles" in chat
+    assert "workspaceArtifact" in chat and "function workspaceArtifact" in artifacts
+    assert "summary.changed_files" in swarm
 
 
 def test_artifact_module_finds_previewable_chat_blocks():
@@ -1398,6 +1901,7 @@ const swarm = swarmModule.create();
 swarm.meta.model = "fake";
 swarmModule.applyEvent(swarm, {
   type: "swarm_plan", strategy: "peer_review", rounds: 1, notes: "split",
+  success_criteria: ["both files read"],
   agents: [{id: "a1", label: "Reader", task: "read", status: "queued"}],
 });
 swarmModule.applyEvent(swarm, {
@@ -1406,6 +1910,17 @@ swarmModule.applyEvent(swarm, {
 });
 swarmModule.applyEvent(swarm, {type: "swarm_agent_delta", agent: "a1", phase: "work", text: "hel"});
 swarmModule.applyEvent(swarm, {type: "swarm_agent_delta", agent: "a1", phase: "work", text: "lo"});
+const streamCheck = swarmModule.create();
+swarmModule.applyEvent(streamCheck, {type: "swarm_agent_start", agent: "a1", label: "A", phase: "work"});
+swarmModule.applyEvent(streamCheck, {type: "swarm_agent_delta", agent: "a1", phase: "work", text: "hel"});
+swarmModule.applyEvent(streamCheck, {type: "swarm_agent_delta", agent: "a1", phase: "work", text: "lo"});
+const streamed = streamCheck.agents[0].text;
+swarmModule.applyEvent(streamCheck, {type: "swarm_agent_start", agent: "a1", label: "A", phase: "review"});
+const reset = streamCheck.agents[0].text === "";
+swarmModule.applyEvent(swarm, {
+  type: "swarm_agent_plan", agent: "a1",
+  plan: [{text: "read", status: "done"}, {text: "write", status: "active"}], version: 1,
+});
 swarmModule.applyEvent(swarm, {
   type: "swarm_agent_end", agent: "a1", status: "done", output: "result",
   score: 4.5, steps: 2, version: 2,
@@ -1423,6 +1938,7 @@ swarmModule.applySnapshot(swarm, {
 });
 swarmModule.finish(swarm, {
   ok: true, status: "completed", messages: 3, memory_count: 1,
+  timed_out: true, assembled: true, warnings: ["one run note"],
   tools: ["file.read", "file.list"],
   agents: [{agent: "a1", label: "Reader", status: "done", output: "result"}],
   reviews: [{reviewer: "a1", target: "a1", score: 4}],
@@ -1453,7 +1969,12 @@ console.log(JSON.stringify({
   reviewCount: swarm.meta.reviewCount,
   memoryCount: swarm.meta.memoryCount,
   tools: swarm.meta.tools,
-  malformed,
+  criteria: swarm.meta.criteria,
+  planDone: swarm.agents[0].plan.filter(step => step.status === "done").length,
+  timedOut: swarm.meta.timedOut,
+  assembled: swarm.meta.assembled,
+  warnings: swarm.meta.warnings,
+  streamed, reset, malformed,
 }));
 """
     result = node_script(script, WEB / "js/swarm.js")
@@ -1462,6 +1983,9 @@ console.log(JSON.stringify({
         "status": "done", "finished": True, "strategy": "peer_review",
         "messageCount": 3, "reviewCount": 1, "memoryCount": 1,
         "tools": ["file.read", "file.list"], "malformed": True,
+        "criteria": ["both files read"], "planDone": 1,
+        "timedOut": True, "assembled": True, "warnings": ["one run note"],
+        "streamed": "hello", "reset": True,
     }
 
 
@@ -1480,7 +2004,7 @@ def test_css_uses_tokens_and_web_assets_use_standard_names():
         assert not re.search(r"#[0-9a-fA-F]{3,8}\b", source.read_text(encoding="utf-8")), source.name
     for source in WEB.glob("**/*"):
         if source.is_file():
-            assert source.suffix in {".js", ".css", ".html", ".svg"}
+            assert source.suffix in {".js", ".css", ".html", ".svg", ".wasm", ".c"}
             assert re.fullmatch(r"[a-z0-9.-]+", source.name), source.name
 
 
