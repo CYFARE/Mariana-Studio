@@ -121,9 +121,9 @@ loss, and an optional refiner loss:
 
 $$
 \mathcal{L}_{\text{tok}} =
-  \mathcal{L}_{\text{recon}}
-  + \mathcal{L}_{\text{VQ}}
-  + \lambda_{\text{ref}}\mathcal{L}_{\text{refine}}.
+  \mathcal{L}_{\text{recon}} +
+  \mathcal{L}_{\text{VQ}} +
+  \lambda_{\text{ref}}\mathcal{L}_{\text{refine}}.
 $$
 
 Mariana's implementation adds several stabilizers:

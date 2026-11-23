@@ -122,8 +122,8 @@ Content symbols use a codebook of learned embeddings. During training, the
 content embedding uses the straight-through Gumbel estimator:
 
 $$
-\mathrm{hard}(\mathrm{softmax}(z)) + \mathrm{softmax}(z)
-- \mathrm{softmax}(z).\mathrm{detach}().
+\mathrm{hard}(\mathrm{softmax}(z)) + \mathrm{softmax}(z) -
+  \mathrm{softmax}(z).\mathrm{detach}().
 $$
 
 The hard one-hot selects the code; the soft term supplies a gradient to the
@@ -235,8 +235,8 @@ latent objective is
 
 $$
 \mathcal{L}_{\text{latent}} =
-  w_{\text{latent}}\left(\mathcal{L}_{\text{cont}}
-  + \tfrac{1}{4}\mathcal{L}_{\text{win}}\right).
+  w_{\text{latent}}\left(\mathcal{L}_{\text{cont}} +
+  \tfrac{1}{4}\mathcal{L}_{\text{win}}\right).
 $$
 
 The local window is additionally masked with probability
@@ -250,15 +250,15 @@ The complete latent objective adds
 $$
 \begin{aligned}
 \mathcal{L}_{\text{SAINT}} ={}&
-  \mathcal{L}_{\text{latent}}
-  - w_{\text{entropy}}\,\mathcal{L}_{\text{alphabet entropy}}
-  + w_{\text{grammar}}\,\mathcal{L}_{\text{grammar}} \\
-  &+ w_{\text{hierarchy}}\,\mathcal{L}_{\text{hier}}
-  + w_{\text{kl}}\,\mathcal{L}_{\text{KL}}
-  + w_{\text{rl}}\,\mathcal{L}_{\text{policy}}
-  + w_{\text{value}}\,\mathcal{L}_{\text{value}} \\
-  &- w_{\text{policy entropy}}\,\mathcal{L}_{\text{action entropy}}
-  + w_{\text{moe}}\,\mathcal{L}_{\text{MoE-LB}}.
+  \mathcal{L}_{\text{latent}} -
+  w_{\text{entropy}}\,\mathcal{L}_{\text{alphabet entropy}} +
+  w_{\text{grammar}}\,\mathcal{L}_{\text{grammar}} \\
+  &+ w_{\text{hierarchy}}\,\mathcal{L}_{\text{hier}} +
+  w_{\text{kl}}\,\mathcal{L}_{\text{KL}} +
+  w_{\text{rl}}\,\mathcal{L}_{\text{policy}} +
+  w_{\text{value}}\,\mathcal{L}_{\text{value}} \\
+  &- w_{\text{policy entropy}}\,\mathcal{L}_{\text{action entropy}} +
+  w_{\text{moe}}\,\mathcal{L}_{\text{MoE-LB}}.
 \end{aligned}
 $$
 
@@ -275,9 +275,9 @@ the content embedding, not the downstream value of choosing a particular symbol
 or stopping. SAINT adds a per-context return:
 
 $$
-R = -\overline{\mathrm{NLL}}_{\text{continuation}}
-  + w_{\text{task}}\cdot\mathrm{Accuracy}_{\text{byte}}
-  - w_{\text{length}}\cdot\frac{\text{used thoughts}}{\text{max thoughts}}.
+R = -\overline{\mathrm{NLL}}_{\text{continuation}} +
+  w_{\text{task}}\cdot\mathrm{Accuracy}_{\text{byte}} -
+  w_{\text{length}}\cdot\frac{\text{used thoughts}}{\text{max thoughts}}.
 $$
 
 All terms are detached when forming the return. The last term makes computation

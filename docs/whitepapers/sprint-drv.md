@@ -143,12 +143,12 @@ with total
 
 $$
 \mathcal{L}_{\text{legacy}} =
-  w_{\text{ar}}\mathcal{L}_{\text{AR}}
-  + w_{\text{diff}}\mathcal{L}_{\text{diff}}
-  + w_{\text{align}}\mathcal{L}_{\text{align}}
-  + w_{\text{ver}}\mathcal{L}_{\text{ver}}
-  + w_{\text{mtp}}\mathcal{L}_{\text{MTP}}
-  + w_{\text{moe}}\mathcal{L}_{\text{MoE-LB}}.
+  w_{\text{ar}}\mathcal{L}_{\text{AR}} +
+  w_{\text{diff}}\mathcal{L}_{\text{diff}} +
+  w_{\text{align}}\mathcal{L}_{\text{align}} +
+  w_{\text{ver}}\mathcal{L}_{\text{ver}} +
+  w_{\text{mtp}}\mathcal{L}_{\text{MTP}} +
+  w_{\text{moe}}\mathcal{L}_{\text{MoE-LB}}.
 $$
 
 The first two terms need different attention patterns: the clean pass is
@@ -220,11 +220,11 @@ where `P'` is the causal prefix restricted to positions that have a valid
 
 $$
 \mathcal{L}_{\text{fast}} =
-  w_{\text{ar}}\mathcal{L}_{\text{AR}}
-  + w_{\text{diff}}\mathcal{L}_{\text{diff}}
-  + w_{\text{ver}}\mathcal{L}_{\text{ver}}
-  + w_{\text{mtp}}\mathcal{L}_{\text{MTP}}
-  + w_{\text{moe}}\mathcal{L}_{\text{MoE-LB}},
+  w_{\text{ar}}\mathcal{L}_{\text{AR}} +
+  w_{\text{diff}}\mathcal{L}_{\text{diff}} +
+  w_{\text{ver}}\mathcal{L}_{\text{ver}} +
+  w_{\text{mtp}}\mathcal{L}_{\text{MTP}} +
+  w_{\text{moe}}\mathcal{L}_{\text{MoE-LB}},
 $$
 
 with `L_align = 0`. A single fixed-shape cross-entropy and masked reductions

@@ -10,6 +10,9 @@ from mariana.studio.api import router
 from tests.helpers import ROOT
 
 
+MARKDOWN_LIST_MARKER = re.compile(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)])[ \t]")
+
+
 def source_for_test(path: Path) -> Path | None:
     if path.name in {"__init__.py", "helpers.py", "conftest.py", "test_standards.py"}:
         return None
@@ -74,3 +77,17 @@ def test_engineering_reference_covers_the_checkable_rules():
         assert required in text
     assert "studio.validation.number" in text
     assert "tests/helpers.py" in text
+
+
+def test_docs_math_blocks_avoid_markdown_list_markers():
+    for path in sorted((ROOT / "docs").rglob("*.md")):
+        in_math = False
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip() == "$$":
+                in_math = not in_math
+            elif in_math:
+                assert not MARKDOWN_LIST_MARKER.match(line), (
+                    f"{path.relative_to(ROOT)}:{number}: a line inside $$ math starts with a "
+                    "Markdown list marker, which breaks GitHub's math rendering; end the "
+                    "previous line with the operator instead"
+                )
