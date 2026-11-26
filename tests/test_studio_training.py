@@ -17,6 +17,7 @@ from mariana.studio.training import (
     MetricsHistory,
     TrainingJobs,
     TrainingManager,
+    _checkpoint_step,
     build_training_command,
     build_training_commands,
     launcher,
@@ -50,6 +51,28 @@ def test_studio_cli_and_ncm_command():
         {"technique": "fast", "compile": True}, "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
     )
     assert "--compile" in compiled
+
+
+def test_axiom_training_command_options():
+    command = build_training_command(
+        {"technique": "fast", "axiom": True, "axiom_profile": "reversible"},
+        "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+    )
+    assert "--axiom" in command
+    assert command[command.index("--axiom-profile") + 1] == "reversible"
+    assert "--axiom" not in build_training_command(
+        {"technique": "fast"}, "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT
+    )
+    with pytest.raises(ValueError, match="DRV-LM"):
+        build_training_command(
+            {"technique": "ncm", "axiom": True},
+            "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+        )
+    with pytest.raises(ValueError, match="profile"):
+        build_training_command(
+            {"technique": "fast", "axiom": True, "axiom_profile": "extreme"},
+            "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+        )
 
 
 def test_moe_and_latent_command_options():
@@ -274,6 +297,80 @@ def test_drv_continue_rejects_ncm_checkpoint(tmp_path):
                 "technique": "fast", "mode": "continue", "name": "ncm.pt",
                 "folder": str(tmp_path), "steps": 1,
             })
+
+
+def test_invalid_model_geometry_is_rejected_at_the_boundary():
+    with pytest.raises(ValueError, match="divisible by attention heads"):
+        build_training_command(
+            {"technique": "fast", "dim": 30, "heads": 4},
+            "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+        )
+    with pytest.raises(ValueError, match="even head size"):
+        build_training_command(
+            {"technique": "fast", "dim": 12, "heads": 4},
+            "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+        )
+    with pytest.raises(ValueError, match="latent width"):
+        build_training_command(
+            {"technique": "ncm", "dim": 512, "heads": 128, "steps": 1,
+             "tokenizer_steps": 1},
+            "/tmp/corpus.txt", Path("/tmp/model.pt"), ROOT,
+        )
+
+
+def test_corrupt_checkpoint_has_an_actionable_error(tmp_path):
+    broken = tmp_path / "broken.pt"
+    broken.write_bytes(b"not a torch checkpoint")
+    with pytest.raises(ValueError, match="could not be read as a checkpoint"):
+        _checkpoint_step(broken)
+
+
+def test_pause_request_does_not_mask_a_failed_run(tmp_path):
+    manager = TrainingManager(tmp_path)
+    job = manager._new_job(technique="fast", mode="fresh", status="running")
+    manager.job = job
+    job["pause_requested"] = True
+    pause = tmp_path / "model.pt.pause"
+    pause.write_text("pause\n", encoding="utf-8")
+    manager._settle(job, 1, pause, False)
+    assert job["status"] == "failed" and job["error"]
+    assert not pause.exists()
+
+
+def test_state_polling_stays_responsive_while_a_start_copies_a_backup(tmp_path):
+    folder = make_corpus(tmp_path / "input")
+    manager = TrainingManager(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_backup(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return None
+
+    started = {}
+
+    def start():
+        started["state"] = manager.start({
+            **TINY_DRV, "folder": str(folder), "name": "slow.pt",
+            "steps": 1, "backup": True,
+        })
+
+    with patch.object(TrainingManager, "_backup", side_effect=slow_backup), \
+            patch.object(TrainingManager, "_run", return_value=None):
+        worker = threading.Thread(target=start, daemon=True)
+        worker.start()
+        assert entered.wait(5)
+        observed = {}
+        probe = threading.Thread(
+            target=lambda: observed.setdefault("state", manager.state()), daemon=True
+        )
+        probe.start()
+        probe.join(timeout=2)
+        responsive = "state" in observed
+        release.set()
+        worker.join(timeout=5)
+    assert responsive, "state polling blocked behind backup disk I/O"
+    assert started["state"]["status"] == "preparing"
 
 
 def test_parquet_inspect_then_smart_does_not_crash(tmp_path):

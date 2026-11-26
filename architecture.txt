@@ -1,5 +1,5 @@
-Mariana DRV-LM v2.3 — Sprint-DRV + Hybrid Diffusion-AR + SAINT Thought
-====================================================================
+Mariana DRV-LM v2.3 — Sprint-DRV + Hybrid Diffusion-AR + SAINT Thought + AXIOM
+==========================================================================
 
 This document describes the architecture *actually implemented* in the
 `mariana/` package (v2.3).  Items from the original design spec that are not
@@ -139,7 +139,35 @@ NCM checkpoints and export paths remain separate from DRV-LM.
 │   └── Export: every latent tensor is omitted; ordinary AR and GGUF/ONNX/
 │       LLaMA-safetensors paths remain bit-exact (legacy and SAINT parity tests)
 │
-├── 6. Measured status (byte-level, TinyShakespeare → Common Corpus subset)
+├── 6. AXIOM corpus codec (mariana/axiom.py, --axiom)
+│   ├── Semantic layer: 28 English relations, one reserved C0 byte each
+│   │   (0x01–0x1F except tab/newline/return), fixed-point rewrite, glyph view;
+│   │   fenced/indented code, inline code, inline math, tables, URLs, emails
+│   │   and HTML tags are masked out and preserved exactly
+│   ├── Profiles: auto detects the domain and smallest codec; compact and
+│   │   reversible force English connectors; lossless keeps text exact
+│   ├── Text codecs: utf8 (raw non-ASCII) and dictionary (0x7F–0xFF index up
+│   │   to 129 corpus-derived entries; 0x00 escapes a literal code point)
+│   ├── Dictionary: words, phrases, Unicode math/emoji, LaTeX commands and
+│   │   1–4-char CJK n-grams scored by byte savings; encoded with longest match
+│   ├── Sequence codecs: DNA 4-bit (16 IUPAC symbols), protein 5-bit (29
+│   │   symbols); record framing 0x1E 0x41 + type + varint + packed payload,
+│   │   literal records preserve headers/comments/lowercase/spaced lines
+│   ├── Identity: invalid UTF-8, binary or incompressible data is copied
+│   │   byte-for-byte; the codec never silently expands a corpus
+│   ├── Languages: script + function-word detection; non-English and mixed
+│   │   corpora use the lossless dictionary and never the English semantics
+│   ├── Corpus: spread sample selects the codec; line-streamed encode; cache
+│   │   under trained-model/axiom/; manifest holds codec, bytes and histogram
+│   ├── Model unchanged: every wire byte is ordinary vocabulary, so Sprint-DRV,
+│   │   SAINT, MoE/MTP and export work without new parameters or embeddings
+│   ├── Generation: the checkpoint stores axiom_codec JSON; prompts are encoded
+│   │   and outputs decoded; --show-axiom prints glyphs/entries/packing label
+│   └── Honest limits: English-only semantics, corpus-specific dictionary,
+│       heuristic detection, sequence generation is record-framed, no
+│       capability result
+│
+├── 7. Measured status (byte-level, TinyShakespeare → Common Corpus subset)
 │   ├── 9M / dim 256 / 1.1MB corpus (2.5k steps):  val ar 1.56, align 1.63,
 │   │   acceptance ~19%, hybrid ≈ 0.5× AR
 │   ├── 20M / dim 384 / 2GiB Common Corpus (250k steps): val ar 1.08,
@@ -153,7 +181,7 @@ NCM checkpoints and export paths remain separate from DRV-LM.
 │   └── Acceptance is the governing metric: it rises with data scale and
 │       AR/diffusion agreement (L_align), not with sampling-side tuning
 │
-└── 7. Spec items NOT yet implemented
+└── 8. Spec items NOT yet implemented
     ├── Pretrained AR init / continual pretraining workflow
     ├── Variable-length *byte* decoding / [EXPAND] logic (SAINT thought EOS is
     │   implemented in §5; this item concerns the ordinary byte generator)

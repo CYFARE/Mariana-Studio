@@ -115,7 +115,7 @@ def recommend_training_options(corpus, technique="fast", requested_device="auto"
 
         flex_available = HAS_FLEX and device.type == "cuda" and dim // heads >= 16
         config.update({
-            "generator_lr": round(min(3e-4, max(1e-4, 3e-4 * lr_scale)), 8),
+            "generator_lr": round(min(1e-3, max(1e-4, 1e-3 * lr_scale)), 8),
             "prefix": min(64, max(1, ctx // 2)), "levels": _levels(ctx),
         })
     else:

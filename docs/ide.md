@@ -192,10 +192,12 @@ toggles focus mode, which folds both side panes and restores them in one step.
 `Ctrl+B` toggles the explorer and `Ctrl+Shift+B` the agent panel.
 
 Sizes stick: a preferred width is remembered across reloads and restored when
-space returns. When the window is too narrow the panes shrink to their readable
-minimum and then fold to a divider, which can be dragged or tabbed back open.
-Dragging a divider past its minimum folds the pane, and the divider left behind
-is the restore handle.
+space returns. There is no fixed maximum — a pane can be grown until another one
+reaches its minimum, so the editor or the agent can take the whole window when
+that is what the task needs. When the window is too narrow the panes shrink to
+their readable minimum and then fold to a divider, which can be dragged or
+tabbed back open. Dragging a divider past its minimum folds the pane, and the
+divider left behind is the restore handle.
 
 ### Voice input and narration
 
@@ -231,6 +233,12 @@ breakdown: agent instructions, project instructions, project map, pinned context
 active file, open files, saved history and the current draft. The dialog reports
 the model window, truncation, pinned-file caps, any over-budget warning and
 whether history has been consolidated, and offers a refresh.
+
+The ring also tracks a live run: the server publishes a `budget` event after
+each tool round with the tokens actually used and the remaining context, so the
+meter moves while the agent works instead of only when the run ends. Your draft
+is substituted into that figure locally, so typing still updates the ring
+between events.
 
 Each completed run stores the provider's reported `prompt_tokens` and
 `completion_tokens` on the conversation. The status bar shows the last run's total,
@@ -291,6 +299,16 @@ therefore call tools directly; the aliases are provider-safe (`file_read`) and
 are translated back to the Mariana tool id. If an endpoint rejects native
 tools, Studio retries without them and the prompted JSON path takes over. A
 malformed tool call is reported back to the model, which can correct it.
+
+Arguments are normalised before a call runs, so provider- or model-specific
+spellings still reach the right key: `file_path`, `filename` and `path` become
+`path`, `q` becomes `query`, `offset` becomes `start_line` and `limit` becomes
+`end_line`, a bare string becomes the tool's primary argument, and
+punctuation/case variants of an id (`file_search`) resolve to the canonical
+tool. A call that is still missing a required key is not executed: Studio
+returns the reply to the model with one repair round that names the missing
+keys and asks for the complete calls, so an empty input object costs a round
+trip instead of a failed tool.
 
 | Tool | What it does |
 |---|---|
@@ -530,9 +548,11 @@ and change manifest in `agent-workspace/ide/sessions/<session-id>.json`.
 
 Conversations support the full lifecycle from the agent panel: create, rename,
 pin to the top, duplicate (a fork that keeps the transcript but starts with no
-change snapshots), export as Markdown and delete. Only one run per workspace is
-active at a time; different projects run independently. Rename and pin use
-`PATCH /api/ide/sessions/{id}`; duplicate uses
+change snapshots), copy the whole conversation as Markdown to the clipboard,
+export it as a `.md` file and delete. Copy and export include tool calls, tool
+output and errors, so a transcript pasted into an issue keeps the evidence.
+Only one run per workspace is active at a time; different projects run
+independently. Rename and pin use `PATCH /api/ide/sessions/{id}`; duplicate uses
 `POST /api/ide/sessions/{id}/duplicate`.
 
 The model picker lists every catalog chat model, including saved endpoints. The
@@ -551,6 +571,7 @@ A run streams server-sent events:
 | `plan` | The normalized plan list. |
 | `file_changed` | A file was written; payload has the diff and counts. |
 | `context_consolidated` | Older turns became a recap; payload has before/after token counts, percent and cause. |
+| `budget` | Live context usage after a tool round: `used_tokens`, `context_window`, `percent` and `remaining_tokens`, reported in the run's token `unit`. |
 | `swarm_start`, `swarm_plan`, `swarm_leader`, `swarm_round`, `swarm_agent_start`, `swarm_agent_step`, `swarm_agent_delta`, `swarm_agent_status`, `swarm_agent_tool`, `swarm_agent_end`, `swarm_message`, `swarm_memory`, `swarm_review`, `swarm_context`, `swarm_end` | Swarm progress; every event carries `swarm`, `round`, `phase` and, when it concerns one member, `agent`. `swarm_context` carries the grant or denial and the current pool snapshot. |
 | `log` | Status or a recoverable warning. |
 | `run_completed`, `run_failed`, `run_cancelled` | Terminal state; `output` is the final answer. |

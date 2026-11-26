@@ -58,7 +58,7 @@ def test_every_route_has_a_summary_and_uses_the_error_contract():
 
 
 def test_core_model_modules_do_not_depend_on_studio_or_agents():
-    for name in ("config", "data", "model", "train", "generate", "latent", "saint"):
+    for name in ("config", "data", "model", "train", "generate", "latent", "saint", "axiom"):
         path = ROOT / "mariana" / f"{name}.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):

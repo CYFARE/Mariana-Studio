@@ -29,12 +29,14 @@ from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 
-from ..agents.aml import ABILITY_TYPES, slugify
+from ..agents.aml import ABILITY_TYPES, MAX_SWARM_AGENTS, slugify
 from ..agents.runtime import EMPTY_REPLIES, normalize_plan, parse_model_action
 from ..agents.swarm import SwarmCoordinator, SwarmLimits, snapshot_due
+from ..agents.toolcalls import has_tool_markup, usable_text
 from ..agents.tools import (
-    TOOL_ATTEMPTS, execute_ability, json_safe, nearest_tool_id, retryable_tool_failure,
-    tool_failure_hint,
+    TOOL_ATTEMPTS, execute_ability, json_safe, missing_required_arguments,
+    nearest_tool_id, normalise_tool_arguments, required_arguments, resolve_tool_id,
+    retryable_tool_failure, tool_failure_hint,
 )
 from ..workspace import ensure_workspace, read_json, write_json
 from .models.context import entry_context
@@ -107,7 +109,6 @@ BUDGET_WARNING_PERCENT = 80
 CONSOLIDATE_PERCENT = 80
 CONSOLIDATE_KEEP_MESSAGES = 8
 CONSOLIDATE_SUMMARY_CHARS = 4_000
-MAX_SWARM_AGENTS = 6
 MAX_SWARM_TASK_CHARS = 4_000
 MAX_SWARM_STEPS = 8
 MAX_SWARM_ROUNDS = 2
@@ -204,7 +205,9 @@ _PARALLEL_TOOLS = frozenset({
     "skill.read", "code.diagnostics", "csv.read", "sqlite.query", "git.inspect",
     "http.fetch", "news.headlines", "browser.fetch",
 })
-MAX_PARALLEL_TOOLS = 4
+MAX_PARALLEL_TOOLS = 8
+# Eight matches the swarm's read cap: a broad audit can fetch eight files at once
+# without a thread per call or a burst of disk seeks.
 _SKILL_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _SKILL_DIRS = (".agents/skills", ".mariana/skills")
 _DIAGNOSTIC_EXTENSIONS = frozenset({".py", ".pyw", ".json", ".jsonc", ".json5"})
@@ -243,12 +246,15 @@ def _looks_like_action(value) -> bool:
     """Whether a reply that failed to parse was probably meant as an action.
 
     Prose is a legitimate final answer for models that do not follow the JSON
-    contract.  Broken JSON, a JSON code fence or an action key near the start is
-    instead asked for again, so a typo never silently ends a long coding run.
+    contract.  Broken JSON, a JSON code fence, an action key near the start or
+    native tool-call markup is instead asked for again, so a typo never
+    silently ends a long coding run — and markup never reaches the user.
     """
     text = str(value or "").strip()
     if not text:
         return False
+    if has_tool_markup(text):
+        return True
     if text.startswith("```"):
         text = text[3:]
         if text.lower().startswith("json"):
@@ -715,6 +721,8 @@ class IdeService:
         self._threads: dict[str, threading.Thread] = {}
         self._active_sessions: set[str] = set()
         self._active_workspaces: set[str] = set()
+        # Workspaces currently being deleted; a new run must not start in one.
+        self._deleting_workspaces: set[str] = set()
         self._stats_cache: dict[str, dict] = {}
         self._index_cache: dict[str, dict] = {}
         self._session_cache: dict[Path, tuple[int, int, dict]] = {}
@@ -1173,27 +1181,37 @@ class IdeService:
         external = workspace_id in entries
         path = None if external else self.workspace_path(workspace_id)
         with self._lock:
-            if any(run.workspace_id == workspace_id and run.status not in FINISHED
-                   for run in self._runs.values()):
+            if workspace_id in self._deleting_workspaces:
+                raise ConflictError("This workspace is being deleted")
+            if workspace_id in self._active_workspaces or any(
+                    run.workspace_id == workspace_id and run.status not in FINISHED
+                    for run in self._runs.values()):
                 raise ConflictError("Stop the active IDE run before deleting this workspace")
+            # Reserve the workspace while the filesystem work runs outside the
+            # lock, so start_run cannot begin a run in a half-deleted project.
+            self._deleting_workspaces.add(workspace_id)
+        try:
             sessions = [
-                data.get("id") for data in self._load_sessions(newest=None)
-                if data.get("workspace_id") == workspace_id
-                and SESSION_ID.fullmatch(str(data.get("id") or ""))
+                data.get("id") for data in self._load_sessions(
+                    newest=None, workspace_id=workspace_id)
+                if SESSION_ID.fullmatch(str(data.get("id") or ""))
             ]
-        if external:
-            # An in-place folder is only unregistered; its files are never deleted.
-            entries.pop(workspace_id, None)
-            self._save_external(entries)
-        else:
-            shutil.rmtree(path, ignore_errors=True)
-        for session_id in sessions:
-            self._session_path(session_id).unlink(missing_ok=True)
-            shutil.rmtree(self.snapshots_dir / str(session_id), ignore_errors=True)
-        self._forget_sessions({str(item) for item in sessions})
-        with self._lock:
-            self._stats_cache.pop(workspace_id, None)
-            self._index_cache.pop(workspace_id, None)
+            if external:
+                # An in-place folder is only unregistered; its files are never deleted.
+                entries.pop(workspace_id, None)
+                self._save_external(entries)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+            for session_id in sessions:
+                self._session_path(session_id).unlink(missing_ok=True)
+                shutil.rmtree(self.snapshots_dir / str(session_id), ignore_errors=True)
+            self._forget_sessions({str(item) for item in sessions})
+            with self._lock:
+                self._stats_cache.pop(workspace_id, None)
+                self._index_cache.pop(workspace_id, None)
+        finally:
+            with self._lock:
+                self._deleting_workspaces.discard(workspace_id)
         return True
 
     def _stats(self, workspace_id: str) -> dict:
@@ -1754,8 +1772,10 @@ class IdeService:
         }, {"agent": {"id": "ide"}}, self.root, files_root=workspace, deny=deny)
         excluded = self._excluded_paths(workspace_id)
         if excluded and isinstance(result, dict) and isinstance(result.get("matches"), list):
-            result["matches"] = [match for match in result["matches"]
-                                 if not _under(str(match.get("path") or ""), excluded)]
+            result["matches"] = [
+                match for match in result["matches"]
+                if not _under(str(match.get("path") or "").replace("\\", "/"), excluded)
+            ]
         return result
 
     def diagnostics(self, workspace_id: str, relative: str = "") -> dict:
@@ -1969,13 +1989,18 @@ class IdeService:
             raise NotFoundError("Conversation not found")
         return self.sessions_dir / f"{session_id}.json"
 
-    def _load_sessions(self, newest: int | None = 200) -> list[dict]:
-        """Recent sessions; unchanged files are served from a stat-keyed cache."""
+    def _load_sessions(self, newest: int | None = 200,
+                       workspace_id: str | None = None) -> list[dict]:
+        """Recent sessions for one workspace, with unchanged files cached by stat.
+
+        The limit is applied after the workspace filter: a project with a busy
+        history cannot push an older conversation out of another project's list.
+        """
         files = sorted(self.sessions_dir.glob("ide-*.json"), key=_modified, reverse=True)
-        if newest is not None:
-            files = files[:newest]
         sessions = []
         for path in files:
+            if newest is not None and len(sessions) >= newest:
+                break
             try:
                 stat = path.stat()
             except OSError:
@@ -1993,6 +2018,8 @@ class IdeService:
                     continue
                 with self._lock:
                     self._session_cache[path] = (stamp, size, data)
+            if workspace_id is not None and data.get("workspace_id") != workspace_id:
+                continue
             sessions.append(data)
         with self._lock:
             if len(self._session_cache) > 512:
@@ -2019,8 +2046,8 @@ class IdeService:
             "id": session["id"],
             "workspace_id": session.get("workspace_id"),
             "title": session.get("title") or "Untitled session",
-            "created": session.get("created"),
-            "updated": session.get("updated"),
+            "created": _stamp(session.get("created"), 0.0),
+            "updated": _stamp(session.get("updated"), 0.0),
             "model": session.get("model"),
             "mode": session.get("mode"),
             "status": status,
@@ -2038,8 +2065,8 @@ class IdeService:
 
     def list_sessions(self, workspace_id: str) -> list[dict]:
         self.workspace_path(workspace_id)
-        summaries = [self._session_summary(session) for session in self._load_sessions()
-                     if session.get("workspace_id") == workspace_id]
+        summaries = [self._session_summary(session) for session in
+                     self._load_sessions(workspace_id=workspace_id)]
         summaries.sort(key=lambda item: (not item.get("pinned"), -(item.get("updated") or 0)))
         return summaries
 
@@ -2239,7 +2266,7 @@ class IdeService:
             },
             "event_types": [
                 "run_started", "assistant_start", "assistant_delta", "reasoning_delta",
-                "assistant_end", "tool_call", "tool_result", "plan", "file_changed",
+                "assistant_end", "tool_call", "tool_result", "plan", "budget", "file_changed",
                 "context_consolidated", "swarm_start", "swarm_plan", "swarm_leader",
                 "swarm_round", "swarm_agent_start", "swarm_agent_step", "swarm_agent_delta",
                 "swarm_agent_status", "swarm_agent_tool", "swarm_agent_end", "swarm_message",
@@ -2320,6 +2347,8 @@ class IdeService:
         context = self._context_payload(payload.get("context"))
         session_id = text(payload, "session_id", "", 60)
         with self._lock:
+            if workspace_id in self._deleting_workspaces:
+                raise ConflictError("This workspace is being deleted")
             if workspace_id in self._active_workspaces:
                 raise ConflictError(
                     "Another coding run is active in this workspace; wait for it to finish"
@@ -2336,6 +2365,8 @@ class IdeService:
             session["context"] = context
         try:
             with self._lock:
+                if workspace_id in self._deleting_workspaces:
+                    raise ConflictError("This workspace is being deleted")
                 if workspace_id in self._active_workspaces:
                     raise ConflictError(
                         "Another coding run is active in this workspace; wait for it to finish"
@@ -2525,6 +2556,7 @@ class IdeService:
             repeated: Counter = Counter()
             recent_calls: deque[tuple[str, bool, str]] = deque(maxlen=8)
             format_repairs = 0
+            saw_markup = False
             network_retries = 0
             extensions = 0
             iteration = 0
@@ -2571,6 +2603,21 @@ class IdeService:
                              f"{info['unit']} during the run."),
                 )
                 return True
+
+            def publish_budget(step: int) -> None:
+                """Keep the live context meter in step with the request being built."""
+                if messages is None:
+                    return
+                unit = str(budget.get("unit") or "tokens")
+                window = int(budget.get("context_window") or 0)
+                used = self._message_tokens(messages, unit)
+                run.event(
+                    "budget", iteration=step, unit=unit, used_tokens=used,
+                    context_window=window,
+                    percent=round(used * 100 / window, 1) if window else 0.0,
+                    remaining_tokens=max(0, window - used),
+                    message="Context usage updated",
+                )
 
             def extend_if_needed() -> None:
                 nonlocal limit, extensions
@@ -2622,7 +2669,8 @@ class IdeService:
                                      f"{delay:.0f}s"),
                         )
                         checkpoint(force=True)
-                        time.sleep(delay)
+                        if run.cancelled.wait(delay):
+                            raise _Cancelled()
                         iteration -= 1  # a transport retry does not consume a step
                         continue
                     raise
@@ -2639,31 +2687,95 @@ class IdeService:
                         "The model returned an empty reply. Choose another model in the IDE toolbar."
                     )
                 action, calls = parse_model_action(reply)
+                markup = has_tool_markup(reply)
                 malformed = action is None and _looks_like_action(reply)
                 unknown = (action is not None and not calls
                            and "final" not in action and "plan" not in action)
                 if malformed or unknown:
                     if format_repairs < MAX_FORMAT_REPAIRS:
                         format_repairs += 1
+                        saw_markup = markup
                         messages.append({"role": "assistant", "content": reply})
-                        messages.append({"role": "user", "content":
-                                         f"That reply was not a valid action. {action_help}"})
+                        repair = (
+                            "That reply was tool-call markup the client could not parse. "
+                            "Reply with plain JSON only, for example "
+                            '{"tool": "file.read", "input": {"path": "src/main.py"}}. '
+                            "Never emit DSML, <invoke> or <parameter> tags."
+                            if markup else f"That reply was not a valid action. {action_help}"
+                        )
+                        messages.append({"role": "user", "content": repair})
                         run.event(
                             "log", level="warning", iteration=iteration,
-                            message=("The model's action was malformed; asking for a "
-                                     "corrected JSON reply"),
+                            message=(
+                                "The model replied with tool-call markup; asking for a "
+                                "corrected JSON reply" if markup else
+                                "The model's action was malformed; asking for a "
+                                "corrected JSON reply"
+                            ),
                         )
                         consolidate_history(iteration)
                         checkpoint(force=True)
                         extend_if_needed()
                         continue
                     raise ValueError(
-                        "The model kept replying with malformed actions. Choose a model "
-                        "with reliable JSON tool calling or start a new conversation."
+                        "The model kept replying with malformed actions."
+                        + (" It emits native tool markup that could not be parsed; "
+                           "choose a model with reliable JSON tool calling or start "
+                           "a new conversation." if saw_markup else
+                           " Choose a model with reliable JSON tool calling or "
+                           "start a new conversation.")
                     )
-                format_repairs = 0
+                if calls:
+                    definitions = {tool["id"]: tool for tool in tools}
+                    normalised_calls = []
+                    problems = []
+                    for call in calls:
+                        requested = str(call.get("tool") or "")
+                        resolved = resolve_tool_id(requested, definitions) or requested
+                        arguments = normalise_tool_arguments(resolved, call.get("input"))
+                        normalised_calls.append({"tool": resolved, "input": arguments})
+                        if resolved in definitions:
+                            missing = missing_required_arguments(resolved, arguments)
+                            if missing:
+                                problems.append((resolved, missing))
+                    calls = normalised_calls
+                    if problems:
+                        if format_repairs < MAX_FORMAT_REPAIRS:
+                            # An empty or incomplete native tool call is a model slip, not
+                            # a reason to spend a round failing the tool.  Ask for the call
+                            # again with the exact required keys before executing anything.
+                            format_repairs += 1
+                            messages.append({"role": "assistant", "content": reply})
+                            details = "; ".join(
+                                f"{tool_id} needs {', '.join(missing)}"
+                                for tool_id, missing in problems[:4])
+                            messages.append({"role": "user", "content": (
+                                f"Some tool calls were missing required input: {details}. "
+                                "Reissue the complete calls now; for example "
+                                '{"calls": [{"tool": "file.search", "input": {"query": "needle"}}]}. '
+                                "Do not invent tools or empty input objects."
+                            )})
+                            run.event(
+                                "log", level="warning", iteration=iteration,
+                                message=("A tool call was missing required input; asking for "
+                                         "the complete call before executing it"),
+                            )
+                            consolidate_history(iteration)
+                            checkpoint(force=True)
+                            extend_if_needed()
+                            continue
+                    else:
+                        # Reset after a complete reply only, so a model that keeps
+                        # omitting the same argument is not repaired forever.
+                        format_repairs = 0
                 if action is None:
-                    final_text = reply.strip()[:20_000]
+                    final_text = usable_text(reply)[:20_000]
+                    if not final_text:
+                        raise ValueError(
+                            "The model returned tool-call markup instead of a final "
+                            "answer. Start a new conversation or choose a model with "
+                            "reliable JSON tool calling."
+                        )
                     self._append_transcript(session, {"role": "assistant", "text": final_text})
                     final_recorded = True
                     break
@@ -2680,8 +2792,13 @@ class IdeService:
                         if not final_text.strip():
                             if format_repairs < MAX_FORMAT_REPAIRS:
                                 format_repairs += 1
+                                saw_markup = saw_markup or has_tool_markup(reply)
                                 messages.append({"role": "assistant", "content": reply})
                                 messages.append({"role": "user", "content": (
+                                    "Your final answer contained only tool-call markup. "
+                                    'Reply with {"final": "<summary>"} using plain prose; '
+                                    "never emit DSML or <invoke> tags."
+                                    if has_tool_markup(reply) else
                                     "Your final answer was empty. Reply with "
                                     '{"final": "<summary>"} describing what was done, '
                                     "or continue with a tool call."
@@ -2724,6 +2841,7 @@ class IdeService:
                 messages.append({"role": "user", "content":
                                  self._observation_message(observations, session)})
                 consolidated = consolidate_history(iteration)
+                publish_budget(iteration)
                 wrote = any(result.get("ok") and result.get("tool") in _WRITE_TOOLS
                             for result in observations)
                 checkpoint(force=wrote or consolidated)
@@ -3060,9 +3178,9 @@ class IdeService:
             allow_write = False
         specs = self._swarm_specs(arguments)
         try:
-            max_agents = int(arguments.get("max_agents", 4))
+            max_agents = int(arguments.get("max_agents", 16))
         except (TypeError, ValueError):
-            max_agents = 4
+            max_agents = 16
         try:
             rounds = int(arguments.get("rounds", 1))
         except (TypeError, ValueError):
@@ -3254,8 +3372,11 @@ class IdeService:
                   repeated: Counter, excluded: list[str] | None = None) -> dict:
         tool_type = call["tool"]
         arguments = call["input"] if isinstance(call["input"], dict) else {"input": call["input"]}
+        definitions = {tool["id"]: tool for tool in tools}
+        tool_type = resolve_tool_id(tool_type, definitions) or tool_type
+        arguments = normalise_tool_arguments(tool_type, arguments)
         call_id = f"{iteration}-{index}"
-        definition = next((tool for tool in tools if tool["id"] == tool_type), None)
+        definition = definitions.get(tool_type)
         signature = self._tool_signature(tool_type, arguments)
         repeated[signature] += 1
         noted = repeated[signature] >= 3
@@ -3301,6 +3422,16 @@ class IdeService:
                         repeated: Counter, excluded: list[str] | None = None) -> list[dict]:
         """Run independent read-only calls together; everything else in order."""
         definitions = {tool["id"]: tool for tool in tools}
+        normalised_calls = []
+        for call in calls:
+            tool_type = str(call.get("tool") or "")
+            resolved = resolve_tool_id(tool_type, definitions) or tool_type
+            arguments = (call.get("input") if isinstance(call.get("input"), dict)
+                         else {"input": call.get("input")})
+            normalised_calls.append({
+                "tool": resolved, "input": normalise_tool_arguments(resolved, arguments),
+            })
+        calls = normalised_calls
         parallel = (len(calls) > 1 and not run.cancelled.is_set()
                     and all(call.get("tool") in _PARALLEL_TOOLS
                             and call.get("tool") in definitions for call in calls))
@@ -3397,6 +3528,10 @@ class IdeService:
                 "reviewer": review.get("reviewer"), "target": review.get("target"),
                 "score": review.get("score"),
             })
+        cache = observation.get("cache")
+        cache = ({key: cache[key] for key in ("hits", "misses", "saved_seconds",
+                                             "prompt_cache_hit_rate")
+                  if key in cache} if isinstance(cache, dict) else {})
         return {
             "ok": observation.get("ok"),
             "strategy": observation.get("strategy"),
@@ -3411,6 +3546,7 @@ class IdeService:
             "changed_files": [str(item) for item in
                               (observation.get("changed_files") or [])[:6]],
             "usage": observation.get("usage") or {},
+            "cache": cache,
             "elapsed": observation.get("elapsed"),
         }
 
@@ -3424,6 +3560,13 @@ class IdeService:
         snapshotted and reported exactly as they are for the parent agent, so a
         swarm edit is visible in the panel, revertible and diffable.
         """
+        arguments = normalise_tool_arguments(tool_type, arguments)
+        missing = missing_required_arguments(tool_type, arguments)
+        if missing:
+            return {
+                "error": (f"{tool_type} is missing {', '.join(missing)}; required input "
+                          f"keys are {', '.join(required_arguments(tool_type))}."),
+            }, False, None, arguments
         if tool_type == "skill.read":
             name = str(arguments.get("name") or arguments.get("id") or "").strip()
             try:
@@ -3449,7 +3592,7 @@ class IdeService:
         try:
             if relative and relative not in {".", "./"}:
                 resolved = self._workspace_file(
-                    workspace_id, relative, for_write=tool_type in {"file.write", "file.edit"},
+                    workspace_id, relative, for_write=tool_type == "file.write",
                 )
                 normalised = resolved.relative_to(
                     self.workspace_path(workspace_id)
@@ -3516,7 +3659,8 @@ class IdeService:
         if tool_type == "file.tree" and isinstance(observation.get("entries"), list):
             kept = []
             for entry in observation["entries"]:
-                relative = str(entry.get("path") or "") if isinstance(entry, dict) else ""
+                relative = (str(entry.get("path") or "").replace("\\", "/")
+                            if isinstance(entry, dict) else "")
                 if relative and _under(relative, excluded):
                     hidden += 1
                 else:
@@ -3525,21 +3669,33 @@ class IdeService:
         elif tool_type == "file.search" and isinstance(observation.get("matches"), list):
             kept = []
             for match in observation["matches"]:
-                relative = str(match.get("path") or "") if isinstance(match, dict) else ""
+                relative = (str(match.get("path") or "").replace("\\", "/")
+                            if isinstance(match, dict) else "")
                 if relative and _under(relative, excluded):
                     hidden += 1
                 else:
                     kept.append(match)
             observation = {**observation, "matches": kept}
-        elif tool_type == "file.list" and isinstance(observation.get("files"), list):
-            kept = []
-            for item in observation["files"]:
-                relative = str(item.get("name") or "") if isinstance(item, dict) else ""
-                if relative and _under(relative, excluded):
-                    hidden += 1
-                else:
-                    kept.append(item)
-            observation = {**observation, "files": kept}
+        elif tool_type == "file.list":
+            # file.list returns the full directory as ``entries`` plus a flat
+            # ``files`` subset; both use a path relative to the workspace root.
+            # Abilities use the platform separator, so normalise it before the
+            # hidden-path comparison (the IDE stores forward-slash paths).
+            hidden_paths: set[str] = set()
+            for key in ("entries", "files"):
+                items = observation.get(key)
+                if not isinstance(items, list):
+                    continue
+                kept = []
+                for item in items:
+                    relative = ("" if not isinstance(item, dict) else
+                                str(item.get("path") or item.get("name") or "").replace("\\", "/"))
+                    if relative and _under(relative, excluded):
+                        hidden_paths.add(relative)
+                    else:
+                        kept.append(item)
+                observation = {**observation, key: kept}
+            hidden = len(hidden_paths)
         if hidden:
             observation["context_note"] = (
                 f"{hidden} entr{'y' if hidden == 1 else 'ies'} hidden by the user's "
@@ -3774,8 +3930,9 @@ class IdeService:
     def _final_text(self, action: dict, reply: str) -> str:
         value = action.get("final") if "final" in action else reply
         if isinstance(value, str):
-            return value.strip()[:20_000]
-        return json.dumps(value, indent=2, ensure_ascii=False, default=str)[:20_000]
+            return usable_text(value)[:20_000]
+        return usable_text(
+            json.dumps(value, indent=2, ensure_ascii=False, default=str))[:20_000]
 
     def _finish_plan(self, run: IdeRun, session: dict) -> None:
         """Mark the current plan complete when a run ends with a final answer.
@@ -4015,7 +4172,7 @@ class IdeService:
                 continue
             if tool["type"] == "agent.swarm":
                 lines.append(
-                    "- agent.swarm: Run a leader-chosen team of up to six agents that work in "
+                    "- agent.swarm: Run a leader-chosen team of up to sixteen agents that work in "
                     "parallel, message each other, share a blackboard, review and revise each "
                     "other's work, and return one synthesised answer. In Edit and Auto the "
                     "members may edit files; file-tool writes are serialized and snapshotted, "
@@ -4064,7 +4221,7 @@ class IdeService:
             })
         sections.append({
             "id": "map", "label": "Project map",
-            "text": f"Project map:\n{self._map(workspace, include=include, exclude=excluded)}",
+            "text": f"Project map:\n{self._map(workspace, exclude=excluded)}",
         })
         session = session if isinstance(session, dict) else {}
         plan = [item for item in session.get("plan") or [] if isinstance(item, dict)]
@@ -4611,7 +4768,7 @@ class IdeService:
                 token = uuid.uuid4().hex
                 snapshot = self.snapshots_dir / session["id"] / f"{token}.orig"
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
-                snapshot.write_bytes(path.read_bytes())
+                _atomic_write(snapshot, path.read_bytes())
         changes[key] = {
             "path": key, "existed": existed, "snapshot": token, "tracked": tracked,
             "edits": 0, "added": 0, "removed": 0, "diff": "", "truncated": False,

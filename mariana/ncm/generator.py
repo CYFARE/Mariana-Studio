@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .config import NCMConfig
 from .layers import HAS_FLEX, Block, RMSNorm, ZeroConv, resize, sample_logits
-from .tokenizer import MultiscaleTokenizer
+from .tokenizer import MultiscaleTokenizer, masked_ce
 
 
 class CodebookHead(nn.Module):
@@ -164,6 +164,19 @@ class NCMGenerator(nn.Module):
         x = self.input_refiners[level](x)
         return self.latent_proj(x) + self.level_embedding.weight[level]
 
+    def _perturb_prefix(self, cumulative):
+        """Make training prefixes resemble the generator's own free-running errors."""
+        if not self.training:
+            return cumulative
+        if self.cfg.prefix_dropout > 0:
+            drop = torch.rand(
+                cumulative.shape[0], 1, 1, device=cumulative.device,
+            ) < self.cfg.prefix_dropout
+            cumulative = cumulative.masked_fill(drop, 0.0)
+        if self.cfg.prefix_noise > 0:
+            cumulative = cumulative + torch.randn_like(cumulative) * self.cfg.prefix_noise
+        return cumulative
+
     def _target_layout(self, prompt_length):
         chunks, positions = [], []
         for level, length in enumerate(self.cfg.levels):
@@ -172,7 +185,7 @@ class NCMGenerator(nn.Module):
             prompt_length += length
         return chunks, positions
 
-    def forward(self, prompt, codes, has_padding=None):
+    def forward(self, prompt, codes, has_padding=None, perturb=True):
         if len(codes) != self.cfg.n_levels:
             raise ValueError("expected one target code tensor per level")
         prompt_x, _, prompt_valid = self._prompt_data(prompt)
@@ -191,6 +204,8 @@ class NCMGenerator(nn.Module):
                 )
             else:
                 cumulative = partials[:, level - 1]
+            if perturb:
+                cumulative = self._perturb_prefix(cumulative)
             inputs.append(self._level_input(cumulative, level, B))
         x = torch.cat((prompt_x, *inputs), dim=1)
         P = prompt.shape[1]
@@ -236,8 +251,48 @@ class NCMGenerator(nn.Module):
         corrupted = torch.where(replace, random_codes, flat)
         return list(corrupted.split(self.cfg.levels, dim=1))
 
-    def loss(self, prompt, codes):
+    def _latent_from_logits(self, logits):
+        """Differentiable hard-code latent: forward uses argmax, gradients use the softmax."""
+        cumulative = None
+        for level, score in enumerate(logits):
+            probs = score.float().softmax(-1)
+            hard = F.one_hot(
+                probs.argmax(-1), self.cfg.codebook_size,
+            ).to(probs.dtype)
+            soft = hard + probs - probs.detach()
+            quantized = soft @ self.tokenizer.quantizer.embeddings[level].weight
+            contribution = self.tokenizer.quantizer._contribution(
+                None, level, quantized=quantized,
+            )
+            cumulative = contribution if cumulative is None else cumulative + contribution
+        return cumulative
+
+    def _byte_loss(self, logits, target, valid):
+        latent = self._latent_from_logits(logits)
+        byte_logits = self.tokenizer.decode_latent(latent, valid)
+        return masked_ce(byte_logits, target, valid, self.cfg.pad_token)
+
+    def _free_byte_loss(self, prompt, target, valid):
+        """Byte loss for the codes the model chooses under its own free-running prefix."""
+        with torch.no_grad():
+            cache = self.encode_prompt(prompt)
+            cumulative = torch.zeros(
+                prompt.shape[0], self.cfg.ctx_len, self.cfg.latent_dim,
+                device=prompt.device, dtype=self.queries.dtype,
+            )
+            predicted = []
+            for level in range(self.cfg.n_levels):
+                logits = self.forward_level(prompt, level, cumulative, cache)
+                code = logits.argmax(-1)
+                predicted.append(code)
+                cumulative = self.tokenizer.quantizer.add_level(cumulative, code, level)
+        student = self.forward(prompt, predicted, perturb=False)
+        return self._byte_loss(student, target, valid)
+
+    def loss(self, prompt, codes, target=None):
         B = prompt.shape[0]
+        if (self.cfg.byte_weight > 0 or self.cfg.free_byte_weight > 0) and target is None:
+            raise ValueError("byte_weight and free_byte_weight require target bytes")
         if self.training and self.cfg.prompt_dropout > 0:
             drop = torch.rand(B, device=prompt.device) < self.cfg.prompt_dropout
             prompt = torch.where(drop[:, None], self.null_prompt(prompt), prompt)
@@ -289,6 +344,18 @@ class NCMGenerator(nn.Module):
             "total": total, "code": code_loss, "consistency": consistency,
             "acc": correct, "self": total.new_tensor(float(self_step)),
         }
+        if target is not None and (self.cfg.byte_weight > 0 or self.cfg.free_byte_weight > 0):
+            target = target.long()
+            valid = target != self.cfg.pad_token
+            if self.cfg.byte_weight > 0:
+                byte_loss = self._byte_loss(logits, target, valid)
+                total = total + self.cfg.byte_weight * byte_loss
+                result["byte"] = byte_loss.detach()
+            if self.cfg.free_byte_weight > 0:
+                free_byte = self._free_byte_loss(prompt, target, valid)
+                total = total + self.cfg.free_byte_weight * free_byte
+                result["free_byte"] = free_byte.detach()
+            result["total"] = total
         result.update({f"l{i}": value for i, value in enumerate(level_losses)})
         return result
 

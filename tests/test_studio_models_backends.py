@@ -10,6 +10,7 @@ import pytest
 from mariana.studio.errors import UnavailableError, UpstreamError
 from mariana.studio.models import ModelGateway
 from mariana.studio.models.backends import (
+    ChatRequest,
     StopFilter,
     anthropic_tools,
     canonical_calls,
@@ -37,6 +38,43 @@ def sse(*chunks) -> list[str]:
 def add(gateway, name, kind, base, model="test-model", **extra):
     gateway.add_endpoint({"name": name, "kind": kind, "base_url": base, "model": model, **extra})
     return next(entry for entry in gateway.catalog(force=True) if entry["name"] == name)
+
+
+def test_openai_prompt_cache_payload_and_usage_normalisation():
+    request = ChatRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        options={"provider": "openai", "prompt_cache": True,
+                 "prompt_cache_key": "stable-prefix"},
+    )
+    remote = openai.build_payload("m", request, False)
+    assert remote["prompt_cache_key"] == "stable-prefix"
+    assert "cache_prompt" not in remote
+    local = openai.build_payload("m", request, True)
+    assert local["cache_prompt"] is True
+    assert "prompt_cache_key" not in local
+    automatic = openai.build_payload(
+        "m", ChatRequest(messages=request.messages,
+                         options={"provider": "groq", "prompt_cache": True,
+                                  "prompt_cache_key": "ignored"}), False)
+    assert "prompt_cache_key" not in automatic and "cache_prompt" not in automatic
+
+    counts = openai.usage_counts({
+        "prompt_tokens": 10, "completion_tokens": 2,
+        "prompt_tokens_details": {"cached_tokens": 7, "cache_creation_tokens": 3},
+    })
+    assert counts["cached_tokens"] == 7 and counts["cache_write_tokens"] == 3
+    deepseek = openai.usage_counts({
+        "prompt_tokens": 10, "completion_tokens": 2, "prompt_cache_hit_tokens": 6,
+    })
+    assert deepseek["cached_tokens"] == 6 and "cache_write_tokens" not in deepseek
+
+    rejected = UpstreamError("no", detail={
+        "status": 400, "body": "unknown parameter prompt_cache_key"})
+    adapted = openai.adapt_payload(remote, rejected)
+    assert adapted is not None and "prompt_cache_key" not in adapted
+    rejected_local = UpstreamError("no", detail={
+        "status": 400, "body": "unknown parameter cache_prompt"})
+    assert "cache_prompt" not in openai.adapt_payload(local, rejected_local)
 
 
 def test_openai_and_ollama_round_trips_without_streaming_support(gateway):

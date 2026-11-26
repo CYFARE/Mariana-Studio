@@ -1,8 +1,9 @@
 # Contributing to Mariana
 
-Thanks for taking the time to improve Mariana. The project is a hybrid
-diffusion-AR language model, a local Studio, and an agent runtime; small,
-well-tested changes are easier to review than broad rewrites.
+Thanks for taking the time to improve Mariana. The project is a one-stop
+research and development studio for language models: a hybrid diffusion-AR
+trainer, a local Studio, and an agent runtime; small, well-tested changes are
+easier to review than broad rewrites.
 
 ## Before you start
 
@@ -79,7 +80,7 @@ python -m pytest tests/test_studio_assets.py -q
 
 | Path | Owns |
 | --- | --- |
-| `mariana/*.py` | Core DRV-LM: config, model, training, generation, latent/SAINT, CLI. |
+| `mariana/*.py` | Core DRV-LM: config, model, training, generation, latent/SAINT, AXIOM, CLI. |
 | `mariana/ncm/` | Next-Concept Modeling. |
 | `mariana/export/` | GGUF, ONNX, and safetensors conversion. |
 | `mariana/agents/` | AML/AMP, flow runtime, swarm coordinator, abilities, store, scheduler. |

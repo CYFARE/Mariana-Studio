@@ -98,7 +98,10 @@ def load_optimizer_state(optimizer, state):
 
 
 def free_running_metrics(model, batch, cfg, device):
-    if len(batch) == cfg.n_levels + 1:
+    if len(batch) == cfg.n_levels + 2:
+        prompt = batch[0].to(device, non_blocking=True).long()
+        codes = [code.to(device, non_blocking=True).long() for code in batch[2:]]
+    elif len(batch) == cfg.n_levels + 1:
         prompt = batch[0].to(device, non_blocking=True).long()
         codes = [code.to(device, non_blocking=True).long() for code in batch[1:]]
     else:
@@ -107,12 +110,16 @@ def free_running_metrics(model, batch, cfg, device):
         with torch.no_grad():
             codes = model.tokenizer.encode(target)
     with torch.no_grad():
-        _, stats = model.generate(prompt, temperature=0, refine_steps=0)
+        tokens, stats = model.generate(prompt, temperature=0, refine_steps=0)
         correct = torch.cat([
             (predicted == truth).reshape(prompt.shape[0], -1)
             for predicted, truth in zip(stats["codes"], codes)
         ], dim=1).float().mean()
-        result = {"free": correct}
+        truth_bytes, _ = model.tokenizer.decode(codes)
+        result = {
+            "free": correct,
+            "free_bytes": (tokens == truth_bytes).float().mean(),
+        }
         result.update({
             f"free_l{level}": (predicted == truth).float().mean()
             for level, (predicted, truth) in enumerate(zip(stats["codes"], codes))
@@ -132,18 +139,23 @@ def cache_generator_codes(model, rows, cfg, args, device, amp):
         pin_memory=device.type == "cuda",
     )
     offset = 0
-    with torch.no_grad():
-        for batch in loader:
-            target = batch[0][:, cfg.prefix_len:].to(device, non_blocking=True).long()
-            with amp.autocast():
-                encoded = model.tokenizer.encode(target)
-            count = target.shape[0]
-            for destination, source in zip(codes, encoded):
-                destination[offset:offset + count].copy_(source.cpu())
-            offset += count
+    was_training = model.tokenizer.training
+    model.tokenizer.eval()
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                target = batch[0][:, cfg.prefix_len:].to(device, non_blocking=True).long()
+                with amp.autocast():
+                    encoded = model.tokenizer.encode(target)
+                count = target.shape[0]
+                for destination, source in zip(codes, encoded):
+                    destination[offset:offset + count].copy_(source.cpu())
+                offset += count
+    finally:
+        model.tokenizer.train(was_training)
     size = sum(code.numel() * code.element_size() for code in codes) / 1024**2
     print(f"Cached {len(rows)} frozen-code rows ({size:.1f} MiB) in {time.time() - started:.1f}s")
-    return TensorDataset(rows[:, :cfg.prefix_len], *codes)
+    return TensorDataset(rows[:, :cfg.prefix_len], rows[:, cfg.prefix_len:], *codes)
 
 
 def run_training(model, train_ids, val_ids, cfg, args, device, checkpoint, stage):
@@ -170,11 +182,22 @@ def run_training(model, train_ids, val_ids, cfg, args, device, checkpoint, stage
     schedule_origin = 0
     saved_optimizer = None
     legacy_generator = False
-    if args.resume and os.path.exists(checkpoint):
+    if args.resume and not os.path.exists(checkpoint):
+        raise ValueError(
+            f"--resume needs an existing checkpoint at {checkpoint}; "
+            "point --checkpoint at the file to continue, or drop --resume to start fresh"
+        )
+    if args.resume:
         state = load_checkpoint(checkpoint, map_location=device)
         if state.get("stage") != stage:
             raise ValueError(f"checkpoint is {state.get('stage')}, not {stage}")
-        model.load_state_dict(state["model"])
+        try:
+            model.load_state_dict(state["model"])
+        except (KeyError, RuntimeError) as error:
+            raise ValueError(
+                f"{checkpoint} does not match the current {stage} configuration "
+                f"({error}); resume with the checkpoint's own settings or start fresh"
+            ) from error
         start = state.get("step", 0)
         legacy_generator = state.get("format", 1) < 2 and stage == "generator"
         if legacy_generator:
@@ -231,15 +254,20 @@ def run_training(model, train_ids, val_ids, cfg, args, device, checkpoint, stage
             if stage == "tokenizer":
                 rows = batch[0].to(device, non_blocking=True).long()
                 return model(rows[:, -cfg.ctx_len:])
-            if len(batch) == cfg.n_levels + 1:
+            if len(batch) == cfg.n_levels + 2:
                 prompt = batch[0].to(device, non_blocking=True).long()
+                target = batch[1].to(device, non_blocking=True).long()
+                codes = [code.to(device, non_blocking=True).long() for code in batch[2:]]
+            elif len(batch) == cfg.n_levels + 1:
+                prompt = batch[0].to(device, non_blocking=True).long()
+                target = None
                 codes = [code.to(device, non_blocking=True).long() for code in batch[1:]]
             else:
                 rows = batch[0].to(device, non_blocking=True).long()
                 prompt, target = rows[:, :cfg.prefix_len], rows[:, cfg.prefix_len:]
                 with torch.no_grad():
                     codes = model.tokenizer.encode(target)
-            return model.loss(prompt, codes)
+            return model.loss(prompt, codes, target=target)
 
     steps_per_epoch = max(1, math.ceil(len(train_loader) / args.grad_accum))
     print(

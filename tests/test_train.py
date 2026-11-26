@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from mariana.cli import cfg_from_args, parse_args
+from mariana.cli import cfg_from_args, cmd_train, parse_args
 from mariana.config import Config
 from mariana.data import build_dataset
+from mariana.device import Amp
 from mariana.model import MarianaLM
 from mariana.train import (
     corrupt_batch,
+    evaluate,
     hybrid_losses,
     make_block_mask,
     make_causal_mask,
+    save_checkpoint,
     train as train_model,
+    train_step,
 )
 
 
@@ -284,3 +290,142 @@ def test_training_reduces_loss():
         first = first or float(losses["total"].detach())
         last = float(losses["total"].detach())
     assert last < first, f"loss did not decrease: {first} -> {last}"
+
+
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("ctx", [2, 3, 4])
+def test_tiny_contexts_train_without_crashing(fast, ctx):
+    cfg = Config(
+        ctx_len=ctx, dim=32, n_heads=4, n_pre=1, n_core=1, n_post=1,
+        max_loops=1, block_size=2, mlp_mult=2, fast_train=fast,
+    )
+    model = MarianaLM(cfg)
+    x = torch.randint(0, 256, (2, ctx + 1))
+    inputs, targets, originals, times, region, masks, flex = corrupt_batch(x, cfg)
+    assert flex is None
+    assert inputs.shape == originals.shape == (2, ctx)
+    assert (inputs[:, 0] == cfg.bos_token).all()
+    for row in range(2):
+        cutoff = int(region[row].argmax())
+        if region[row].any():
+            expected = make_block_mask(ctx, cutoff, cfg.block_size)
+            torch.testing.assert_close(masks[row, 0], expected)
+    causal = make_causal_mask(ctx).unsqueeze(0).unsqueeze(0)
+    losses = hybrid_losses(
+        model, inputs, targets, originals, times, region, masks, flex,
+        cfg, causal, cfg.max_loops,
+    )
+    for key in ("ar", "diff", "align", "ver", "total"):
+        assert torch.isfinite(losses[key]), key
+
+
+def test_flex_mask_receives_the_causal_annealing_rows():
+    cfg = tiny_cfg(fast=False)
+    captured = {}
+
+    def fake_mask(cutoffs, ctx, block_size, device, causal_only=None):
+        captured["causal_only"] = causal_only
+        return "flex-mask"
+
+    with patch("mariana.train.HAS_FLEX", True), patch(
+        "mariana.train.build_flex_block_mask", fake_mask
+    ):
+        x = torch.randint(0, 256, (3, cfg.ctx_len + 1))
+        batch = corrupt_batch(
+            x, cfg, p_causal=1.0, use_flex=True, device=torch.device("cpu")
+        )
+    assert batch[5] is None and batch[6] == "flex-mask"
+    assert captured["causal_only"].tolist() == [True, True, True]
+
+
+def test_a_failed_checkpoint_write_keeps_the_previous_file(tmp_path):
+    cfg = tiny_cfg()
+    model = MarianaLM(cfg)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    amp = Amp(torch.device("cpu"))
+    path = tmp_path / "model.pt"
+    save_checkpoint(path, model, optimizer, cfg, 3, amp, False)
+    assert torch.load(path, weights_only=False)["step"] == 3
+    previous = path.read_bytes()
+
+    def broken_save(state, target, *args, **kwargs):
+        Path(target).write_bytes(b"partial checkpoint")
+        raise RuntimeError("disk full")
+
+    with patch("mariana.train.torch.save", side_effect=broken_save):
+        with pytest.raises(RuntimeError, match="disk full"):
+            save_checkpoint(path, model, optimizer, cfg, 4, amp, False)
+    assert path.read_bytes() == previous
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_resume_requires_an_existing_checkpoint(tmp_path):
+    args = parse_args([
+        "train", "--resume", "--checkpoint", str(tmp_path / "missing.pt"),
+        "--ctx", "8", "--dim", "32", "--heads", "4", "--n-pre", "1",
+        "--n-core", "1", "--n-post", "1", "--loops", "1", "--batch", "1",
+        "--steps", "1", "--no-gen", "--device", "cpu",
+    ])
+    with pytest.raises(ValueError, match="--resume needs an existing checkpoint"):
+        train_model(args, cfg_from_args(args), torch.device("cpu"))
+
+
+def test_resume_rejects_an_ncm_checkpoint_early(tmp_path):
+    checkpoint = tmp_path / "ncm.pt"
+    torch.save({"stage": "generator", "step": 1, "model": {}, "cfg": {}}, checkpoint)
+    args = parse_args([
+        "train", "--resume", "--checkpoint", str(checkpoint),
+        "--steps", "2", "--no-gen", "--device", "cpu",
+    ])
+    with pytest.raises(SystemExit, match="DRV-LM checkpoint"):
+        cmd_train(args)
+
+
+@pytest.mark.parametrize(
+    ("dim", "heads", "message"),
+    [(30, 4, "divisible by --heads"), (12, 4, "even head size")],
+)
+def test_invalid_geometry_is_rejected_before_training(dim, heads, message):
+    args = parse_args([
+        "train", "--ctx", "8", "--dim", str(dim), "--heads", str(heads),
+        "--batch", "1", "--steps", "1", "--no-gen", "--device", "cpu",
+    ])
+    with pytest.raises(ValueError, match=message):
+        train_model(args, cfg_from_args(args), torch.device("cpu"))
+
+
+def test_evaluate_restores_training_mode():
+    cfg = tiny_cfg()
+    model = MarianaLM(cfg)
+    model.train()
+    result = evaluate(
+        model, [], torch.device("cpu"), cfg, Amp(torch.device("cpu")),
+        make_causal_mask(cfg.ctx_len).unsqueeze(0).unsqueeze(0),
+    )
+    assert result == {} and model.training
+
+
+def test_non_finite_gradients_skip_the_optimizer_step(monkeypatch, capsys):
+    cfg = tiny_cfg()
+    model = MarianaLM(cfg)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    steps = []
+    original_step = optimizer.step
+
+    def counted_step(*args, **kwargs):
+        steps.append(1)
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "step", counted_step)
+    monkeypatch.setattr(
+        "mariana.train.torch.nn.utils.clip_grad_norm_",
+        lambda *args, **kwargs: torch.tensor(float("inf")),
+    )
+    x = torch.randint(0, 256, (2, cfg.ctx_len + 1))
+    causal = make_causal_mask(cfg.ctx_len).unsqueeze(0).unsqueeze(0)
+    train_step(
+        model, x, torch.device("cpu"), cfg, Amp(torch.device("cpu")), causal,
+        False, 0.0, 1, True, optimizer, 0, 1,
+    )
+    assert steps == []
+    assert "non-finite gradients" in capsys.readouterr().out

@@ -40,7 +40,7 @@
   ];
 
   const SWARM_DEFAULTS = {
-    strategy: "auto", max_agents: 4, rounds: 0, ipc: true, memory: true,
+    strategy: "auto", max_agents: 8, rounds: 0, ipc: true, memory: true,
     depth: "deep", max_steps: 16, max_seconds: 900,
   };
   const TOOL_DEFAULTS = { files: true, write: false, web: true };
@@ -110,7 +110,7 @@
       strategy: SWARM_STRATEGIES.some(([value]) => value === saved.strategy)
         ? saved.strategy : SWARM_DEFAULTS.strategy,
       depth,
-      max_agents: bounded(saved.max_agents, SWARM_DEFAULTS.max_agents, 1, 6),
+      max_agents: bounded(saved.max_agents, SWARM_DEFAULTS.max_agents, 1, 64),
       rounds: bounded(saved.rounds, SWARM_DEFAULTS.rounds, 0, 2),
       max_steps: budget.max_steps,
       max_seconds: budget.max_seconds,
@@ -2418,7 +2418,7 @@
       ariaLabel: "Swarm strategy",
     });
     const swarmAgents = Studio.form.control({
-      type: "number", min: 1, max: 6, step: 1, value: state.swarmOptions.max_agents,
+      type: "number", min: 1, max: 64, step: 1, value: state.swarmOptions.max_agents,
       ariaLabel: "Swarm agents",
     });
     const swarmRounds = Studio.form.control({

@@ -81,6 +81,9 @@ decoding are additional passes and are not included in the dense benchmark below
 - RoPE cosine/sine computed once per model forward and shared by Q, K, and all
   blocks, instead of recomputed twice per block.
 - Vectorized corruption and mask construction directly on the training device.
+- FlexAttention (`--flex`) builds the same per-row block mask, including the
+  early-training causal-only annealing rows; devices without a FlexAttention
+  backward kernel keep the equivalent SDPA masks.
 - Pinned CUDA batches and nonblocking host-to-device transfer.
 - Fixed-shape losses without variable-sized boolean indexing; a single CE
   computes both AR and diffusion terms.

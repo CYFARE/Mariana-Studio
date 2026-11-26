@@ -12,6 +12,7 @@ See [`whitepapers/`](whitepapers/) for the index and citation details.
 | --- | --- |
 | [Sprint-DRV](whitepapers/sprint-drv.md) | Single-pass training for the hybrid diffusion-AR model, including the legacy two-pass baseline and measurements. |
 | [SAINT](whitepapers/saint.md) | Adaptive hierarchical discrete/continuous thought memory, curricula, policy learning, and ablations. |
+| [AXIOM](whitepapers/axiom.md) | The connector algebra and domain-adaptive corpus codec: English operators, lossless dictionaries, DNA/protein packing, compression measurements and the evaluation protocol. |
 | [NCM](whitepapers/ncm.md) | Multiscale residual VQ and parallel next-concept generation. |
 | [AML and AMP](whitepapers/aml-amp.md) | The portable agent document language and the local HTTP/JSON runtime protocol. |
 
@@ -22,6 +23,7 @@ See [`whitepapers/`](whitepapers/) for the index and citation details.
 | [setup.md](setup.md) | The cross-platform `mariana setup` command: pyenv, virtual environment, requirements profiles, extras and troubleshooting. |
 | [fast-training.md](fast-training.md) | Sprint-DRV flags, benchmark command, tradeoffs, and MoE kernels. |
 | [latent-language.md](latent-language.md) | SAINT commands, metrics, ablations, and limitations. |
+| [axiom.md](axiom.md) | AXIOM commands, profiles, corpus cache, generation decoding, metrics, and limits. |
 | [ncm.md](ncm.md) | NCM training/inference recipes, controls, and evaluation requirements. |
 | [distillation.md](distillation.md) | Sequence-level distillation from a local or cloud teacher. |
 | [export.md](export.md) | GGUF, ONNX and safetensors export, plus llama.cpp, Ollama and ONNX Runtime runners. |

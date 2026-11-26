@@ -195,7 +195,7 @@ def test_prepare_validates_and_bounds_a_chat_swarm(tmp_path):
     request = service.prepare(chat_config())
     assert request.model == "fake" and request.model_name == "Fake"
     assert request.strategy == "auto" and request.rounds == 1
-    assert request.limits.max_agents == 4 and request.limits.max_steps == 10
+    assert request.limits.max_agents == 8 and request.limits.max_steps == 10
     assert request.limits.max_seconds == 300.0
     assert request.goal == "What is my name?"
     assert "Conversation system prompt:\nBe concise." in request.briefing
@@ -209,7 +209,7 @@ def test_prepare_validates_and_bounds_a_chat_swarm(tmp_path):
          "last message must be from you"),
         ({"messages": "nope"}, "messages must be a list"),
         ({"strategy": "magic"}, "strategy must be one of"),
-        ({"max_agents": 99}, "max_agents must be between 1 and 6"),
+        ({"max_agents": 999}, "max_agents must be between 1 and 64"),
         ({"max_steps": 0}, "max_steps must be between 1 and 24"),
         ({"rounds": 3}, "rounds must be between 0 and 2"),
         ({"max_seconds": 5}, "max_seconds must be between"),
@@ -285,7 +285,7 @@ def test_cancellation_ends_the_stream_with_an_error_event(tmp_path):
             self.release = threading.Event()
 
         def chat(self, config):
-            if "Plan a small, focused team" in config["messages"][0]["content"]:
+            if "Plan a focused team" in config["messages"][0]["content"]:
                 self.started.set()
                 self.release.wait(5)
             return super().chat(config)
@@ -311,7 +311,7 @@ def test_close_cancels_running_swarms(tmp_path):
             self.release = threading.Event()
 
         def chat(self, config):
-            if "Plan a small, focused team" in config["messages"][0]["content"]:
+            if "Plan a focused team" in config["messages"][0]["content"]:
                 self.started.set()
                 self.release.wait(5)
             return {"reply": json.dumps({"final": "too late"}), "usage": {}}
@@ -442,7 +442,7 @@ def test_a_swarm_member_can_read_a_workspace_file(tmp_path):
 
         def chat(self, config):
             system = config["messages"][0]["content"]
-            if "Plan a small, focused team" in system:
+            if "Plan a focused team" in system:
                 return {"reply": json.dumps({
                     "strategy": "map_reduce", "rounds": 0,
                     "agents": [{"id": "a1", "task": "read the notes"}],

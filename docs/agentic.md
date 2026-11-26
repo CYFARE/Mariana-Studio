@@ -7,7 +7,7 @@
 Mariana Studio's **Agents** workspace is a visual and programmatic automation suite.
 It has two public specifications:
 
-- [Agent Management Language (AML) v1.8](../mariana/agents/specs/AML.md) — the
+- [Agent Management Language (AML) v1.9](../mariana/agents/specs/AML.md) — the
   portable agent/flow document.
 - [Agent Management Protocol (AMP) v1.10](../mariana/agents/specs/AMP.md) — the
   HTTP/JSON protocol for creating, validating, running, testing, debugging and
@@ -84,12 +84,136 @@ Chat's preview panel; when automatic previews are on, the last previewable file
 opens as soon as the run finishes, so a built page, design or image is visible
 without selecting it by hand.
 
+### Latency and cache reuse
+
+A swarm reuses work instead of repeating it. Known read-only tools (file
+list/read/search/tree/inspect, diagnostics, `git.inspect`, CSV/skill reads and
+the web/browser fetchers) keep a bounded, in-memory result cache for the run.
+Concurrent identical calls are single-flight: one member executes, the others
+wait and reuse the result. Independent reads in one batched tool call run in
+parallel up to eight at a time; writes stay ordered and serialised. A successful
+write, edit, delete or shell call clears the cache and invalidates in-flight
+read results, so a later read never sees a stale file. Failures are not cached;
+network entries expire after 30 seconds and local entries after two minutes.
+The run result and snapshot report hits, saved time, stored bytes and the
+prompt-cache hit rate; Chat swarm cards and the IDE's bounded swarm observation
+surface the hits and hit rate while the run is live. The cache is never written
+to disk.
+
+The leader has a free hand to plan a large team. The safety ceiling is 64
+agents (default 16 in AML, 8 in Chat and 16 in the IDE); the leader is told to
+size the team to the work, give every independent workstream its own member in
+one wave, and never add filler. Model calls
+and tool executions are metered by separate semaphores (defaults 16 and 32
+concurrent, overridable with `MARIANA_SWARM_MODEL_CONCURRENCY` and
+`MARIANA_SWARM_TOOL_CONCURRENCY`) so a large plan queues safely instead of
+firing every provider and disk call at once. A single read pool serves every
+member, so a large team cannot create hundreds of per-turn threads. Planning
+output grows with the team size, and reports from more than 12 agents are
+condensed in parallel groups before the final synthesis, so every member stays
+represented without exceeding the leader's prompt.
+
+Member prompts separate immutable instructions, tool descriptions and briefing
+from mutable state. Peer digests, the blackboard, the member plan, unread
+messages and feedback live in the user turn; the system prefix stays
+byte-identical across tool turns and phases. OpenAI receives a stable
+`prompt_cache_key`, llama.cpp receives `cache_prompt`, other compatible
+providers use their automatic prefix cache, Anthropic receives `cache_control`
+on the system and tool blocks, and cached-token counts flow back into the run
+usage. A provider that rejects a cache parameter is retried once without it. If
+a caller supplies complete member tasks and explicit tool grants,
+the leader planning call is skipped; a feedback round where every review scores
+4+ with no open issue also stops without another leader decision. When a
+reasoning effort is configured, routine tool turns run at low effort while the
+first turn and the final wrap-up keep the configured level. Set
+`adaptive_effort: false` on a swarm node to send the configured level on every
+turn instead.
+
+These are algorithmic reductions in model and tool work. They are not a
+published wall-clock comparison against a separate coding agent; use a matched
+corpus, model, tool set and time budget before claiming an external speed record.
+
 Tool calls are reliability-checked in `agent`, `swarm` and the IDE coding loop.
 A read-only failure that looks temporary (timeout, connection reset, rate limit,
 5xx) is retried once; writes are never retried. Deterministic failures come
 back with a short recovery hint, an unknown tool id gets a closest-match
 suggestion, and a third identical call is called out explicitly. These rules are
 published under `swarm.reliability` in AMP discovery.
+
+### Real-project reads and the hot cache
+
+Below the run cache, a process-wide hot cache keeps decoded workspace files in
+RAM, keyed by absolute path and `mtime_ns`/size so a changed file is never served
+stale. Its budget is a fifth of available memory (64 MiB–2 GiB) and can be set
+with `MARIANA_HOT_CACHE_MB`. Writes and shell commands that may change files
+invalidate entries; large and binary files are never stored.
+
+`file.read` now lists a directory instead of failing, follows symlinks that stay
+inside the sandbox, reports binary files, streams files above 8 MB by line range,
+and suggests close paths and nearby entries when a path is missing. `file.list`
+takes a folder, nested pattern and recursion, and `file.tree` reports folders
+too, with a depth limit and up to 20,000 entries. `file.search` uses `git grep`
+in a Git work tree and falls back to the Python walker elsewhere; it scans up to
+50,000 files and treats an invalid regular expression as a literal search.
+
+Swarm tool arguments are normalised before dispatch (`file_path`, `filePath`,
+`startLine`, `from`/`to`, `q`, `glob`, `cmd`, numeric strings), so a model's
+spelling habit is not a tool failure and equivalent calls share the cache.
+Synthesis never accepts tool-call markup as the final answer, and a member whose
+reasoning consumes the visible output budget gets one compact evidence-only
+repair prompt. Short runs reserve 15% of their budget for synthesis, and member
+prompts keep the shared instruction/briefing prefix first so the first member
+warms the provider cache for the rest.
+
+On the 3.5k-file Shotcut checkout with the saved DeepSeek endpoint, a read-only
+bug audit finished in 156 s with 46 tool calls and no failures, a targeted
+three-agent audit in 56 s with 27 calls and no failures, and a four-agent
+ownership audit in 93 s with 16 calls and no failures. A documentation swarm
+edited only `README.md` in a disposable copy. These are observed local runs;
+they are not a matched comparison against another coding agent.
+
+`python scripts/swarm_bench.py --workspace /path/to/project --goal "..."` runs
+the same path against any folder, using a saved Studio endpoint (default
+`endpoint:deepseek`); add `--write` for edits and `--json` for a machine-readable
+summary with phase timings and cache counters.
+
+### Context compression (CRAFT)
+
+CRAFT — **C**ontext **R**eduction with **A**nchors, **F**acts and **T**races —
+follows the provenance-first direction of the agent-context survey: the failure
+mode that matters is not only losing bytes, but losing the path or line that
+proves a later claim. It has three layers:
+
+1. **Anchors** — URLs, file paths, `path:line` references, commands, quoted
+   symbols and error lines are extracted verbatim before anything is shortened.
+2. **Facts** — units are ranked by goal overlap, error/decision markers, recency
+   and anchor density, then deduplicated; head and tail units are reserved so a
+   conclusion is never crowded out by filler.
+3. **Traces** — the original text stays behind a `ctx-…` handle; the compacted
+   prompt says how to request it back. Nothing is silently destroyed.
+
+The compressor spends no model call, so it runs on every observation inside a
+large team. Tool results are compressed structure-aware: search matches keep
+`path:line` and match text, reads keep range/error metadata plus a bounded body,
+trees keep counts and representative paths. The member observation path is
+newest-first, so a long older result can no longer push the latest evidence out
+of the window.
+
+Compacted turns become an **episode card** naming the tools used, anchors, errors
+and decisions, instead of only a list of handles. A run-wide evidence ledger
+collects anchors seen by any member and places a compact line in every member
+prompt, so the second agent can reuse the first agent's provenance instead of
+re-reading the file. Handles also carry a 260-character summary and anchor list.
+
+Default budgets are larger: 24,000 prompt characters, 8,000 observation
+characters, a 400,000-character context bank, 96,000 characters per agent and
+32,000 per retrieval slice. `cache` reports `compacted_raw_chars`,
+`compacted_chars`, `compression_ratio`, `context_episodes`, `context_items` and
+`evidence_anchors`.
+
+Reference direction: *Context Compression for LLM Agents: A Survey of Methods,
+Failure Modes, and Evaluation* and its curated index
+[`YerbaPage/Awesome-Agent-Context-Compression`](https://github.com/YerbaPage/Awesome-Agent-Context-Compression).
 
 An `agent` node keeps its own history bounded. After about 24,000 characters it
 replaces the oldest tool rounds with a ledger naming the tools already called and

@@ -112,6 +112,10 @@ def adapt_payload(payload: dict, error: UpstreamError) -> dict | None:
         adapted.pop("seed")
     elif "reasoning_effort" in text and "reasoning_effort" in adapted:
         adapted.pop("reasoning_effort")
+    elif "prompt_cache_key" in text and "prompt_cache_key" in adapted:
+        adapted.pop("prompt_cache_key")
+    elif "cache_prompt" in text and "cache_prompt" in adapted:
+        adapted.pop("cache_prompt")
     elif ("reasoning_content" in text or "reasoning content" in text) and "tools" in adapted:
         # DeepSeek requires prior thinking to be sent back with native tools; the
         # prompted path is the safe fallback when that history is not available.
@@ -148,12 +152,48 @@ def build_payload(model: str, request, local: bool) -> dict:
         # Reasoning endpoints (DeepSeek, o-series) honour this; adapt_payload drops it
         # automatically when a provider rejects the parameter.
         payload["reasoning_effort"] = effort
+    if options.get("prompt_cache"):
+        provider = str(options.get("provider") or "").strip().lower()
+        if local:
+            # llama.cpp keeps the longest matching prefix hot across requests.
+            payload["cache_prompt"] = True
+        elif provider == "openai":
+            key = str(options.get("prompt_cache_key") or "").strip()
+            if key:
+                payload["prompt_cache_key"] = key[:64]
+        # Other compatible providers cache prefixes automatically; sending an
+        # OpenAI-only routing field can make a strict server reject the request.
     tools, _ = native_tools(options.get("tools"))
     if tools and options.get("provider") != "deepseek":
         # DeepSeek requires prior reasoning to be replayed when native tools are sent;
         # its DSML/text tool calls are parsed instead, so the text path is used.
         payload["tools"] = tools
     return payload
+
+
+def _count(value) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_counts(raw: dict) -> dict:
+    """Normalise the cache fields providers put around prompt usage."""
+    details = raw.get("prompt_tokens_details") if isinstance(raw, dict) else None
+    details = details if isinstance(details, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    cached = raw.get("prompt_cache_hit_tokens") or details.get("cached_tokens")
+    written = details.get("cache_creation_tokens") or raw.get("cache_creation_input_tokens")
+    counts = {
+        "prompt_tokens": _count(raw.get("prompt_tokens")),
+        "completion_tokens": _count(raw.get("completion_tokens")),
+    }
+    if _count(cached):
+        counts["cached_tokens"] = _count(cached)
+    if _count(written):
+        counts["cache_write_tokens"] = _count(written)
+    return counts
 
 
 def stream_chat(url: str, payload: dict, headers: dict, request, prompt_format: str = "openai-chat"):
@@ -277,8 +317,7 @@ def stream_chat(url: str, payload: dict, headers: dict, request, prompt_format: 
         yield delta(tool_calls_text(calls))
         finish = "tool_calls"
     yield done(
-        usage={"prompt_tokens": int(usage.get("prompt_tokens") or 0),
-               "completion_tokens": int(usage.get("completion_tokens") or 0)},
+        usage=usage_counts(usage),
         prompt_format=prompt_format, finish_reason=finish or "stop",
     )
 

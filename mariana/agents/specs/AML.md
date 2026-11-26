@@ -1,4 +1,4 @@
-# Agent Management Language (AML) v1.8
+# Agent Management Language (AML) v1.9
 
 AML is a portable, human-readable format for describing an agent as a directed
 flowchart with abilities, model settings, schedules and run controls. The
@@ -6,7 +6,7 @@ canonical encoding is JSON; YAML is accepted on import when PyYAML is
 installed. Studio stores the normalized JSON form.
 
 - Media type: `application/vnd.mariana.aml+json`
-- Current version: `1.8` (a superset of `1.7`, `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changelog](#9-changelog))
+- Current version: `1.9` (a superset of `1.8`, `1.7`, `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changelog](#9-changelog))
 - Transport for execution: [Agent Management Protocol (AMP)](./AMP.md)
 - Studio location: **Agents** workspace → **Spec** panel
 
@@ -19,7 +19,7 @@ debug an automation entirely through HTTP.
 
 ```json
 {
-  "aml": "1.8",
+  "aml": "1.9",
   "kind": "agent",
   "id": "daily-digest",
   "name": "Daily digest",
@@ -29,7 +29,7 @@ debug an automation entirely through HTTP.
   "model": "trained-model/mariana.pt",
   "vars": {"team": "support", "dry_run": false},
   "swarm": {
-    "max_agents": 6, "max_steps": 8, "max_rounds": 2, "max_seconds": 300,
+    "max_agents": 16, "max_steps": 8, "max_rounds": 2, "max_seconds": 300,
     "max_messages": 200, "allow_write": false, "allow_ipc": true,
     "shared_memory": true
   },
@@ -73,7 +73,7 @@ debug an automation entirely through HTTP.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `aml` | string | yes | `"1.8"`, `"1.7"`, `"1.6"`, `"1.5"`, `"1.4"`, `"1.3"`, `"1.2"`, `"1.1"` or `"1.0"`. Documents are normalized to `1.8`; any other value validates with a warning. |
+| `aml` | string | yes | `"1.9"`, `"1.8"`, `"1.7"`, `"1.6"`, `"1.5"`, `"1.4"`, `"1.3"`, `"1.2"`, `"1.1"` or `"1.0"`. Documents are normalized to `1.9`; any other value validates with a warning. |
 | `kind` | string | yes | Must be `"agent"`. |
 | `id` | slug | recommended | Lowercase letters, digits and dashes. Derived from `name` when omitted. |
 | `name` | string | yes | Display name, max 120 chars. |
@@ -107,7 +107,7 @@ every `swarm` node. A node may narrow it, never widen it.
 
 | Key | Default | Range | Meaning |
 |---|---:|---:|---|
-| `max_agents` | 6 | 1–12 | Members in one swarm. |
+| `max_agents` | 16 | 1–64 | Members in one swarm. The leader chooses the team; the runtime meters concurrent model and tool calls separately. |
 | `max_steps` | 8 | 1–24 | Model rounds per member per phase. |
 | `max_rounds` | 2 | 0–4 | Feedback rounds available to a node. |
 | `max_seconds` | 300 | 10–3600 | Active time for one swarm node. |
@@ -115,9 +115,11 @@ every `swarm` node. A node may narrow it, never widen it.
 | `max_message_chars` | 4000 | 200–20000 | Characters in one message. |
 | `max_memory_entries` | 120 | 0–1000 | Shared-blackboard keys. |
 | `max_memory_chars` | 8000 | 200–100000 | Serialized size of one memory value. |
-| `max_context_chars` | 200000 | 0–2000000 | Run-wide extra prompt characters members may borrow; `0` disables dynamic context. |
-| `max_agent_context_chars` | 64000 | 0–500000 | Most extra context one member may hold at once. |
-| `max_context_item_chars` | 24000 | 500–200000 | Largest slice one context request may return. |
+| `max_context_chars` | 400000 | 0–2000000 | Run-wide extra prompt characters members may borrow; `0` disables dynamic context. |
+| `max_model_concurrency` | 16 | 1–64 | Concurrent provider calls across the whole swarm. Agents beyond this run in parallel but queue their model turns. |
+| `max_tool_concurrency` | 32 | 1–128 | Concurrent tool executions across the whole swarm. |
+| `max_agent_context_chars` | 96000 | 0–500000 | Most extra context one member may hold at once. |
+| `max_context_item_chars` | 32000 | 500–200000 | Largest slice one context request may return. |
 | `allow_write` | `false` | bool | Members may use write-like tools. |
 | `allow_ipc` | `true` | bool | Members may message each other. |
 | `shared_memory` | `true` | bool | Members may use the blackboard. |
@@ -232,8 +234,9 @@ the final answer. The leader may be a different model (`leader_model`).
     "strategy": "peer_review",
     "rounds": 1,
     "effort": "high",
+    "adaptive_effort": true,
     "reflection": true,
-    "max_agents": 4,
+    "max_agents": 16,
     "max_steps": 6,
     "max_seconds": 240,
     "write": false,
@@ -255,8 +258,9 @@ the final answer. The leader may be a different model (`leader_model`).
 | `strategy` | `auto` | `auto`, `map_reduce`, `peer_review`, `debate` or `pipeline`. |
 | `rounds` | `1` | Peer-review/revision rounds, 0–4. The leader may choose fewer, never more. Each round reviews then revises. |
 | `effort` | `""` | `low`, `medium`, `high` or empty (provider default). Sent as `reasoning_effort` where the endpoint supports it, for planning, member work, review decisions and synthesis. |
+| `adaptive_effort` | `true` | Spend the configured effort on the first turn and the final answer; routine tool loops and peer reviews use low effort. `false` sends the configured level on every turn. |
 | `reflection` | `true` | Ask a member once to finish or justify open plan steps before it returns its answer. |
-| `max_agents` | `4` | Team size, 1–8. |
+| `max_agents` | `16` | Team size, 1–64. |
 | `max_steps` | `6` | Model rounds per member per phase, 1–12. |
 | `max_seconds` | `240` | Active time budget, 10–1800. |
 | `write` | `false` | Members may use write-like tools. Requires top-level `swarm.allow_write`. |
@@ -612,12 +616,12 @@ A node cannot use an ability that is not listed. `enabled: false` disables it.
 | `http.fetch` | `url` or node input, `method`, `headers`, `body`, `timeout`, `allow_private`, `extract` (`raw`/`text`), `max_chars` | `status`, `headers`, `body`, `json` when parseable; with `extract: "text"`, `text` (readable text, HTML stripped) replaces `body` |
 | `news.headlines` | `url` (empty = Google News), `query`, `source` (`auto`/`google`/`bing`), `region`, `language`, `date`, `limit` (1–50), `include_summary`, `timeout` | `url`, `source_used`, `feed_title`, `items[{title, link, source, published, date}]`, `count`, `total`, `date_matched`, `latest_date`, `dates`, `note`; `auto` tries Google News then Bing News |
 | `browser.fetch` | `url`, `timeout`, `max_chars` | `title`, `text`, `chars`, `truncated`, `engine`; renders JavaScript in Playwright or a Chromium binary and requires OS access |
-| `file.read` | `path`, `start_line`, `end_line` (default 200 lines) | `path`, `content`, `start_line`, `end_line`, `total_lines`, `truncated` |
+| `file.read` | `path`, `start_line`, `end_line` (default 200 lines) | `path`, `content`, `start_line`, `end_line`, `total_lines` (null while streaming a large file), `truncated`; a directory returns `entries`, a binary file returns `binary: true`, and a large file returns `large_file: true` |
 | `file.write` | `path`, `content` | `path`, `bytes`, `written` |
-| `file.list` | `pattern` | `pattern`, `files[{name, bytes, modified}]` |
+| `file.list` | `path`, `pattern`, `recursive`, `max_entries` | `path`, `pattern`, `entries[{path, type, bytes?, modified?}]`, `files[{name, bytes, modified, path}]`, `truncated` |
 | `file.edit` | `path`, `old`, `new`, `replace_all` | `path`, `replacements`, `bytes`, `changed`; the old text must be unique unless `replace_all` |
-| `file.search` | `query`, `regex` (default true), `case_sensitive`, `include` (glob), `max_results` | `query`, `matches[{path, line, text}]`, `files_scanned`, `truncated` |
-| `file.tree` | `max_entries` | `entries[{path, type, bytes?}]`, `truncated`; dependency folders are skipped |
+| `file.search` | `query`, `regex` (default true; an invalid pattern is searched literally), `case_sensitive`, `include` (comma-separated globs), `max_results` | `query`, `matches[{path, line, text}]`, `files_scanned` (null when Git grep ran), `truncated`, `engine`, `regex_fallback?` |
+| `file.tree` | `max_entries` (up to 20,000), `depth` | `entries[{path, type, bytes?}]`, `truncated`, `depth`; dependency folders are skipped |
 | `file.delete` | `path` | `path`, `deleted` |
 | `code.diagnostics` | `path` (file, folder or empty) | `files_checked`, `issues[{path, line, column, message, rule, severity}]`, `ok`; checks Python syntax, JSON and optional pyflakes rules |
 | `sqlite.query` | `path`, `sql`, `params` (list or object), `max_rows`, `timeout`; ability config `write` (default false) | `columns`, `rows`, `row_count`, `truncated`, `changes`; one parameterized SQLite statement in the sandbox |
@@ -734,7 +738,7 @@ input. Overlapping runs for the same agent are skipped.
 
 ```json
 {
-  "aml": "1.8",
+  "aml": "1.9",
   "kind": "agent",
   "id": "support-triage",
   "name": "Support triage",
@@ -770,6 +774,27 @@ input. Overlapping runs for the same agent are skipped.
 ---
 
 ## 9. Changelog
+
+### 1.9
+
+AML 1.9 is additive. Every 1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1 and 1.0
+document is valid and runs unchanged.
+
+- The `swarm` node accepts `adaptive_effort` (default `true`). With an
+  `effort` set, routine tool turns and peer reviews run at low effort while the
+  first turn and the final answer keep the configured level.
+- `file.list` accepts `path`, `recursive` and `max_entries`; `file.tree` accepts
+  `depth` and up to 20,000 entries; `file.search` accepts comma-separated
+  `include` globs, reports its `engine`, and searches an invalid regular
+  expression as literal text. All additions are optional.
+- Swarm teams may contain up to 64 agents. The leader chooses the team size;
+  concurrent model and tool calls are metered separately (defaults 16 and 32),
+  and reports from large teams are condensed in parallel groups before the
+  final synthesis.
+- Default context capacity is larger (24,000 prompt characters, 8,000 per
+  observation, a 400,000-character bank, 96,000 per agent, 32,000 per retrieval
+  slice). The runtime compacts observations and turns with anchor-preserving
+  episode cards; the schema is unchanged.
 
 ### 1.8
 

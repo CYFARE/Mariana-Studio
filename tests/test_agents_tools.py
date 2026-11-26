@@ -20,6 +20,9 @@ from mariana.agents.tools import (
     _guarded_connection,
     _private_address,
     execute_ability,
+    missing_required_arguments,
+    normalise_tool_arguments,
+    resolve_tool_id,
 )
 from tests.helpers import mock_provider, serving
 
@@ -134,12 +137,69 @@ def test_symlinks_cannot_expose_files_outside_the_sandbox(tmp_path):
     project.mkdir()
     (project / "inside.txt").write_text("inside\n", encoding="utf-8")
     (project / "link.txt").symlink_to(secret)
+    (project / "inside-link.txt").symlink_to(project / "inside.txt")
     found = run(tmp_path, "file.search", {"query": "secret", "regex": False})
     assert found["matches"] == []
     tree = run(tmp_path, "file.tree", {})
     assert "link.txt" not in {entry["path"] for entry in tree["entries"]}
     with pytest.raises(ToolError, match="symlink|inside"):
         run(tmp_path, "file.read", {"path": "link.txt"})
+    inside = run(tmp_path, "file.read", {"path": "inside-link.txt"})
+    assert inside["content"] == "inside\n"
+
+
+def test_search_falls_back_to_literal_text_for_an_invalid_regex(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.cpp").write_text("if (strlen(value) > 3) {\n", encoding="utf-8")
+    found = run(tmp_path, "file.search", {"query": "strlen(", "regex": True})
+    assert found["regex_fallback"] is True
+    assert found["matches"] and found["matches"][0]["path"] == "main.cpp"
+    assert "literal" in found["hint"]
+
+
+def test_read_accepts_a_path_prefixed_with_the_project_folder(tmp_path):
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "main.cpp").write_text("int main() {}\n", encoding="utf-8")
+    result = run(tmp_path, "file.read", {"path": "project/src/main.cpp"})
+    assert result["content"] == "int main() {}\n"
+
+
+def test_read_lists_a_directory_and_list_walks_subfolders(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "src" / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (project / "src" / "widgets").mkdir()
+
+    directory = run(tmp_path, "file.read", {"path": "src"})
+    assert directory["directory"] is True
+    assert {entry["type"] for entry in directory["entries"]} == {"dir", "file"}
+    assert any(entry["path"] == "src/app.py" for entry in directory["entries"])
+
+    listed = run(tmp_path, "file.list", {"path": "src", "pattern": "*.py"})
+    assert [item["path"] for item in listed["entries"]] == ["src/app.py"]
+    assert listed["files"][0]["name"] == "app.py"
+
+
+def test_read_streams_a_file_above_the_read_cache_limit(tmp_path, monkeypatch):
+    from mariana.agents import tools as tools_module
+
+    monkeypatch.setattr(tools_module, "MAX_READ_STREAM_BYTES", 120)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "big.txt").write_text(
+        "".join(f"line {index:03d}\n" for index in range(500)), encoding="utf-8")
+    first = run(tmp_path, "file.read", {"path": "big.txt"})
+    assert first["large_file"] is True and first["truncated"] is True
+    assert first["total_lines"] is None
+    assert first["next_start_line"] == first["end_line"] + 1
+    second = run(tmp_path, "file.read", {
+        "path": "big.txt", "start_line": first["next_start_line"],
+    })
+    assert second["start_line"] == first["next_start_line"]
+    assert second["content"].startswith(f"line {second['start_line'] - 1:03d}")
 
 
 def test_delete_checks_existence_and_dry_run_skips_side_effects(tmp_path):
@@ -230,6 +290,19 @@ def test_csv_reads_headers_values_and_tsv_delimiters(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
+def test_git_search_caps_a_broad_result_without_buffering_it(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    git = shutil.which("git")
+    subprocess.run([git, "init", "-q"], cwd=project, check=True)
+    (project / "many.txt").write_text("needle\n" * 300, encoding="utf-8")
+    found = run(tmp_path, "file.search", {"query": "needle", "regex": False,
+                                           "max_results": 5})
+    assert found["engine"] == "git" and len(found["matches"]) == 5
+    assert found["truncated"] is True
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
 def test_git_inspection_reports_status_diff_and_log_read_only(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
@@ -252,16 +325,20 @@ def test_git_inspection_reports_status_diff_and_log_read_only(tmp_path):
     log = run(tmp_path, "git.inspect", {"action": "log"})
     assert log["commits"][0]["subject"] == "first"
 
+    aliased = run(tmp_path, "git.inspect", {"action": "history 5"})
+    assert aliased["action"] == "log" and aliased["commits"][0]["subject"] == "first"
+
     with pytest.raises(ToolError, match="action must be"):
         run(tmp_path, "git.inspect", {"action": "push"})
 
 
-def test_git_inspection_needs_a_repository(tmp_path):
+def test_git_inspection_reports_a_missing_repository_without_failing(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
-    with pytest.raises(ToolError, match="No Git repository"):
-        execute_ability({"id": "git", "type": "git.inspect", "config": {}}, {},
-                        {"agent": {"id": "test"}}, tmp_path, files_root=project)
+    result = execute_ability({"id": "git", "type": "git.inspect", "config": {}}, {},
+                             {"agent": {"id": "test"}}, tmp_path, files_root=project)
+    assert result["repository"] is False and result["files"] == []
+    assert "No Git repository" in result["hint"]
 
 
 @pytest.mark.parametrize("address", [
@@ -559,3 +636,31 @@ def test_shell_cancellation_stops_the_whole_process_tree(tmp_path, monkeypatch):
     assert not thread.is_alive() and "cancelled" in outcome.get("error", "").lower()
     time.sleep(1.0)
     assert not (project / "cancelled-late.txt").exists()
+
+
+def test_tool_arguments_accept_bare_strings_and_alias_spellings():
+    assert normalise_tool_arguments("file.search", "needle") == {"query": "needle"}
+    assert normalise_tool_arguments("file.read", {"filePath": "src/main.py", "offset": "10",
+                                                  "limit": "5"}) == {
+        "path": "src/main.py", "start_line": 10, "end_line": 14,
+    }
+    assert normalise_tool_arguments("file.search", {
+        "q": "needle", "include_pattern": "*.py", "maxResults": "20",
+    }) == {"query": "needle", "include": "*.py", "max_results": 20}
+    assert normalise_tool_arguments("file.write", {
+        "file_path": "notes.txt", "contents": "body",
+    }) == {"path": "notes.txt", "content": "body"}
+
+    assert resolve_tool_id("file_search", ["file.read", "file.search"]) == "file.search"
+    assert resolve_tool_id("file.search", ["file.read", "file.search"]) == "file.search"
+    assert resolve_tool_id("file.orphan", ["file.read", "file.search"]) == ""
+
+
+def test_missing_required_tool_arguments_are_reported_by_canonical_key():
+    assert missing_required_arguments("file.search", {}) == ["query"]
+    assert missing_required_arguments(
+        "file.search", normalise_tool_arguments("file.search", {"q": "x"})) == []
+    assert missing_required_arguments("file.read", {"path": "   "}) == ["path"]
+    assert missing_required_arguments(
+        "file.write", normalise_tool_arguments("file.write", {"path": "a.txt"})) == ["content"]
+    assert missing_required_arguments("time.now", {}) == []

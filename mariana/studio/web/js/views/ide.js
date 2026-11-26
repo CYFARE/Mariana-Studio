@@ -299,11 +299,8 @@
     }
     const value = String(draft === undefined ? ($("ide-message").value || "") : draft);
     const draftBase = budget.draft && Number(budget.draft.tokens) || 0;
-    const taskBase = budget.task && Number(budget.task.tokens) || 0;
     const liveDraft = Studio.tokens.estimate(value, unit) + 4;
-    const liveTask = Studio.tokens.estimate(`Current task:\n${value.slice(0, 3000)}`, unit);
-    const used = Math.max(0, (Number(budget.used_tokens) || 0) - draftBase - taskBase
-      + liveDraft + liveTask);
+    const used = Math.max(0, (Number(budget.used_tokens) || 0) - draftBase + liveDraft);
     const window = Number(budget.context_window) || 0;
     return {
       budget, unit, used, window,
@@ -899,7 +896,10 @@
     const project = ensureProject(id);
     if (!project) return;
     const previous = state.data.get(state.active);
-    if (previous && previous.id !== id) stopDictation(previous, true);
+    if (previous && previous.id !== id) {
+      stopDictation(previous, true);
+      closeMention(previous);
+    }
     state.active = id;
     state.model = project.model || state.model;
     Studio.store.set("ide-workspace", id);
@@ -1981,7 +1981,10 @@
       if (!load) return;
     }
     try {
+      const token = (tab.loadToken || 0) + 1;
+      tab.loadToken = token;
       const data = await api(fileUrl(project.id, tab.path));
+      if (tab.loadToken !== token || !project.open.includes(tab)) return;
       tab.content = Studio.editor.encodeEol(data.content, "\n");
       tab.version = data.version;
       tab.language = data.language;
@@ -2023,13 +2026,19 @@
     }
     try {
       const data = await api(previewUrl(project.id, path, { start: 0, limit: PREVIEW_LINES }));
-      if (!isActive(project)) return;
+      // A second click may have opened the file while this request was in
+      // flight; reuse that tab instead of creating a duplicate.
+      if (project.open.some(tab => tab.path === data.path)) {
+        if (isActive(project)) activateTab(project, data.path);
+        return;
+      }
       const tab = makeTab(data);
       if (line && tab.kind === "text" && tab.view !== "code") tab.view = "code";
       project.open.push(tab);
       project.activePath = tab.path;
       rememberRecent(project, tab.path);
       rememberProject(project);
+      if (!isActive(project)) return;
       renderTabs(project);
       revealPath(project, tab.path);
       mountEditor(project);
@@ -2112,11 +2121,24 @@
     for (const tab of [...project.open]) await closeTab(project, tab.path);
   }
 
-  async function reloadOpenFile(project, path) {
+  async function reloadOpenFile(project, path, options = {}) {
+    const tab = project.open.find(item => item.path === path);
+    if (!tab) return;
+    if (tab.dirty && !options.confirmed) {
+      const discard = await Studio.confirm({
+        title: "Discard unsaved changes?",
+        message: `${path} changed on disk. Reloading replaces your unsaved edits.`,
+        confirmLabel: "Discard and reload", danger: true,
+      });
+      if (!discard) return;
+    }
+    // Edits during a run can emit several file_changed events; only the newest
+    // reload may write the buffer and the version back into the tab.
+    const token = (tab.loadToken || 0) + 1;
+    tab.loadToken = token;
     try {
       const data = await api(previewUrl(project.id, path, { start: 0, limit: PREVIEW_LINES }));
-      const tab = project.open.find(item => item.path === path);
-      if (!tab) return;
+      if (tab.loadToken !== token || !project.open.includes(tab)) return;
       tab.bytes = data.bytes || 0;
       tab.mime = data.mime || tab.mime;
       tab.modified = data.modified || tab.modified;
@@ -2213,7 +2235,7 @@
           title: "File changed on disk", message: error.message,
           confirmLabel: "Reload from disk", cancelLabel: "Keep editing",
         });
-        if (reload) await reloadOpenFile(project, tab.path);
+        if (reload) await reloadOpenFile(project, tab.path, { confirmed: true });
       } else {
         Studio.toast(error.message, "error");
       }
@@ -2485,6 +2507,7 @@
       { label: "Rename…", icon: "edit", onSelect: () => renameSession(project, session) },
       { label: session.pinned ? "Unpin" : "Pin to top", icon: "pin", onSelect: () => pinSession(project, session, !session.pinned) },
       { label: "Duplicate", icon: "copy", disabled: project.running, onSelect: () => duplicateSession(project, session.id) },
+      { label: "Copy conversation", icon: "copy", onSelect: () => copySession(project, session.id) },
       { label: "Export as Markdown", icon: "download", onSelect: () => exportSession(project, session.id) },
       "separator",
       { label: "Delete conversation…", icon: "trash", danger: true, onSelect: () => deleteSession(project, session.id) },
@@ -2515,7 +2538,12 @@
       if (token !== project.sessionToken || !state.data.has(project.id)) return;
       const session = data.session;
       if (session.workspace_id !== project.id) {
+        // A deep link or the global session list can name a conversation in
+        // another project: open that project, then load the requested session
+        // there instead of landing on whatever conversation it had open.
         await openProject(session.workspace_id);
+        const target = state.data.get(session.workspace_id);
+        if (target) await loadSession(target, id);
         return;
       }
       project.session = session;
@@ -2682,6 +2710,11 @@
   }
 
   function exportDocument(project, session) {
+    const name = (session.title || "mariana-session").replace(/[^\w.-]+/g, "-").slice(0, 60);
+    Studio.download(`${name}.md`, sessionMarkdown(project, session), "text/markdown");
+  }
+
+  function sessionMarkdown(project, session) {
     const lines = [`# ${session.title || "Conversation"}`, "",
       `- Project: ${projectName(project.id)}`,
       `- Model: ${session.model || "default"}`,
@@ -2698,10 +2731,27 @@
         lines.push("");
       } else if (entry.role === "tool") {
         lines.push(`### ${entry.tool}`, "", "```json", JSON.stringify(entry.input || {}, null, 2), "```", "");
+        if (entry.output !== undefined) {
+          lines.push("```json", pretty(entry.output, 20000), "```", "");
+        }
+      } else if (entry.role === "error") {
+        lines.push("## Error", "", entry.text || "The run failed.", "");
+      } else if (entry.text) {
+        lines.push(entry.text, "");
       }
     }
-    const name = (session.title || "mariana-session").replace(/[^\w.-]+/g, "-").slice(0, 60);
-    Studio.download(`${name}.md`, lines.join("\n"), "text/markdown");
+    return lines.join("\n");
+  }
+
+  async function copySession(project, id) {
+    try {
+      let session = project.session && project.session.id === id ? project.session : null;
+      if (!session) session = (await api(sessionUrl(id))).session;
+      if (!session) throw new Error("Open the conversation before copying it.");
+      await Studio.copy(sessionMarkdown(project, session), "Conversation copied as Markdown");
+    } catch (error) {
+      Studio.toast(error.message, "error");
+    }
   }
 
   function updateJumpButton(project) {
@@ -3259,10 +3309,28 @@
     const summary = toolSummary(entry);
     const path = (entry.change && entry.change.path) || input.path || (entry.output && entry.output.path) || "";
     const startLine = entry.output && typeof entry.output === "object" ? entry.output.start_line : 0;
-    const actions = path
-      ? h("div", { class: "row wrap" },
-        Studio.ui.button("Open file", { small: true, onclick: () => openFile(path, startLine) }))
-      : null;
+    const failure = !pending && ok === false && entry.output && typeof entry.output === "object"
+      ? entry.output : null;
+    const actions = [];
+    if (path) actions.push(Studio.ui.button("Open file", { small: true, onclick: () => openFile(path, startLine) }));
+    if (!pending && entry.output !== undefined) {
+      actions.push(Studio.ui.button("Copy result", {
+        small: true,
+        onclick: () => {
+          Studio.copy(pretty(entry.output, 30000), "Tool result copied")
+            .catch(error => Studio.toast(error.message, "error"));
+        },
+      }));
+    }
+    if (Object.keys(input).length) {
+      actions.push(Studio.ui.button("Copy input", {
+        small: true,
+        onclick: () => {
+          Studio.copy(JSON.stringify(input, null, 2), "Tool input copied")
+            .catch(error => Studio.toast(error.message, "error"));
+        },
+      }));
+    }
     return rememberDetails(entry, h("details", {
       class: `ide-entry tool${ok === false ? " failed" : ""}`,
       open: expandedEntries.has(entry) ? expandedEntries.get(entry)
@@ -3276,10 +3344,13 @@
         h("span", { class: "ide-chevron" }, icon("chevron-right", "small"))),
       h("div", { class: "ide-entry-body" },
         h("div", { class: "ide-tool-path mono tiny muted", text: entry.tool }),
+        failure ? Studio.ui.callout("danger", h("div", { class: "stack tight" },
+          h("span", { text: String(failure.error || "The tool failed.") }),
+          failure.hint ? h("span", { class: "muted tiny", text: String(failure.hint) }) : null)) : null,
         Object.keys(input).length ? rawDetails("Input", pretty(input)) : null,
         pending ? null : renderToolResult(entry),
         diffBlock(entry.change),
-        actions)));
+        actions.length ? h("div", { class: "row wrap" }, ...actions) : null)));
   }
 
   function renderEntry(project, entry, options = {}) {
@@ -3456,10 +3527,14 @@
     const trimmed = project.liveText.trimStart();
     if (trimmed.startsWith("{") || trimmed.startsWith("```json")) {
       clearTimeout(project.live.timer);
-      project.live.status.textContent = "preparing a tool call";
+      const kind = /"final"\s*:/.test(trimmed) ? "writing the answer"
+        : /"plan"\s*:/.test(trimmed) ? "updating the plan" : "preparing a tool call";
+      project.live.status.textContent = kind;
       Studio.markdown.reset(project.live.preview);
       project.live.preview.classList.remove("markdown");
-      project.live.preview.textContent = "Preparing a tool call…";
+      project.live.preview.textContent = kind === "writing the answer"
+        ? "Writing the answer…"
+        : kind === "updating the plan" ? "Updating the plan…" : "Preparing a tool call…";
       scrollLive(project);
       return;
     }
@@ -3653,13 +3728,16 @@
         renderPlan(project);
         break;
       case "context_consolidated":
-        if (event.iteration && project.preview && project.preview.budget
+        if (project.preview && project.preview.budget
           && event.after_tokens !== undefined) {
           const budget = project.preview.budget;
           budget.used_tokens = Math.max(0, Number(event.after_tokens) || 0);
           budget.percent = budget.context_window
             ? Math.round(budget.used_tokens * 1000 / budget.context_window) / 10 : 0;
           budget.remaining_tokens = Math.max(0, budget.context_window - budget.used_tokens);
+          // The consolidation count covers the messages, not the composer draft;
+          // typing must add the whole new draft, not subtract a stale one.
+          budget.draft = { chars: 0, tokens: 0 };
           updateBudgetMeter(project);
         }
         setStatus(project, event.message || "Consolidated older turns to free context.");
@@ -3667,6 +3745,28 @@
           text: event.message || "Consolidated older turns to free context." });
         if (!project.running) refreshContextPreview(project);
         break;
+      case "budget": {
+        if (event.used_tokens === undefined) break;
+        if (!project.preview) project.preview = {};
+        const base = project.preview.budget || {};
+        const used = Math.max(0, Number(event.used_tokens) || 0);
+        const window = Number(event.context_window || base.context_window) || 0;
+        project.preview.budget = {
+          ...base, unit: event.unit || base.unit || "tokens",
+          used_tokens: used, context_window: window,
+          percent: event.percent !== undefined ? event.percent
+            : (window ? Math.round(used * 1000 / window) / 10 : 0),
+          remaining_tokens: event.remaining_tokens !== undefined
+            ? Math.max(0, Number(event.remaining_tokens) || 0) : Math.max(0, window - used),
+          // Measured from the request being sent, which does not contain the
+          // composer draft; a later keystroke adds the whole live draft.
+          draft: { chars: 0, tokens: 0 },
+        };
+        project.budgetLocked = true;
+        updateBudgetMeter(project);
+        updateContextSummary(project);
+        break;
+      }
       case "swarm_start": {
         const pending = project.pendingTools.get(event.swarm);
         const entry = pending ? pending.entry : findPendingToolEntry(project, event.swarm);
@@ -3958,6 +4058,15 @@
     renderProjects();
     removeLive(project);
     for (const pending of project.pendingTools.values()) {
+      if (pending.entry) {
+        // finishRun normally reloads the canonical transcript, but if that fetch
+        // fails the checkpointed entry must not keep saying "Running" forever.
+        pending.entry.pending = false;
+        if (pending.entry.ok === undefined) {
+          pending.entry.ok = false;
+          pending.entry.output = { error: "The run ended before this tool returned a result." };
+        }
+      }
       if (isActive(project) && typeof pending.card.remove === "function") pending.card.remove();
     }
     for (const timer of project.swarmTimers.values()) clearTimeout(timer);
@@ -3983,12 +4092,24 @@
           : "The step budget ran out. Ask for the next step to continue.")
         : "Finished. Review the diff, then run Check project or your tests.");
     }
+    if (event.type === "run_completed" && typeof event.output === "string"
+      && event.output.trim()) {
+      // Show the answer without waiting for the canonical session fetch, and
+      // keep it if that fetch fails. The later renderTranscript replaces the
+      // transcript with the canonical copy, so this cannot appear twice.
+      const transcript = (project.session && project.session.transcript) || [];
+      const last = [...transcript].reverse().find(item => item && item.role === "assistant");
+      if (!last || last.text !== event.output) {
+        appendEntry(project, { role: "assistant", text: event.output });
+      }
+    }
     await refreshParentDirectory(project, "");
     await loadSessions(project);
     if (sessionId) {
       try {
         const data = await api(sessionUrl(sessionId));
-        if (project.running || (project.session && project.session.id !== sessionId)) return;
+        if (project.running
+          || (project.session && project.session.id && project.session.id !== sessionId)) return;
         project.session = data.session;
         project.sessionId = sessionId;
         project.plan = data.session.plan || [];
@@ -4056,7 +4177,9 @@
   function persistSessionContext(project) {
     clearTimeout(project.contextTimer);
     project.contextTimer = setTimeout(async () => {
-      if (!project.session || !project.session.id || project.running) return;
+      // A live run merges the context into its in-memory session, so a pin made
+      // while the agent is working survives the next checkpoint and reload.
+      if (!project.session || !project.session.id) return;
       try {
         await api(sessionUrl(project.session.id), {
           method: "PATCH", body: { context: sessionContext(project) },
@@ -4378,12 +4501,15 @@
         }));
     }
 
+    let resultsToken = 0;
     async function renderResults() {
+      const token = ++resultsToken;
       const query = filter.value.trim();
       Studio.ui.render(results, Studio.ui.loading("Finding paths…"));
       try {
         const data = await api(`/api/ide/workspaces/${encodeURIComponent(project.id)}/files`
           + Studio.query({ query, limit: 120 }));
+        if (token !== resultsToken) return;
         Studio.ui.render(results);
         const rows = [
           ...(data.folders || []).map(item => ({ ...item, type: "dir" })),
@@ -4396,6 +4522,7 @@
         for (const item of rows.slice(0, 120)) results.append(resultRow(item));
         if (data.truncated) results.append(h("p", { class: "muted tiny", text: "More paths exist; narrow the filter." }));
       } catch (error) {
+        if (token !== resultsToken) return;
         Studio.ui.render(results, Studio.ui.callout("danger", h("span", { text: error.message })));
       }
     }
@@ -5078,6 +5205,7 @@
           }, icon("file", "small"), h("span", { class: "grow truncate", text: row.path })));
         }
       } catch (error) {
+        if (current !== token) return;
         Studio.ui.render(list, h("p", { class: "muted tiny", text: error.message }));
       }
     }
@@ -5085,7 +5213,7 @@
     function choose(path) {
       const message = $("ide-message");
       const value = message.value;
-      const caret = message.selectionStart || value.length;
+      const caret = Math.max(start, message.selectionStart ?? value.length);
       message.value = `${value.slice(0, start)}${path}${value.slice(caret)}`;
       message.selectionStart = start + path.length;
       message.selectionEnd = message.selectionStart;
@@ -5171,7 +5299,9 @@
     const before = input.value.slice(0, caret);
     const match = /(^|\s)@([^\s@]*)$/.exec(before);
     if (match && state.viewActive) {
-      const start = caret - match[2].length;
+      // Replace the trigger "@" and the query, not just the query, so choosing
+      // a file inserts its path instead of leaving a stray "@" in the message.
+      const start = Math.max(0, caret - match[2].length - 1);
       if (!project.mention) openMention(project, start, match[2]);
     } else if (project.mention) {
       closeMention(project);
@@ -5223,13 +5353,17 @@
       if (isActive(project)) {
         $("ide-session-title").textContent = result.session.title || "Session";
         appendEntry(project, { role: "user", text: content });
-        input.value = "";
-        project.draft = "";
-        input.style.height = "";
+        if ($("ide-message").value.trim() === content) {
+          input.value = "";
+          input.style.height = "";
+        }
+        // Keep a draft the reader typed while the request was in flight.
+        if (project.draft.trim() === content) project.draft = "";
         renderPlan(project);
         renderSessions(project);
         renderContext(project);
       } else if (project.session) {
+        if (project.draft.trim() === content) project.draft = "";
         project.session.transcript.push({ role: "user", text: content });
       }
       rememberProject(project);
@@ -5319,19 +5453,21 @@
       root: $("ide-body"),
       key: "ide-layout",
       gap: 6,
-      centerMin: 320,
-      centerMinHeight: 240,
+      // The panes may grow until the user collapses or resizes them; the
+      // computed bound is the container itself, not an arbitrary maximum.
+      centerMin: 0,
+      centerMinHeight: 0,
       stackAt: 900,
       fallbackWidth: 1200,
       fallbackHeight: 700,
       sidebar: {
         splitter: $("ide-split-sidebar"),
-        min: 190, max: 420, defaultSize: 252,
+        min: 190, max: Number.MAX_SAFE_INTEGER, defaultSize: 252,
       },
       agent: {
         splitter: $("ide-split-agent"),
-        min: 300, max: 680, defaultSize: 380,
-        minHeight: 220, maxHeight: 720, defaultHeight: 340,
+        min: 300, max: Number.MAX_SAFE_INTEGER, defaultSize: 380,
+        minHeight: 220, maxHeight: Number.MAX_SAFE_INTEGER, defaultHeight: 340,
       },
       onChange: updateLayoutControls,
       onBlocked(name) {
@@ -5536,6 +5672,7 @@
           { label: session.pinned ? "Unpin" : "Pin to top", icon: "pin", disabled: !session.id,
             onSelect: () => pinSession(project, session, !session.pinned) },
           { label: "Duplicate", icon: "copy", disabled: !session.id || project.running, onSelect: () => duplicateSession(project, session.id) },
+          { label: "Copy conversation", icon: "copy", disabled: !session.id, onSelect: () => copySession(project, session.id) },
           { label: "Export as Markdown", icon: "download", disabled: !session.id, onSelect: () => exportSession(project, session.id) },
           "separator",
           { label: "Delete conversation…", icon: "trash", danger: true, disabled: !session.id,
@@ -5803,6 +5940,7 @@
       state.viewActive = false;
       for (const project of state.data.values()) {
         closeFeed(project);
+        closeMention(project);
         stopDictation(project, true);
       }
       if (Studio.voice) Studio.voice.stopSpeaking();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mariana: a tiny hybrid Diffusion-AR language model (DRV-LM).
+"""Mariana: One-stop Research and Development Studio for language models.
 
 This is a thin backward-compatible wrapper around the ``mariana`` package.
 

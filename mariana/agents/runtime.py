@@ -13,10 +13,14 @@ from pathlib import Path
 from .aml import ABILITY_TYPES, HUMAN_KINDS, render_data, render_template
 from .schema import schema_errors, validate_value
 from .swarm import SwarmCoordinator, SwarmError, SwarmLimits, snapshot_due
-from .toolcalls import extract_action_object, parse_dsml_tool_calls
+from .toolcalls import (
+    extract_action_span, has_tool_markup, json_action_outranks_markup,
+    parse_dsml_action, usable_text,
+)
 from .tools import (
-    TOOL_ATTEMPTS, WRITE_ABILITY_TYPES, execute_ability, json_safe, nearest_tool_id,
-    retryable_tool_failure, tool_failure_hint,
+    TOOL_ATTEMPTS, WRITE_ABILITY_TYPES, execute_ability, json_safe,
+    missing_required_arguments, nearest_tool_id, normalise_tool_arguments,
+    required_arguments, resolve_tool_id, retryable_tool_failure, tool_failure_hint,
 )
 
 MAX_AGENT_ITERATIONS = 40
@@ -978,16 +982,22 @@ def normalize_tool_calls(action: dict) -> list[dict]:
 def parse_model_action(text: str) -> tuple[dict | None, list[dict]]:
     """An action and its tool calls from JSON or a model's native tool markup.
 
-    DSML is checked first: its parameters contain JSON objects, and a plain
-    JSON scan would mistake one of them for the whole action.
+    DSML is preferred: its parameters contain JSON objects, and a plain JSON
+    scan would mistake one of them for the whole action.  A JSON action that
+    *encloses* the markup is the exception — the model wrote its answer first
+    and quoted call syntax inside it, so the JSON is the contract.
     """
-    calls = parse_dsml_tool_calls(text)
-    if calls:
-        return {"calls": calls}, calls
-    action = extract_action_object(text)
-    if action is None:
+    found = extract_action_span(text)
+    if found and json_action_outranks_markup(text, found[1:]):
+        return found[0], normalize_tool_calls(found[0])
+    action, calls = parse_dsml_action(text)
+    if action or calls:
+        if calls:
+            action = {**action, "calls": calls}
+        return action, calls
+    if found is None:
         return None, []
-    return action, normalize_tool_calls(action)
+    return found[0], normalize_tool_calls(found[0])
 
 
 def _looks_like_action(text: str) -> bool:
@@ -995,8 +1005,9 @@ def _looks_like_action(text: str) -> bool:
     stripped = str(text or "").strip()
     if not stripped:
         return False
-    lowered = stripped.lower()
-    if not (stripped.startswith("{") or "```" in stripped or "dsml" in lowered):
+    if has_tool_markup(stripped):
+        return True
+    if not (stripped.startswith("{") or "```" in stripped):
         return False
     return any(f'"{key}"' in stripped for key in ("tool", "calls", "plan", "final"))
 
@@ -1106,7 +1117,9 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                                    "The model's action was malformed; asking for a "
                                    "corrected JSON reply"))
                 continue
-            text = "" if str(reply).strip() in EMPTY_REPLIES else _string(reply)
+            text = usable_text(reply)
+            if str(reply).strip() in EMPTY_REPLIES:
+                text = ""
             return {"text": text, "iterations": iteration, "steps": steps, "model": model,
                     "usage": usage, "exhausted": False}
         plan = normalize_plan(action.get("plan")) if "plan" in action else None
@@ -1116,7 +1129,9 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
         if not calls:
             if "final" in action:
                 final = action.get("final")
-                text = "" if str(final).strip() in EMPTY_REPLIES else _string(final)
+                text = usable_text(_string(final))
+                if str(final).strip() in EMPTY_REPLIES:
+                    text = ""
                 if not text and format_repairs < MAX_ACTION_REPAIRS:
                     format_repairs += 1
                     messages.append({"role": "assistant", "content": reply[:12_000]})
@@ -1148,13 +1163,19 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                           message="The model's JSON action was empty; asking for a usable action")
                 continue
             final = reply
-            text = "" if str(final).strip() in EMPTY_REPLIES else _string(final)
+            text = usable_text(final)
+            if str(final).strip() in EMPTY_REPLIES:
+                text = ""
             return {"text": text, "iterations": iteration, "steps": steps, "model": model,
                     "usage": usage, "exhausted": False}
         observations: list[dict] = []
         for index, call in enumerate(calls):
             tool_id = call["tool"]
             tool_input = call["input"]
+            resolved = resolve_tool_id(tool_id, allowed)
+            if resolved:
+                tool_id = resolved
+            tool_input = normalise_tool_arguments(tool_id, tool_input)
             run.event("tool_call", node=node["id"], iteration=iteration, index=index,
                       ability=tool_id, input=json_safe(tool_input, 4000),
                       message=f"Calling {tool_id}")
@@ -1174,6 +1195,12 @@ def _run_agent(node, data, context, run, agent, gateway, root, abilities,
                         raise ValueError(
                             f"Unknown tool {tool_id!r}.{hint} Available tools: "
                             f"{', '.join(allowed) or 'none'}"
+                        )
+                    missing = missing_required_arguments(tool_id, tool_input)
+                    if missing:
+                        raise ValueError(
+                            f"{tool_id} is missing {', '.join(missing)}. Required input "
+                            f"keys: {', '.join(required_arguments(tool_id))}"
                         )
                     tool = allowed[tool_id]
                     observation = execute_ability(tool, tool_input, context, root,
@@ -1264,10 +1291,11 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
     if effort not in {"low", "medium", "high"}:
         effort = ""
     reflection = data.get("reflection") is not False
+    adaptive_effort = data.get("adaptive_effort") is not False
     policy = agent.get("swarm") or {}
     if not isinstance(policy, dict):
         policy = {}
-    max_agents = min(int(data.get("max_agents", 4) or 4), int(policy.get("max_agents", 6)))
+    max_agents = min(int(data.get("max_agents", 16) or 16), int(policy.get("max_agents", 16)))
     max_steps = min(int(data.get("max_steps", 6) or 6), int(policy.get("max_steps", 8)))
     rounds = min(int(data.get("rounds", 1) or 0), int(policy.get("max_rounds", 2)))
     max_seconds = min(int(data.get("max_seconds", 240) or 240),
@@ -1328,7 +1356,7 @@ def _run_swarm_node(node, data, context, run, agent, gateway, root, abilities,
             abilities, member, tool_id, arguments, context, root, run, os_access),
         limits=limits, allow_write=allow_write, allow_ipc=allow_ipc,
         allow_os_access=os_access, criteria=criteria, effort=effort, reflection=reflection,
-        shared_memory=shared_memory, dry_run=run.dry_run,
+        adaptive_effort=adaptive_effort, shared_memory=shared_memory, dry_run=run.dry_run,
         on_event=lambda kind, **fields: _swarm_event(
             run, coordinator, kind, node=node["id"], **fields),
         cancelled=lambda: run.stop.is_set(), briefing="",

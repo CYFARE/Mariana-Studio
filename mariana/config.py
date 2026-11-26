@@ -84,6 +84,15 @@ class Config:
     # uses the exact causal clean prefix; full-sequence AR alignment stays legacy.
     fast_train: bool = False
 
+    # --- corpus encoding -------------------------------------------------------
+    # AXIOM selects a text, dictionary, DNA/protein or identity codec from the
+    # corpus and records it here so generation rewrites its prompt and decodes
+    # its output with exactly the same rules. axiom_codec is the JSON codec
+    # specification; an empty value means a pre-codec (v1) checkpoint.
+    use_axiom: bool = False
+    axiom_profile: str = "auto"
+    axiom_codec: str = ""
+
     # --- loop regularisation ---------------------------------------------------
     loop_dropout: bool = True      # sample loop count in {1..max_loops} per step
 
@@ -113,7 +122,10 @@ class Config:
 
     @property
     def head_dim(self) -> int:
-        assert self.dim % self.n_heads == 0
+        if self.n_heads < 1 or self.dim % self.n_heads:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
         return self.dim // self.n_heads
 
     @property

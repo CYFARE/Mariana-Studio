@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..agents.aml import ABILITY_TYPES, SWARM_STRATEGIES
+from ..agents.aml import ABILITY_TYPES, MAX_SWARM_AGENTS, SWARM_STRATEGIES
 from ..agents.swarm import SwarmCoordinator, SwarmLimits, snapshot_due
 from ..agents.tools import execute_ability
 from ..workspace import chat_files_path, ensure_workspace
@@ -168,7 +168,7 @@ class ChatSwarm:
         workspace = (chat_files_path(self.root, chat_id)
                      if chat_id and tools else None)
         strategy = choice(config, "strategy", "auto", SWARM_STRATEGIES)
-        max_agents = number(config, "max_agents", 4, 1, DEFAULTS.max_agents)
+        max_agents = number(config, "max_agents", 8, 1, MAX_SWARM_AGENTS)
         max_steps = number(config, "max_steps", 10, 1, MAX_RESEARCH_STEPS)
         rounds = number(config, "rounds", 1, 0, DEFAULTS.max_rounds)
         max_seconds = number(config, "max_seconds", 300.0, 20.0, MAX_RESEARCH_SECONDS, float)
@@ -184,6 +184,9 @@ class ChatSwarm:
             max_observation_chars=8_000,
             max_prompt_chars=32_000,
             max_output_chars=6_000,
+            max_context_chars=400_000,
+            max_agent_context_chars=96_000,
+            max_context_item_chars=32_000,
             max_reviews=min(8, max(2, max_agents * 2)),
         )
         with self._lock:
@@ -801,6 +804,7 @@ def _summary(result: dict) -> dict:
         "context": result.get("context") if isinstance(result.get("context"), dict) else {},
         "context_items": int(result.get("context_items") or 0),
         "usage": dict(result.get("usage") or {}),
+        "cache": dict(result.get("cache") or {}),
         "elapsed": result.get("elapsed") or 0.0,
         "timed_out": bool(result.get("timed_out")),
         "warnings": [str(item)[:400] for item in (result.get("warnings") or [])[:MAX_WARNINGS]],

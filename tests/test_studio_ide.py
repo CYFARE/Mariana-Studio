@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
 import shutil
 import threading
 import time
@@ -16,7 +17,7 @@ import pytest
 from mariana.studio import ide as ide_module
 from mariana.studio.errors import (BadRequestError, ConflictError, NotFoundError,
                                    UnavailableError)
-from mariana.studio.ide import IdeRun, IdeService
+from mariana.studio.ide import IdeRun, IdeService, MAX_FORMAT_REPAIRS
 from mariana.agents.tools import ToolError, execute_ability
 from tests.helpers import wait_for
 
@@ -317,6 +318,78 @@ def test_deepseek_dsml_tool_calls_run_in_the_ide(service):
     assert any(tool["id"] == "file.read" for tool in gateway.calls[0]["tools"])
 
 
+def test_tool_calls_accept_model_argument_and_name_spellings(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file_read", "input": {"file_path": "main.py", "startLine": "1", "to": 2}}',
+        '{"final": "Read the first two lines."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read main.py", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+    assert final["status"] == "completed", final.get("error")
+    call = next(event for event in final["events"] if event["type"] == "tool_call")
+    assert call["tool"] == "file.read"
+    assert call["input"] == {"path": "main.py", "start_line": 1, "end_line": 2}
+    result = next(event for event in final["events"] if event["type"] == "tool_result")
+    assert result["ok"] is True
+    assert result["output"]["start_line"] == 1 and result["output"]["end_line"] == 2
+
+
+def test_an_incomplete_tool_call_is_repaired_before_it_runs(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.search", "input": {}}',
+        '{"tool": "file.search", "input": {"q": "def greet"}}',
+        '{"final": "Found the definition."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Find greet", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+    assert final["status"] == "completed", final.get("error")
+    calls = [event for event in final["events"] if event["type"] == "tool_call"]
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert len(calls) == 1 and calls[0]["tool"] == "file.search"
+    assert calls[0]["input"]["query"] == "def greet"
+    assert len(results) == 1 and results[0]["ok"] is True
+    assert any("missing required input" in event.get("message", "")
+               for event in final["events"] if event["type"] == "log")
+
+
+def test_a_stubborn_incomplete_tool_call_is_repaired_only_twice(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.search", "input": {}}',
+        '{"tool": "file.search", "input": {}}',
+        '{"tool": "file.search", "input": {}}',
+        '{"tool": "file.search", "input": {}}',
+        '{"final": "Could not repair the call."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Find greet", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+    assert final["status"] == "completed", final.get("error")
+    repairs = [event for event in final["events"]
+               if event["type"] == "log"
+               and "missing required input" in event.get("message", "")]
+    assert len(repairs) == MAX_FORMAT_REPAIRS
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert results and results[0]["ok"] is False
+    assert "query" in results[0]["output"]["error"]
+
+
+def test_a_run_publishes_live_context_usage(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.read", "input": {"path": "main.py"}}',
+        '{"final": "Done."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read main.py", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+    assert final["status"] == "completed", final.get("error")
+    budgets = [event for event in final["events"] if event["type"] == "budget"]
+    assert budgets and budgets[-1]["used_tokens"] > 0
+    assert budgets[-1]["context_window"] > 0
+    assert 0 <= budgets[-1]["percent"] <= 1000
+
+
 def test_workspace_files_are_sandboxed_and_versioned(service):
     workspace = make_workspace(service)
     tree = service.tree(workspace["id"])
@@ -408,6 +481,20 @@ def test_context_rules_hide_paths_from_the_map_tree_and_search(service):
     assert found["matches"] == []
     assert "vendor" not in {item["path"] for item in service.find_files(workspace["id"], "", 50)["folders"]}
 
+    # file.list returns the same directory twice (entries and the files subset),
+    # and both must drop a hidden path so the model never sees it.
+    listed = {
+        "entries": [{"name": "main.py", "path": "main.py", "type": "file"},
+                    {"name": "secret.py", "path": "vendor/secret.py", "type": "file"},
+                    {"name": "win.py", "path": "vendor\\win.py", "type": "file"}],
+        "files": [{"name": "main.py", "path": "main.py"},
+                  {"name": "secret.py", "path": "vendor/secret.py"}],
+    }
+    filtered = service._filter_observation("file.list", listed, ["vendor"])
+    assert [item["path"] for item in filtered["entries"]] == ["main.py"]
+    assert [item["path"] for item in filtered["files"]] == ["main.py"]
+    assert "2 entries hidden" in filtered["context_note"]
+
     service.update_settings(workspace["id"], {"context": {"include": ["main.py"], "exclude": []}})
     preview = service.context_preview(workspace["id"], {})
     assert preview["selected"] == 1 and preview["files"][0]["path"] == "main.py"
@@ -474,6 +561,21 @@ def test_the_session_list_cache_refreshes_after_a_save(service):
     assert service.list_sessions(workspace["id"])[0]["title"] == "Changed task"
 
 
+def test_a_busy_workspace_does_not_hide_another_projects_sessions(service):
+    kept = make_workspace(service, "kept")
+    other = make_workspace(service, "other")
+    target = service._new_session(kept["id"], "Older conversation", "edit", "fake-coder")
+    os.utime(service._session_path(target["id"]), (1_000_000, 1_000_000))
+    for index in range(205):
+        session = service._new_session(other["id"], f"Noise {index}", "edit", "fake-coder")
+        stamp = 2_000_000 + index
+        os.utime(service._session_path(session["id"]), (stamp, stamp))
+
+    # The older conversation is still listed even though every session in the
+    # recent global window belongs to the other, busier project.
+    assert [item["id"] for item in service.list_sessions(kept["id"])] == [target["id"]]
+
+
 def test_pinned_context_and_hidden_paths_reach_the_prompt(service):
     workspace = make_workspace(service)
     service.create_folder(workspace["id"], "vendor")
@@ -496,6 +598,22 @@ def test_pinned_context_and_hidden_paths_reach_the_prompt(service):
 
     session = service.get_session(started["session"]["id"])
     assert session["context"]["include"] == ["main.py"]
+
+
+def test_pinning_one_file_does_not_shrink_the_project_map(service):
+    workspace = make_workspace(service)
+    gateway = ScriptedGateway(['{"final": "done"}'])
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {
+        "message": "Explain the pinned file", "mode": "ask",
+        "context": {"include": ["main.py"], "exclude": []},
+    })
+    run_until_finished(service, started["run"]["id"])
+    prompt = gateway.calls[0]["messages"][0]["content"]
+    assert "Pinned context: main.py" in prompt
+    # Pinned files add their contents; they must not filter the project map.
+    assert "test_main.py" in prompt
+    assert "README.md" in prompt
 
 
 def test_different_workspaces_can_run_coding_agents_at_the_same_time(service):
@@ -827,6 +945,101 @@ def test_repeated_malformed_actions_fail_with_guidance(service):
     assert "malformed actions" in final["error"]
 
 
+# A real DeepSeek reply that lost the slashes on its closing tags.  It must be
+# executed as a tool call, never stored or shown as the assistant's answer.
+DAMAGED_MARKUP_READ = """<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="file.read">
+<｜｜DSML｜｜ parameter name="end_line" string="false">3</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="path" string="true">main.py</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="start_line" string="false">1</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ calls>"""
+
+
+def test_damaged_tool_markup_runs_the_tool_instead_of_ending_the_run(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        DAMAGED_MARKUP_READ,
+        '{"final": "main.py starts with the greeting."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read main", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "main.py starts with the greeting."
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert results and results[0]["tool"] == "file.read" and results[0]["ok"] is True
+    assert "DSML" not in final["output"]
+
+
+def test_repeated_tool_markup_fails_without_leaking_it(service):
+    workspace = make_workspace(service)
+    truncated = ('<｜｜DSML｜｜ parameter name="path" string="true">main.py'
+                 '</｜｜DSML｜｜ parameter>\n<｜｜DSML')
+    service.gateway = ScriptedGateway([truncated] * 3)
+    started = service.start_run(workspace["id"], {"message": "Read main", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "failed"
+    assert "malformed actions" in final["error"]
+    assert "tool markup" in final["error"]
+    assert "DSML" not in final["error"]
+
+
+def test_unparseable_tool_markup_gets_a_repair_turn(service):
+    workspace = make_workspace(service)
+    truncated = ('<｜｜DSML｜｜ parameter name="path" string="true">main.py'
+                 '</｜｜DSML｜｜ parameter>\n<｜｜DSML')
+    service.gateway = ScriptedGateway([
+        truncated,
+        '{"final": "Recovered with a plain answer."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Read main", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Recovered with a plain answer."
+    logs = [event["message"] for event in final["events"] if event["type"] == "log"]
+    assert any("tool-call markup" in message for message in logs)
+
+
+def test_markup_inside_a_final_answer_is_removed(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        json.dumps({"final": "Found it.\n" + DAMAGED_MARKUP_READ}),
+        '{"final": "not used"}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Report", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Found it."
+    assert "DSML" not in final["output"]
+
+
+def test_a_batched_markup_reply_runs_every_call(service):
+    workspace = make_workspace(service)
+    service.write_file(workspace["id"], "second.py", "print('two')\n", version="")
+    batch = ('<｜｜DSML｜｜ calls>\n'
+             '[{"tool": "file.read", "input": {"path": "main.py"}}, '
+             '{"tool": "file.read", "input": {"path": "second.py"}}]'
+             '</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n'
+             '</｜｜DSML｜｜ calls>')
+    service.gateway = ScriptedGateway([batch, '{"final": "Read both files."}'])
+    started = service.start_run(workspace["id"], {"message": "Read both", "mode": "ask"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    assert final["output"] == "Read both files."
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert [event["tool"] for event in results] == ["file.read", "file.read"]
+    assert all(event["ok"] for event in results)
+    paths = [event["output"]["path"] for event in results]
+    assert paths == ["main.py", "second.py"]
+
+
 def test_a_swarm_internal_error_is_returned_to_the_model(service, monkeypatch):
     workspace = make_workspace(service)
     service.gateway = ScriptedGateway([
@@ -1071,6 +1284,37 @@ def test_a_transient_model_failure_is_retried_without_spending_a_step(service):
     assert final["status"] == "completed", final.get("error")
     assert final["output"] == "Recovered from a network failure."
     assert len(gateway.calls) == 2
+
+
+def test_cancelling_a_run_interrupts_a_network_retry_wait(service):
+    class RetryGateway(ScriptedGateway):
+        def __init__(self):
+            super().__init__([])
+            self.calls = 0
+
+        def stream(self, config, cancelled=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("temporary timeout")
+            yield from super().stream(config, cancelled)
+
+    workspace = make_workspace(service)
+    gateway = RetryGateway()
+    service.gateway = gateway
+    started = service.start_run(workspace["id"], {"message": "Say hello"})
+    run_id = started["run"]["id"]
+    wait_for(lambda: any(event["type"] == "log"
+                         and "retrying in" in event.get("message", "")
+                         for event in service.get_run(run_id)["events"]), timeout=5)
+
+    began = time.monotonic()
+    service.cancel_run(run_id)
+    final = run_until_finished(service, run_id)
+    elapsed = time.monotonic() - began
+
+    assert final["status"] == "cancelled"
+    assert elapsed < 0.8, f"cancellation waited {elapsed:.2f}s for the retry sleep"
+    assert gateway.calls == 1
     logs = [event["message"] for event in final["events"] if event["type"] == "log"]
     assert any("retrying" in message.lower() for message in logs)
 
@@ -1476,6 +1720,22 @@ def test_a_failed_edit_after_a_successful_one_has_no_change(service):
     assert "change" not in steps[1]
 
 
+def test_a_failed_edit_does_not_create_missing_folders(service):
+    workspace = make_workspace(service)
+    service.gateway = ScriptedGateway([
+        '{"tool": "file.edit", "input": {"path": "missing/dir/main.py", '
+        '"old": "a", "new": "b"}}',
+        '{"final": "Could not edit the file."}',
+    ])
+    started = service.start_run(workspace["id"], {"message": "Edit a missing file", "mode": "edit"})
+    final = run_until_finished(service, started["run"]["id"])
+
+    assert final["status"] == "completed", final.get("error")
+    results = [event for event in final["events"] if event["type"] == "tool_result"]
+    assert results and results[0]["ok"] is False
+    assert not (service.workspace_path(workspace["id"]) / "missing").exists()
+
+
 def test_a_run_that_cannot_start_does_not_leave_a_running_session(service, monkeypatch):
     workspace = make_workspace(service)
 
@@ -1594,11 +1854,13 @@ def test_a_corrupt_session_does_not_break_listing_or_reverting(service):
 
     path = service.sessions_dir / f"{session_id}.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    data.update({"transcript": "oops", "changes": ["oops"], "plan": "oops"})
+    data.update({"transcript": "oops", "changes": ["oops"], "plan": "oops",
+                 "updated": "yesterday", "created": None})
     path.write_text(json.dumps(data), encoding="utf-8")
 
     summary = service.list_sessions(workspace["id"])[0]
     assert summary["turns"] == 0 and summary["changes"] == 0
+    assert summary["updated"] == 0.0 and summary["created"] == 0.0
     session = service.get_session(session_id)
     assert session["plan"] == [] and session["changes"] == {} and session["transcript"] == []
 
@@ -1638,6 +1900,29 @@ def test_deleting_a_workspace_removes_its_sessions_and_runs(service):
     assert list(service.runs_dir.glob("ide-run-*.json")) == []
     with pytest.raises(NotFoundError):
         service.get_run(run_id)
+
+
+def test_a_workspace_is_reserved_while_its_files_are_deleted(service, monkeypatch):
+    workspace = make_workspace(service)
+    seen = {}
+    original = service._load_sessions
+
+    def load(*args, **kwargs):
+        seen["deleting"] = workspace["id"] in service._deleting_workspaces
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_load_sessions", load)
+    assert service.delete_workspace(workspace["id"]) is True
+    assert seen["deleting"] is True
+    assert workspace["id"] not in service._deleting_workspaces
+
+
+def test_a_run_cannot_start_while_its_workspace_is_being_deleted(service):
+    workspace = make_workspace(service)
+    service._deleting_workspaces.add(workspace["id"])
+    with pytest.raises(ConflictError, match="being deleted"):
+        service.start_run(workspace["id"], {"message": "late"})
+    service._deleting_workspaces.discard(workspace["id"])
 
 
 def test_unknown_session_and_workspace_ids_are_not_found(service):
@@ -1743,7 +2028,7 @@ def test_swarm_spawns_agents_reviews_and_reports_progress(service):
             self.calls.append(copy.deepcopy(config))
             system = config["messages"][0]["content"]
             user = config["messages"][-1]["content"]
-            if "Plan a small, focused team" in system:
+            if "Plan a focused team" in system:
                 reply = json.dumps({
                     "strategy": "peer_review", "rounds": 1,
                     "agents": [
@@ -1754,7 +2039,7 @@ def test_swarm_spawns_agents_reviews_and_reports_progress(service):
                     ],
                 })
             elif "You are one member of the swarm" in system:
-                if "Phase: revise" in system:
+                if "Phase: revise" in user:
                     reply = '{"final": "revised findings with line references"}'
                 elif "returned" in user:
                     reply = '{"final": "main.py defines greet."}'
@@ -1810,8 +2095,9 @@ def test_swarm_spawns_agents_reviews_and_reports_progress(service):
     assert result["output"]["completed"] == 2 and result["output"]["failed"] == 0
     assert len(result["output"]["reviews"]) == 2
     assert result["output"]["messages"] >= 2
-    assert any("main.py" in (agent.get("output") or "")
-               for agent in result["output"]["agents"])
+    assert any(event["type"] == "swarm_agent_tool"
+               and (event.get("input") or {}).get("path") == "main.py" for event in events)
+    assert all(agent.get("output") for agent in result["output"]["agents"])
     assert final["swarm"] and final["swarm"]["strategy"] == "peer_review"
 
 
@@ -1828,13 +2114,19 @@ def test_swarm_parent_observation_stays_bounded():
                     for _ in range(6)],
         "messages": 50, "blackboard": 20,
         "changed_files": [f"src/file{i}.py" for i in range(40)],
-        "usage": {"prompt_tokens": 100, "completion_tokens": 50}, "elapsed": 12.5,
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        "cache": {"hits": 3, "misses": 1, "saved_seconds": 1.5,
+                  "prompt_cache_hit_rate": 0.5, "entries": 2, "chars": 500,
+                  "inflight": 0},
+        "elapsed": 12.5,
     }
     compact = ide_module.IdeService._swarm_parent_observation(observation)
     assert len(json.dumps(compact)) < 6000
     assert compact["final"].startswith("answer ")
     assert "output" not in compact["agents"][0]
     assert len(compact["changed_files"]) == 6
+    assert compact["cache"] == {"hits": 3, "misses": 1, "saved_seconds": 1.5,
+                                "prompt_cache_hit_rate": 0.5}
 
 
 def test_swarm_coding_edits_are_snapshotted_and_revertible(service):
@@ -1842,7 +2134,7 @@ def test_swarm_coding_edits_are_snapshotted_and_revertible(service):
         def stream(self, config, cancelled=None):
             system = config["messages"][0]["content"]
             user = config["messages"][-1]["content"]
-            if "Plan a small, focused team" in system:
+            if "Plan a focused team" in system:
                 reply = json.dumps({
                     "strategy": "map_reduce", "rounds": 0,
                     "agents": [

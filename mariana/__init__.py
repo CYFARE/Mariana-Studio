@@ -1,4 +1,4 @@
-"""Mariana: a tiny hybrid Diffusion-AR language model (DRV-LM).
+"""Mariana: One-stop Research and Development Studio for language models.
 
 The public names are imported lazily so that light-weight entry points (the
 Studio CLI, packaging tools, help output) do not import PyTorch until they need
@@ -8,7 +8,7 @@ modules load.
 
 from __future__ import annotations
 
-__version__ = "2.3.2"
+__version__ = "2.3.3"
 __all__ = [
     "Config",
     "MarianaLM",

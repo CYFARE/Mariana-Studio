@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| Status | Implemented; AML 1.8 and AMP 1.10 |
+| Status | Implemented; AML 1.9 and AMP 1.10 |
 | Canonical specifications | [`mariana/agents/specs/AML.md`](../../mariana/agents/specs/AML.md), [`mariana/agents/specs/AMP.md`](../../mariana/agents/specs/AMP.md) |
 | Guide | [agentic.md](../agentic.md) |
 | Live specifications | `GET /api/agents/spec/aml`, `GET /api/agents/spec/amp` |
@@ -74,7 +74,7 @@ name, nodes, and edges:
 
 ```json
 {
-  "aml": "1.8",
+  "aml": "1.9",
   "kind": "agent",
   "id": "daily-digest",
   "name": "Daily digest",
@@ -506,7 +506,7 @@ behind them.
 
 ## References
 
-1. Mariana. *Agent Management Language (AML) v1.8.*
+1. Mariana. *Agent Management Language (AML) v1.9.*
    [`mariana/agents/specs/AML.md`](../../mariana/agents/specs/AML.md).
 2. Mariana. *Agent Management Protocol (AMP) v1.10.*
    [`mariana/agents/specs/AMP.md`](../../mariana/agents/specs/AMP.md).

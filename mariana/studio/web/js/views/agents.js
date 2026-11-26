@@ -16,7 +16,7 @@
   const ACTIVE_RUNS = new Set(["queued", "running", "paused"]);
   const DELTA_EVENTS = new Set(["assistant_delta", "reasoning_delta", "swarm_agent_delta"]);
   const SWARM_DEFAULTS = {
-    max_agents: 6, max_steps: 8, max_rounds: 2, max_seconds: 300,
+    max_agents: 16, max_steps: 8, max_rounds: 2, max_seconds: 300,
     max_messages: 200, max_message_chars: 4000, max_memory_entries: 120,
     max_memory_chars: 8000, max_context_chars: 200000, max_agent_context_chars: 64000,
     max_context_item_chars: 24000, allow_write: false, allow_ipc: true, shared_memory: true,
@@ -2129,7 +2129,7 @@
       fieldControl({ label: "Maximum output characters", type: "number", min: 100, max: 1000000 }, state.doc.settings.max_output_chars, value => mutate(() => { state.doc.settings.max_output_chars = value; }, false, "Edit run limits")),
     ], null, false));
     const swarmFields = [
-      ["Maximum agents", "max_agents", { type: "number", min: 1, max: 12 }],
+      ["Maximum agents", "max_agents", { type: "number", min: 1, max: 64 }],
       ["Maximum model rounds per agent", "max_steps", { type: "number", min: 1, max: 24 }],
       ["Maximum feedback rounds", "max_rounds", { type: "number", min: 0, max: 4 }],
       ["Time budget (seconds)", "max_seconds", { type: "number", min: 10, max: 3600 }],

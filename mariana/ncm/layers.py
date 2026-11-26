@@ -20,7 +20,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.rms_norm(x, (x.shape[-1],), self.weight, 1e-6)
+        weight = self.weight
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        return F.rms_norm(x, (x.shape[-1],), weight, 1e-6)
 
 
 class Rotary(nn.Module):

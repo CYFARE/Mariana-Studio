@@ -27,6 +27,7 @@
       thoughts: 8, latent_symbols: 256, latent_window: 32, latent_min_thoughts: 2, latent_block_size: 2, latent_continuous_slots: 2,
       latent_refine_steps: 2, latent_grammar_prob: 0.25, w_latent_rl: 0.1, tokenizer_steps: 1000, generator_lr: 0.0003,
       prefix: 64, levels: "", flex: false, cache_codes: false, tokenizer_batch: 16, tokenizer_grad_accum: 1,
+      axiom: false, axiom_profile: "auto",
     };
   }
 
@@ -70,14 +71,18 @@
         field("thoughts", "Thought symbols", "number", { min: 1 }), field("latent_symbols", "Latent vocabulary", "number", { min: 2 }), field("latent_window", "Local raw-byte window", "number", { min: 1 }),
         field("latent_min_thoughts", "Minimum thoughts", "number", { min: 1 }), field("latent_block_size", "Hierarchy block size", "number", { min: 1 }),
         field("latent_continuous_slots", "Continuous slots", "number", { min: 1 }), field("latent_refine_steps", "Slot refinement steps", "number", { min: 0 }),
-        field("latent_grammar_prob", "Grammar curriculum probability", "number", { min: 0, max: 1 }), field("w_latent_rl", "Latent RL weight", "number", { min: 0 }));
+        field("latent_grammar_prob", "Grammar curriculum probability", "number", { min: 0, max: 1 }), field("w_latent_rl", "Latent RL weight", "number", { min: 0 }),
+        field("axiom", "AXIOM corpus codec (connectors, dictionary, DNA/protein packing)", "checkbox"),
+        field("axiom_profile", "AXIOM codec profile", "select", { values: [["auto", "Auto (detect domain)"], ["compact", "Compact (English connectors)"], ["reversible", "Reversible (English, keep words)"], ["lossless", "Lossless (exact text)"]] }));
     }
   }
 
   function config(smart) {
+    const values = { ...state.values };
+    if (state.technique === "ncm") values.axiom = false;  // AXIOM is a DRV-LM corpus encoding
     return {
       technique: state.technique, mode: $("train-mode").value, name: $("train-name").value.trim(), folder: $("train-folder").value.trim(),
-      corpus_mode: $("train-corpus-mode").value, smart: smart === undefined ? $("train-smart").checked : smart, backup: true, ...state.values,
+      corpus_mode: $("train-corpus-mode").value, smart: smart === undefined ? $("train-smart").checked : smart, backup: true, ...values,
     };
   }
 

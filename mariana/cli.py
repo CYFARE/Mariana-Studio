@@ -25,6 +25,8 @@ import sys
 
 import torch
 
+from . import axiom
+from .axiom import PROFILES as AXIOM_PROFILES
 from .config import Config
 from .device import describe, pick_device
 
@@ -84,6 +86,15 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
                    help="return penalty that makes easy contexts use fewer thoughts")
     p.add_argument("--no-latent-diffusion", action="store_true",
                    help="disable SAINT cross-attention in the diffusion draft")
+    p.add_argument("--axiom", action="store_true",
+                   help="train on the AXIOM corpus codec: English connectors become "
+                        "one-byte operators, frequent text becomes dictionary codes, "
+                        "and DNA/protein data is bit-packed")
+    p.add_argument("--axiom-profile", type=str, default="auto",
+                   choices=list(AXIOM_PROFILES),
+                   help="auto detects text/language/sequence and picks the smallest "
+                        "codec; compact and reversible force English connectors; "
+                        "lossless keeps text exact and uses dictionary/packing only")
 
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
@@ -94,7 +105,8 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mariana", description="Mariana tiny hybrid Diffusion-AR LM (DRV-LM)"
+        prog="mariana",
+        description="Mariana: One-stop Research and Development Studio for language models",
     )
     sub = parser.add_subparsers(dest="cmd")
 
@@ -110,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="NCM stage-1 updates; --steps controls stage 2")
     p.add_argument("--ncm-tokenizer-batch", type=int)
     p.add_argument("--ncm-tokenizer-grad-accum", type=int)
-    p.add_argument("--ncm-generator-lr", type=float, default=3e-4)
+    p.add_argument("--ncm-generator-lr", type=float, default=1e-3)
     p.add_argument("--ncm-cache-codes", action="store_true",
                    help="cache frozen NCM codes for repeated-epoch generator training")
     p.add_argument("--ncm-prefix", type=int, default=64, help="NCM prompt byte length")
@@ -176,6 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the latent symbol sequence")
     p.add_argument("--code-temperature", type=float, default=0.0,
                    help="latent-code sampling temperature (0 = greedy)")
+    p.add_argument("--show-axiom", action="store_true",
+                   help="also print the generated AXIOM surface form (glyphs)")
 
     # -- think ----------------------------------------------------------------
     p = sub.add_parser("think", help="inspect the model's private latent code")
@@ -302,6 +316,8 @@ def cfg_from_args(args) -> Config:
         w_latent_grammar=args.w_latent_grammar,
         w_latent_length=args.w_latent_length,
         fast_train=bool(getattr(args, "fast_train", False)),
+        use_axiom=bool(getattr(args, "axiom", False)),
+        axiom_profile=getattr(args, "axiom_profile", "auto"),
     )
     if args.loops is not None:
         cfg.max_loops = args.loops
@@ -314,6 +330,39 @@ def cfg_from_args(args) -> Config:
 NCM_GENERATOR_CHECKPOINT = os.path.join("trained-model", "mariana-ncm.pt")
 
 
+def _axiom_codec(cfg: Config):
+    return axiom.codec_from_settings(cfg.axiom_profile, cfg.axiom_codec)
+
+
+def _prompt_bytes(prompt: str, cfg: Config) -> bytes:
+    """Encode a prompt with the checkpoint's corpus codec, if it has one."""
+    if not cfg.use_axiom:
+        return prompt.encode()
+    return axiom.encode_bytes(prompt.encode("utf-8"), codec=_axiom_codec(cfg))
+
+
+def _render_bytes(data: bytes, cfg: Config) -> str:
+    """Decode model output back to readable text."""
+    if cfg.use_axiom:
+        return axiom.decode_bytes(data, codec=_axiom_codec(cfg))
+    return data.decode("utf-8", errors="replace")
+
+
+def _print_axiom_output(data: bytes, cfg: Config, show: bool) -> None:
+    if not (show and cfg.use_axiom):
+        return
+    codec = _axiom_codec(cfg)
+    detail = codec.mode
+    if codec.mode == "text":
+        detail = f"text/{codec.language}, {len(codec.dictionary)} dictionary entries"
+        if codec.connectors:
+            detail += ", connectors"
+    elif codec.mode in ("dna", "protein"):
+        detail = f"{codec.mode}, {codec.bits}-bit packed"
+    print(f"\n--- AXIOM surface form [{detail}] ---")
+    print(axiom.display_bytes(data, codec)[:4000])
+
+
 def _run_ncm(argv):
     from .ncm.cli import main
 
@@ -322,7 +371,8 @@ def _run_ncm(argv):
 
 def _cmd_ncm_train(args):
     if (args.moe or args.no_grouped_moe or args.latent or args.bench
-            or args.no_mtp or args.no_adaln or args.fast_train is not None):
+            or args.no_mtp or args.no_adaln or args.axiom
+            or args.fast_train is not None):
         raise SystemExit("DRV-LM-only training flags cannot be combined with --ncm.")
     if getattr(args, "init_from", None) or getattr(args, "freeze_layers", 0) or getattr(args, "freeze_embeddings", False):
         raise SystemExit(
@@ -367,7 +417,8 @@ def _cmd_ncm_train(args):
 
 
 def _cmd_ncm_gen(args):
-    if (args.ar or args.latent or args.show_code or args.no_adaptive
+    if (args.ar or args.latent or args.show_code or args.show_axiom
+            or args.no_adaptive
             or args.draft_len is not None or args.draft_temperature is not None
             or args.code_temperature != 0.0):
         raise SystemExit("DRV-LM-only generation flags cannot be combined with --ncm.")
@@ -394,6 +445,8 @@ def cmd_studio(args):
 def cmd_train(args) -> None:
     if args.ncm:
         return _cmd_ncm_train(args)
+    if getattr(args, "init_from", None) and args.resume:
+        raise SystemExit("--init-from and --resume are mutually exclusive")
     from .generate import ar_generate, draft_refine_verify
     from .latent import format_code, generate_latent
     from .train import load_checkpoint, train
@@ -417,8 +470,20 @@ def cmd_train(args) -> None:
             cfg.max_loops = args.loops
         if args.fast_train is not None:
             cfg.fast_train = args.fast_train
+        if args.axiom and not cfg.use_axiom:
+            print(
+                "The base checkpoint uses plain byte encoding; keeping AXIOM "
+                "disabled. Start a fresh checkpoint to enable it."
+            )
+        if cfg.use_axiom and not cfg.axiom_codec:
+            cfg.axiom_codec = axiom.codec_from_settings(cfg.axiom_profile).to_json()
     elif args.resume and os.path.exists(args.checkpoint):
         ckpt = load_checkpoint(args.checkpoint, map_location="cpu")
+        if ckpt.get("stage") not in {None, "drv"}:
+            raise SystemExit(
+                "--checkpoint must point to a DRV-LM checkpoint for --resume; "
+                "NCM checkpoints resume with --ncm or the ncm commands."
+            )
         cfg = Config.from_dict(ckpt["cfg"])
         if args.loops is not None:
             cfg.max_loops = args.loops
@@ -427,10 +492,27 @@ def cmd_train(args) -> None:
                 "Checkpoint was trained without --latent; keeping the latent "
                 "code disabled. Start a new checkpoint to enable it."
             )
+        if args.axiom and not cfg.use_axiom:
+            print(
+                "Checkpoint was trained on plain bytes; keeping AXIOM disabled. "
+                "Start a new checkpoint to enable it."
+            )
+        if cfg.use_axiom and not cfg.axiom_codec:
+            cfg.axiom_codec = axiom.codec_from_settings(cfg.axiom_profile).to_json()
         if args.fast_train is not None:
             cfg.fast_train = args.fast_train
     else:
         cfg = cfg_from_args(args)
+
+    if cfg.use_axiom:
+        if cfg.axiom_codec:
+            codec = _axiom_codec(cfg)
+            detail = codec.mode
+            if codec.mode == "text":
+                detail = f"text/{codec.language} ({len(codec.dictionary)} dictionary entries)"
+            print(f"AXIOM corpus codec: {detail}")
+        else:
+            print(f"AXIOM corpus codec: selecting from the corpus (profile {cfg.axiom_profile})")
 
     model = train(args, cfg, device)
 
@@ -440,17 +522,18 @@ def cmd_train(args) -> None:
         empty_cache(device)
         print("\n--- Final generation demo (Draft-Refine-Verify) ---")
         model.eval()
+        prompt = _prompt_bytes(args.prompt, cfg)
         out, acc, tps, elapsed = draft_refine_verify(
-            model, args.prompt.encode(), max_new_tokens=args.gen_len,
+            model, prompt, max_new_tokens=args.gen_len,
             device=device, cfg=cfg,
         )
         print(f"Hybrid: {tps:.1f} tok/s, acceptance {acc:.2%}, time {elapsed:.2f}s")
-        print(out.decode("utf-8", errors="replace"))
+        print(_render_bytes(out, cfg))
 
         if cfg.use_latent:
             print("\n--- Latent code demo (full context -> private symbols -> bytes) ---")
             lat_out, symbols, stats = generate_latent(
-                model, args.prompt.encode(), cfg, device,
+                model, prompt, cfg, device,
                 max_new_tokens=args.gen_len,
             )
             print(f"Code: {format_code(symbols)}")
@@ -460,15 +543,15 @@ def cmd_train(args) -> None:
                 f"({stats['bytes_per_symbol']:.1f} bytes/symbol, "
                 f"{stats['unique']} unique)"
             )
-            print(lat_out.decode("utf-8", errors="replace"))
+            print(_render_bytes(lat_out, cfg))
 
     if args.bench:
         out_ar, tps_ar, elapsed_ar = ar_generate(
-            model, args.prompt.encode(), max_new_tokens=args.gen_len,
+            model, _prompt_bytes(args.prompt, cfg), max_new_tokens=args.gen_len,
             device=device, cfg=cfg,
         )
         print(f"\nAR baseline: {tps_ar:.1f} tok/s, time {elapsed_ar:.2f}s")
-        print(out_ar.decode("utf-8", errors="replace"))
+        print(_render_bytes(out_ar, cfg))
 
 
 def cmd_gen(args) -> None:
@@ -481,6 +564,12 @@ def cmd_gen(args) -> None:
     print(describe(device))
     cfg, model, _ = load_cfg_and_model(args, device)
 
+    if args.show_axiom and not cfg.use_axiom:
+        raise SystemExit(
+            "This checkpoint is not AXIOM-encoded. Train one with "
+            "`python -m mariana train --axiom` to use --show-axiom."
+        )
+
     if args.latent and not cfg.use_latent:
         raise SystemExit(
             "This checkpoint has no latent code. Train one with "
@@ -488,8 +577,9 @@ def cmd_gen(args) -> None:
         )
 
     if args.latent:
+        prompt = _prompt_bytes(args.prompt, cfg)
         out, symbols, stats = generate_latent(
-            model, args.prompt.encode(), cfg, device,
+            model, prompt, cfg, device,
             max_new_tokens=args.gen_len,
             temperature=args.temperature, top_p=args.top_p,
             code_temperature=args.code_temperature,
@@ -504,29 +594,29 @@ def cmd_gen(args) -> None:
             f"{stats['n_thoughts']} symbols) ---"
         )
         max_context = max(1, cfg.ctx_len - cfg.n_thoughts - 8)
-        used_prompt = args.prompt.encode()[-max_context:]
-        print(
-            used_prompt.decode("utf-8", errors="replace")
-            + out.decode("utf-8", errors="replace")
-        )
+        used_prompt = prompt[-max_context:]
+        _print_axiom_output(out, cfg, args.show_axiom)
+        print(_render_bytes(used_prompt, cfg) + _render_bytes(out, cfg))
         return
 
+    prompt = _prompt_bytes(args.prompt, cfg)
     if args.ar:
         out, tps, elapsed = ar_generate(
-            model, args.prompt.encode(), max_new_tokens=args.gen_len,
+            model, prompt, max_new_tokens=args.gen_len,
             temperature=args.temperature, top_p=args.top_p, device=device, cfg=cfg,
         )
         print(f"\n--- AR generation ({tps:.1f} tok/s) ---")
     else:
         out, acc, tps, elapsed = draft_refine_verify(
-            model, args.prompt.encode(), max_new_tokens=args.gen_len,
+            model, prompt, max_new_tokens=args.gen_len,
             draft_len=args.draft_len, n_steps=args.refine_steps,
             temperature=args.temperature, top_p=args.top_p, device=device, cfg=cfg,
             adaptive_draft=not args.no_adaptive,
             draft_temperature=args.draft_temperature,
         )
         print(f"\n--- Hybrid generation ({tps:.1f} tok/s, accept {acc:.2%}) ---")
-    print(out.decode("utf-8", errors="replace"))
+    _print_axiom_output(out, cfg, args.show_axiom)
+    print(_render_bytes(out, cfg))
 
 
 def cmd_think(args) -> None:
@@ -543,7 +633,7 @@ def cmd_think(args) -> None:
         )
 
     out, symbols, stats = generate_latent(
-        model, args.prompt.encode(), cfg, device,
+        model, _prompt_bytes(args.prompt, cfg), cfg, device,
         max_new_tokens=args.gen_len,
         temperature=args.temperature, top_p=args.top_p,
         code_temperature=args.code_temperature,
@@ -560,11 +650,8 @@ def cmd_think(args) -> None:
     )
     print("\n--- Decoded continuation ---")
     max_context = max(1, cfg.ctx_len - cfg.n_thoughts - 8)
-    used_prompt = args.prompt.encode()[-max_context:]
-    print(
-        used_prompt.decode("utf-8", errors="replace")
-        + out.decode("utf-8", errors="replace")
-    )
+    used_prompt = _prompt_bytes(args.prompt, cfg)[-max_context:]
+    print(_render_bytes(used_prompt, cfg) + _render_bytes(out, cfg))
 
 
 def cmd_bench(args) -> None:
@@ -573,19 +660,19 @@ def cmd_bench(args) -> None:
     device = pick_device(args.device)
     print(describe(device))
     cfg, model, _ = load_cfg_and_model(args, device)
-    prompt = args.prompt.encode()
+    prompt = _prompt_bytes(args.prompt, cfg)
 
     out, acc, tps, el = draft_refine_verify(
         model, prompt, max_new_tokens=args.gen_len, device=device, cfg=cfg,
         n_steps=args.refine_steps, draft_temperature=args.draft_temperature,
     )
     print(f"Hybrid DRV: {tps:.1f} tok/s | acceptance {acc:.2%} | {el:.2f}s")
-    print(out.decode("utf-8", errors="replace"))
+    print(_render_bytes(out, cfg))
     out_ar, tps_ar, el_ar = ar_generate(
         model, prompt, max_new_tokens=args.gen_len, device=device, cfg=cfg
     )
     print(f"\nAR baseline: {tps_ar:.1f} tok/s | {el_ar:.2f}s")
-    print(out_ar.decode("utf-8", errors="replace"))
+    print(_render_bytes(out_ar, cfg))
     print(f"\nSpeedup: {tps / max(tps_ar, 1e-9):.2f}x")
 
 
@@ -598,6 +685,12 @@ def cmd_export(args) -> None:
             "Note: GGUF/ONNX and LLaMA-format safetensors export the lossless "
             "AR path and omit the latent modules; --raw safetensors keeps them. "
             "The AR path itself is unchanged by the latent code."
+        )
+    if cfg.use_axiom:
+        codec = _axiom_codec(cfg)
+        print(
+            "Note: this checkpoint reads and writes an AXIOM "
+            f"{codec.mode} codec; use the same codec for prompts and outputs."
         )
     os.makedirs(args.out, exist_ok=True)
     fmts = ["gguf", "onnx", "safetensors"] if args.format == "all" else [args.format]

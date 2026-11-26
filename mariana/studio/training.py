@@ -68,28 +68,66 @@ NCM_MODES = {"fresh", "continue", "update", "fresh_generator", "update_tokenizer
 NCM_TOKENIZER_MODES = {"fresh", "update", "update_tokenizer", "fresh_tokenizer"}
 NCM_TOKENIZER_ONLY_MODES = {"update_tokenizer", "fresh_tokenizer"}
 DRV_MODES = {"fresh", "continue", "finetune"}
+# ``NCMConfig.latent_dim``; Studio does not expose it as a training option.
+NCM_LATENT_DIM = 128
 
 
 def _checkpoint_step(path, expected_stage=None):
     if not path.exists():
         raise ValueError(f"Required checkpoint does not exist: {path.name}")
-    state = torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:  # noqa: BLE001 - corrupt user data, not a code path
+        raise ValueError(
+            f"{path.name} could not be read as a checkpoint ({error}); "
+            "restore it from backups/ or choose another checkpoint"
+        ) from error
+    if not isinstance(state, dict):
+        raise ValueError(f"{path.name} is not a Mariana checkpoint")
     stage = state.get("stage")
     if expected_stage == "drv" and stage is not None:
         raise ValueError(f"{path.name} must be a Mariana DRV-LM checkpoint")
     if expected_stage not in {None, "drv"} and stage != expected_stage:
         raise ValueError(f"{path.name} must be an NCM {expected_stage} checkpoint")
-    return int(state.get("step", 0))
+    return int(state.get("step", 0) or 0)
+
+
+def _model_geometry(config, latent_dim: int | None = None):
+    """Return validated ``(dim, heads)``; RoPE needs an even head size."""
+    dim = number(config, "dim", 256, 8, 8192)
+    heads = number(config, "heads", 4, 1, 128)
+    if dim % heads:
+        raise ValueError(
+            f"Dimension ({dim}) must be divisible by attention heads ({heads})"
+        )
+    head_dim = dim // heads
+    if head_dim % 2:
+        raise ValueError(
+            f"Dimension ({dim}) with {heads} heads gives a head size of {head_dim}; "
+            "choose a combination with an even head size"
+        )
+    if latent_dim is not None and (
+            latent_dim % heads or (latent_dim // heads) % 2):
+        raise ValueError(
+            f"The NCM latent width ({latent_dim}) needs attention heads that divide it "
+            f"into an even size; {heads} heads do not"
+        )
+    return dim, heads
 
 
 def _integrated_training_command(config, corpus_path, checkpoint, root: Path):
     technique = config.get("technique", "fast")
     if technique not in TECHNIQUES:
         raise ValueError("Unknown training technique")
+    if technique == "ncm" and config.get("axiom"):
+        raise ValueError("AXIOM is available for DRV-LM training only")
     mode = config.get("mode", "fresh")
     steps = number(config, "steps", 1000, 1, 10_000_000)
     if mode == "continue":
         steps += int(config.get("_generator_start_step", 0))
+    dim, heads = _model_geometry(
+        config, latent_dim=NCM_LATENT_DIM if technique == "ncm" else None
+    )
     command = [
         sys.executable, launcher(root), "train",
         "--data", str(corpus_path), "--checkpoint", str(checkpoint),
@@ -97,8 +135,8 @@ def _integrated_training_command(config, corpus_path, checkpoint, root: Path):
         "--batch", str(number(config, "batch", 16, 1, 4096)),
         "--grad-accum", str(number(config, "grad_accum", 1, 1, 4096)),
         "--ctx", str(number(config, "ctx", 128, 8, 32768)),
-        "--dim", str(number(config, "dim", 256, 8, 8192)),
-        "--heads", str(number(config, "heads", 4, 1, 128)),
+        "--dim", str(dim),
+        "--heads", str(heads),
         "--lr", str(number(config, "lr", 3e-3, 1e-8, 1.0, float)),
         "--warmup", str(number(config, "warmup", 50, 0, 1_000_000)),
         "--eval-every", str(number(config, "eval_every", 200, 1, 10_000_000)),
@@ -119,7 +157,7 @@ def _integrated_training_command(config, corpus_path, checkpoint, root: Path):
         command += [
             "--ncm", "--ncm-tokenizer", str(tokenizer),
             "--ncm-tokenizer-steps", str(number(config, "tokenizer_steps", 1000, 1, 10_000_000)),
-            "--ncm-generator-lr", str(number(config, "generator_lr", 3e-4, 1e-8, 1.0, float)),
+            "--ncm-generator-lr", str(number(config, "generator_lr", 1e-3, 1e-8, 1.0, float)),
             "--ncm-prefix", str(number(config, "prefix", 64, 1, 16384)),
         ]
         if config.get("tokenizer_batch") is not None:
@@ -173,6 +211,13 @@ def _integrated_training_command(config, corpus_path, checkpoint, root: Path):
                     "--latent-grammar-prob", str(number(config, "latent_grammar_prob", 0.25, 0.0, 1.0, float)),
                     "--w-latent-rl", str(number(config, "w_latent_rl", 0.1, 0.0, 10.0, float)),
                 ]
+        if config.get("axiom"):
+            profile = config.get("axiom_profile", "auto")
+            if profile not in {"auto", "compact", "reversible", "lossless"}:
+                raise ValueError(
+                    "AXIOM profile must be auto, compact, reversible, or lossless"
+                )
+            command += ["--axiom", "--axiom-profile", profile]
     if mode == "continue":
         command.append("--resume")
     return command
@@ -200,14 +245,15 @@ def _advanced_ncm_commands(config, corpus_path, checkpoint, root: Path):
         steps = number(config, "tokenizer_steps", 1000, 1, 10_000_000)
         if mode in {"update", "update_tokenizer"}:
             steps += int(config.get("_tokenizer_start_step", 0))
+        dim, heads = _model_geometry(config, latent_dim=NCM_LATENT_DIM)
         command = stage_command("tokenizer", steps) + [
             "--checkpoint", str(tokenizer),
             "--batch", str(number(config, "tokenizer_batch", config.get("batch", 16), 1, 4096)),
             "--grad-accum", str(number(config, "tokenizer_grad_accum", config.get("grad_accum", 1), 1, 4096)),
             "--lr", str(number(config, "lr", 3e-3, 1e-8, 1.0, float)),
             "--ctx", str(number(config, "ctx", 128, 8, 32768)),
-            "--dim", str(number(config, "dim", 256, 8, 8192)),
-            "--heads", str(number(config, "heads", 4, 1, 128)),
+            "--dim", str(dim),
+            "--heads", str(heads),
             "--prefix", str(number(config, "prefix", 64, 1, 16384)),
         ]
         if mode in {"update", "update_tokenizer"}:
@@ -224,7 +270,7 @@ def _advanced_ncm_commands(config, corpus_path, checkpoint, root: Path):
             "--tokenizer", str(tokenizer), "--checkpoint", str(checkpoint),
             "--batch", str(number(config, "batch", 16, 1, 4096)),
             "--grad-accum", str(number(config, "grad_accum", 1, 1, 4096)),
-            "--lr", str(number(config, "generator_lr", 3e-4, 1e-8, 1.0, float)),
+            "--lr", str(number(config, "generator_lr", 1e-3, 1e-8, 1.0, float)),
         ]
         if config.get("compile"):
             command.append("--compile")
@@ -277,6 +323,8 @@ def _ncm_finetune_command(config, corpus_path, checkpoint, root: Path):
 def build_training_commands(config, corpus_path, checkpoint, root: Path):
     technique = config.get("technique", "fast")
     mode = config.get("mode", "fresh")
+    if config.get("axiom") and technique == "ncm":
+        raise ValueError("AXIOM is available for DRV-LM training only")
     if technique == "ncm":
         if mode not in NCM_MODES:
             raise ValueError(f"Unknown NCM training mode: {mode}")
@@ -396,6 +444,9 @@ class TrainingManager:
         self.corpus_cache = {}
         self.registry = registry
         self.before_start: list = []  # callables run before a subprocess claims the GPU
+        # Serialises starts without holding ``condition``: validating a
+        # checkpoint and copying a multi-GB backup must not block /api/state.
+        self.start_lock = threading.Lock()
 
     # -- corpus & smart options ------------------------------------------
     def _corpus(self, folder, mode):
@@ -547,8 +598,12 @@ class TrainingManager:
         config = dict(config)
         if config.get("engine") == "hf":
             return self.start_external(config)
-        with self.condition:
-            self._require_idle_locked()
+        # Validation, checkpoint reads, backups and the base-tokenizer copy are
+        # disk work: run them under ``start_lock`` instead of the state
+        # condition so progress polling stays responsive.
+        with self.start_lock:
+            with self.condition:
+                self._require_idle_locked()
             technique = config.get("technique", "fast")
             mode = config.get("mode", "fresh")
             if technique not in TECHNIQUES:
@@ -581,7 +636,15 @@ class TrainingManager:
                     raise ValueError("Base checkpoint must be inside the workspace") from None
                 if base == checkpoint:
                     raise ValueError("Choose a new output name so the base checkpoint is preserved")
-                base_state = torch.load(base, map_location="cpu", weights_only=True)
+                try:
+                    base_state = torch.load(base, map_location="cpu", weights_only=True)
+                except Exception as error:  # noqa: BLE001 - corrupt user data
+                    raise ValueError(
+                        f"Base checkpoint {base.name} could not be read ({error}); "
+                        "choose another checkpoint"
+                    ) from error
+                if not isinstance(base_state, dict):
+                    raise ValueError(f"Base checkpoint {base.name} is not a Mariana checkpoint")
                 stage = base_state.get("stage")
                 if technique == "ncm":
                     if stage != "generator":
@@ -624,7 +687,7 @@ class TrainingManager:
                 f"Fine-tune · {Path(config['init_from']).name}" if finetune
                 else f"{TECHNIQUES[technique]['name']} · {mode.replace('_', ' ')}"
             )
-            job = self.job = self._new_job(
+            job = self._new_job(
                 technique=technique, mode=mode, finetune=finetune,
                 base=config.get("init_from"), title=title, pause_file=str(pause_file),
                 process_stage=(
@@ -639,9 +702,19 @@ class TrainingManager:
                 target=self._run, args=(job, config, folder, checkpoint),
                 name="training-run", daemon=True,
             )
-            thread.start()
-            self._changed_locked()
-            state = self._state_locked()
+            with self.condition:
+                self._require_idle_locked()
+                self.job = job
+                try:
+                    thread.start()
+                except RuntimeError as error:
+                    self.job = None
+                    self._changed_locked()
+                    raise ValueError(
+                        f"Could not start the training worker: {error}"
+                    ) from error
+                self._changed_locked()
+                state = self._state_locked()
         self._notify_registry()
         return state
 
@@ -678,6 +751,21 @@ class TrainingManager:
         except Exception as error:  # noqa: BLE001 - reported on the job
             self._fail(job, error, pause_file)
 
+    @staticmethod
+    def _stop_process(process, grace: float = 5.0) -> None:
+        """Terminate a child, then kill it if it ignores SIGTERM."""
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+
     def _execute(self, job, commands, env: dict | None = None) -> int:
         with self.condition:
             job["command"] = " && ".join(shlex.join(command) for command in commands)
@@ -701,11 +789,18 @@ class TrainingManager:
                 job["process"] = process
                 if job["cancel_requested"] and process.poll() is None:
                     process.terminate()
-            for line in process.stdout:
-                self._append(line, job)
-            returncode = process.wait()
-            with self.condition:
-                job["process"] = None
+            try:
+                for line in process.stdout:
+                    self._append(line, job)
+                returncode = process.wait()
+            finally:
+                # A reader failure must not leave a trainer running and holding
+                # the GPU after the manager has moved on.
+                self._stop_process(process)
+                if process.stdout is not None:
+                    process.stdout.close()
+                with self.condition:
+                    job["process"] = None
             if returncode != 0:
                 break
         return returncode
@@ -719,7 +814,7 @@ class TrainingManager:
             if job["cancel_requested"]:
                 job["status"] = "cancelled"
                 job["stage"] = "Cancelled"
-            elif job["pause_requested"]:
+            elif job["pause_requested"] and returncode == 0:
                 job["status"] = "paused"
                 job["stage"] = "Paused at checkpoint"
             elif returncode == 0:
@@ -752,6 +847,8 @@ class TrainingManager:
     def start_external(self, plan: dict) -> dict:
         """Launch a planned fine-tune of a third-party model (see ``finetune.hf``)."""
         plan = dict(plan)
+        if not plan.get("output"):
+            raise ValueError("Choose an output folder for the fine-tuned model")
         output = Path(plan["output"]).resolve()
         models = (self.root / "models").resolve()
         try:
@@ -761,15 +858,18 @@ class TrainingManager:
         folder = Path(str(plan.get("folder", ""))).expanduser()
         if not str(plan.get("folder", "")).strip() or not folder.exists():
             raise ValueError("Select a valid fine-tuning data folder")
-        with self.condition:
-            self._require_idle_locked()
+        with self.start_lock:
+            with self.condition:
+                self._require_idle_locked()
             job_id = uuid.uuid4().hex[:12]
             pause_file = jobs_path(self.root) / f"{job_id}.pause"
             pause_file.unlink(missing_ok=True)
             backup = None
+            if output.exists() and not plan.get("backup", True):
+                raise ValueError("Output model exists; choose a new name or enable backups")
+            if not plan.get("base"):
+                raise ValueError("Choose a base model to fine-tune")
             if output.exists():
-                if not plan.get("backup", True):
-                    raise ValueError("Output model exists; choose a new name or enable backups")
                 destination = (
                     self.root / "backups" / output.name
                     / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -777,7 +877,7 @@ class TrainingManager:
                 destination.mkdir(parents=True, exist_ok=False)
                 shutil.move(str(output), str(destination / output.name))
                 backup = str(destination.relative_to(self.root))
-            job = self.job = self._new_job(
+            job = self._new_job(
                 id=job_id, technique="hf", mode="finetune", finetune=True,
                 base=plan.get("base_name") or plan.get("base"),
                 title=f"Fine-tune · {plan.get('base_name') or Path(str(plan.get('base'))).name}",
@@ -789,9 +889,19 @@ class TrainingManager:
                 target=self._run_external, args=(job, plan, folder, output, pause_file),
                 name="finetune-run", daemon=True,
             )
-            thread.start()
-            self._changed_locked()
-            state = self._state_locked()
+            with self.condition:
+                self._require_idle_locked()
+                self.job = job
+                try:
+                    thread.start()
+                except RuntimeError as error:
+                    self.job = None
+                    self._changed_locked()
+                    raise ValueError(
+                        f"Could not start the fine-tuning worker: {error}"
+                    ) from error
+                self._changed_locked()
+                state = self._state_locked()
         self._notify_registry()
         return state
 
@@ -868,7 +978,11 @@ class TrainingManager:
                 self.job["ended"] = time.time()
             elif process.poll() is None:
                 process.terminate()
-                threading.Timer(5.0, lambda: process.poll() is None and process.kill()).start()
+                timer = threading.Timer(
+                    5.0, lambda p=process: p.poll() is None and p.kill()
+                )
+                timer.daemon = True
+                timer.start()
             self._changed_locked()
             state = self._state_locked()
         self._notify_registry()
@@ -880,14 +994,18 @@ class TrainingManager:
             return self.version, self._state_locked()
 
     def close(self) -> None:
-        with self.condition:
-            job = self.job
-            if job and job["status"] in {"preparing", "running"}:
-                job["cancel_requested"] = True
-                process = job["process"]
-                if process is not None and process.poll() is None:
-                    process.terminate()
-            self._changed_locked()
+        # Take the start lock so a run that is still preparing a backup cannot
+        # spawn after the server has begun shutting down.
+        with self.start_lock:
+            with self.condition:
+                job = self.job
+                process = None
+                if job and job["status"] in {"preparing", "running"}:
+                    job["cancel_requested"] = True
+                    process = job["process"]
+                self._changed_locked()
+            # Do not leave a trainer holding the GPU after the server has shut down.
+            self._stop_process(process)
 
     def checkpoints(self):
         """Every Mariana ``.pt`` checkpoint in the workspace, newest first."""
@@ -898,7 +1016,10 @@ class TrainingManager:
         for path in paths:
             if path.suffix != ".pt" or path.name.endswith(".tmp"):
                 continue
-            stat = path.stat()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue  # deleted between the glob and the stat
             result.append({
                 "path": str(path.relative_to(self.root)), "name": path.name,
                 "bytes": stat.st_size, "modified": stat.st_mtime,

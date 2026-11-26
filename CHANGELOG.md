@@ -2,6 +2,254 @@
 
 All notable changes to Mariana Studio are recorded here, newest first.
 
+## v2.3.3 — 2026-11-24
+
+### Agents
+
+- Swarm tools now use a run-scoped read-result cache with single-flight
+  duplicate suppression: two members reading the same file or fetching the same
+  page share one execution, and a successful write clears the cache before any
+  later read. Only known read-only tools are cached, results are bounded and
+  in-memory, failures are never cached, and network entries expire after 30 s.
+  Independent read batches execute in parallel while writes stay ordered; the
+  result reports cache hits, saved time and stored size.
+- The leader has a free hand to plan a large team: the safety ceiling is 64
+  agents (default 16 in AML and 8 in Chat). Model calls are metered separately
+  from tool executions (defaults 16 and 32 concurrent) so a 64-agent plan queues
+  safely instead of firing every provider and disk call at once. Chat and IDE
+  defaults were raised to 8 and 16 agents. Planning output grows with the team
+  size, and reports from more than 12 agents are condensed in parallel groups
+  before the final synthesis so no member is silently dropped. One read pool
+  serves every member, so a large team cannot create hundreds of per-turn
+  threads.
+- Member prompts now put the immutable instructions, tools and briefing first
+  and mutable state (peer digest, blackboard, plan, inbox) in the user turn.
+  The system prefix is byte-identical across phases and tool turns, so provider
+  prompt caching can reuse it: OpenAI receives `prompt_cache_key`, llama.cpp
+  receives `cache_prompt`, other compatible providers use their automatic prefix
+  cache, Anthropic receives `cache_control` on the system/tools block, and
+  cached-token usage is parsed and reported. A rejected cache parameter is
+  retried without it.
+- The leader skips planning when the caller already supplied complete agent
+  tasks and tool grants; a feedback round where every review scores 4+ with no
+  open issue stops without a leader decision. With a reasoning effort set,
+  routine tool turns reuse low effort while the first turn and wrap-up keep the
+  configured level; the swarm node exposes this as `adaptive_effort` (default
+  true, false sends the configured level on every turn).
+- Swarm snapshots and results expose `cache` (tool hits, saved time, stored
+  bytes, prompt-cache hit rate); Chat swarm cards and the IDE's bounded swarm
+  observation show the hits and hit rate. The cache is per run and never
+  written to disk.
+- The designer metadata for a swarm node no longer lists the `goal` field
+  twice, and the protocol test now rejects duplicate field keys.
+- AML is now v1.9 (additive; every 1.8 document runs unchanged). AMP 1.10
+  discovery reports the new field, and its specification documents the `cache`
+  result object.
+- A process-wide hot cache keeps decoded workspace files in system RAM, keyed by
+  absolute path plus `mtime_ns`/size so a changed file is never served stale.
+  Its budget is a fifth of available memory (64 MiB–2 GiB), overridable with
+  `MARIANA_HOT_CACHE_MB`; large and binary files are excluded and writes or
+  shell commands that may change files invalidate entries. `cache` now reports
+  `hot_hits`, `hot_misses`, `hot_entries`, `hot_chars` and `hot_budget`.
+- Workspace tools handle real projects: `file.read` lists a directory instead of
+  failing, follows symlinks that stay inside the sandbox, detects binary files,
+  streams files above 8 MB by line range, and suggests close paths plus nearby
+  entries when a path is missing. `file.list` accepts a folder, nested pattern
+  and recursion; `file.tree` reports directories too, supports depth and up to
+  20,000 entries.
+- Context compression now uses CRAFT (Context Reduction with Anchors, Facts and
+  Traces). Observations are ordered newest-first, tool results are compressed
+  structure-aware, compacted turns become episode cards naming tools, anchors,
+  errors and decisions, and a run-wide evidence ledger shares paths/lines seen
+  by any member. Handles keep a 260-character summary and anchor list while the
+  full text remains retrievable. Default budgets increased to 24,000 prompt
+  characters, 8,000 observation characters, a 400,000-character context bank,
+  96,000 characters per agent and 32,000 per retrieval slice; `cache` reports
+  compression ratio, episode count, stored items and evidence anchors.
+- `file.search` uses `git grep` in a Git work tree (respecting `.gitignore` and
+  searching in milliseconds), falls back to the Python walker for non-Git
+  folders, raises the scan ceiling from 2,000 to 50,000 files, and treats an
+  invalid regular expression as a literal search instead of failing. Search
+  results report their engine and the fallback.
+- Swarm tool arguments are normalised before dispatch: `file_path`/`filePath`
+  map to `path`, `startLine`/`from`/`to` to line ranges, `q`/`glob` to query and
+  include, `cmd` to command, numeric strings to numbers, and quotes/backslashes
+  are cleaned. Equivalent spellings now share one cache entry and one executor
+  call.
+- A leader/verifier reply that contains only DSML or tool-call markup is never
+  used as the final answer; synthesis falls back to the members' work. A member
+  whose reasoning consumes the visible output budget gets one compact,
+  evidence-only repair prompt instead of returning raw observations.
+- Short runs reserve 15% of their budget for synthesis, no longer extend a 6-8
+  step member budget, give members a visible step-budget warning, and tell the
+  planner not to add an agent that only waits for every other member. Member
+  prompts put all shared instructions and briefing first and member-specific
+  tools/identity last, so the first member warms the provider prefix cache for
+  the rest. Planning uses low effort on runs of 300 s or less.
+- A synthetic 150 ms-per-read benchmark measured 0.151 s for two identical
+  reads (one executor call), and four distinct reads at 0.602 s serial versus
+  0.154 s when batched. This measures the tool/cache path only; it is not a
+  matched end-to-end agent benchmark.
+- Live checks used the saved DeepSeek endpoint against the 3.5k-file Shotcut
+  checkout. A read-only bug audit completed in 156 s with 46 tool calls, zero
+  tool failures and a verified seven-row table; a targeted three-agent audit of
+  two source trees completed in 56 s (6 s planning, 27 calls, zero failures)
+  with a nine-row table and its rejected candidates listed separately; a
+  four-agent ownership audit completed in 93 s with 16 calls and zero failures.
+  A documentation swarm updated only `README.md` in a disposable copy in 188 s.
+  These are observed local runs, not a matched comparison with another coding
+  agent.
+- Native tool markup can no longer become an answer. The tolerant DSML reader
+  accepts lost slashes, duplicated closers, unclosed blocks, truncated markers,
+  `<parameter name="file.read">` envelopes and an `invoke name="plan"` body;
+  a batch sent as one JSON array inside `<calls>` or `<invoke name="calls">` now
+  executes every call instead of only the last JSON object. A reply that still
+  cannot be parsed is repaired with a concrete JSON example, and the final text,
+  transcript and swarm member output run through one sanitiser that returns
+  prose or nothing, never markup. Replaying a real 32-turn DeepSeek audit raised
+  parsed calls from 1 to 2 on each batched turn (the model had repeatedly
+  observed "only one result returned?"); a targeted read-only rerun against
+  Shotcut then finished in 240 s with a 2,157-character report and no markup in
+  the output.
+- The leader now plans for parallelism rather than a small team: size the team to
+  the work, give every independent workstream its own member and reserve
+  `depends_on` for a real hand-off, so a broad audit starts with a wide first
+  wave instead of a chain. The IDE's swarm hint says sixteen agents (was six),
+  and the IDE runs eight read-only tool calls concurrently (was four).
+
+### Interface
+
+- The IDE context ring moves during a run. The server publishes a `budget` event
+  after every tool round with used tokens, the context window, percent and
+  remaining context; the composer still substitutes the live draft locally
+  between events, so typing and tool work both move the ring before the run
+  ends.
+- IDE panes have no fixed maximum width or height: the explorer, editor and
+  agent can each be dragged until the next pane reaches its minimum, so one
+  pane can fill the window. Preferred sizes are still remembered and restored.
+- Agent-panel tool cards show a failure callout with the error and recovery
+  hint, and offer **Copy result** and **Copy input** beside **Open file**. The
+  streaming status line distinguishes a tool call in flight, a plan and a final
+  answer.
+- **Copy conversation** sits above **Export as Markdown** for every
+  conversation. Both include tool calls, tool output and errors, so a pasted
+  transcript keeps the evidence.
+- IDE interaction fixes: choosing an `@` file mention inserts the path without
+  leaving the trigger character behind, the mention popover closes when the
+  project changes or the view is left, a conversation from another project
+  opens in that project, and a draft typed while a send is in flight is kept.
+  The last answer appears immediately and survives a failed session reload,
+  and pending tool cards are marked ended rather than running forever. Reload
+  on a stale tab asks before discarding unsaved edits, and rapid reopen or
+  duplicate-open requests cannot create a second tab or overwrite a newer
+  buffer.
+- Package docstrings, `mariana --help`, and the citation metadata now describe
+  Mariana as a one-stop research and development studio for language models,
+  matching the README. The technical model documentation keeps its DRV-LM and
+  hybrid diffusion-AR terminology.
+
+### Reliability
+
+- Tool arguments are normalised in one shared helper used by the IDE, the flow
+  runtime and the swarm: `file_path`, `filename` and `path` become `path`, `q`
+  becomes `query`, `offset` becomes `start_line`, `limit` becomes `end_line`, a
+  bare string becomes the tool's primary argument, list and number spellings
+  are coerced, and `file_search` resolves to `file.search`. The swarm no longer
+  keeps a private copy of the alias table, so the three callers cannot drift.
+- An incomplete native tool call is returned to the model with a repair round
+  that names the missing keys instead of running and failing. After two rounds
+  the call runs so the executor's precise error is visible, and the repair
+  budget resets only after a complete call, so a stubborn model cannot be
+  repaired forever.
+- IDE bug sweep. Session lists apply their recent-window after filtering by
+  project, so a busy project cannot hide another project's older conversations;
+  deleting a project reserves it until its files are gone, so a run cannot
+  start in a half-deleted workspace; change snapshots are written atomically; a
+  failed `file.edit` no longer creates empty parent folders; cancelling a run
+  interrupts the network retry wait; pinning a file no longer filters the
+  project map down to that file; hidden paths are removed from both shapes of a
+  `file.list` result; and a corrupt session timestamp no longer breaks the
+  conversation list.
+
+### Training
+
+- New AXIOM corpus codec (`mariana/axiom.py`, `train --axiom`). Its English
+  semantic layer replaces connectors with one-byte mathematical operators,
+  canonicalises number words and typography, and iterates to an idempotent
+  normal form. Its codec layer makes the technique safe on any dataset.
+- AXIOM `auto` profile detects the corpus from a spread sample and selects the
+  smallest codec: a lossless 129-entry dictionary for text (words, phrases,
+  Unicode math symbols, emoji, LaTeX commands and CJK n-grams), 4-bit DNA
+  packing, 5-bit protein packing, or an identity codec for binary and
+  incompressible data. Non-English and mixed-language corpora use the
+  dictionary without the English semantic layer. `compact` and `reversible`
+  force English connectors; `lossless` keeps text exact.
+- The selected codec is stored in the checkpoint (`axiom_codec` JSON) and in
+  the prepared-corpus manifest. `gen`, `think` and `bench` encode their prompt
+  and decode their output with it; a resumed run validates the corpus against
+  the stored codec and refuses a mismatch. `--show-axiom` prints glyphs,
+  dictionary previews or the packing label.
+- AXIOM-prepared corpora are cached under `trained-model/axiom/`; large corpora
+  are sampled for codec selection and encoded line by line. Studio exposes the
+  toggle and four profiles in Advanced settings for DRV-LM runs and rejects
+  AXIOM with NCM.
+- New `scripts/axiom_corpus.py` to measure, inspect or pre-convert a corpus, and
+  `docs/whitepapers/axiom.md` plus `docs/axiom.md` for the design, measurements
+  and evaluation protocol.
+- AXIOM 2.2 bug sweep and escape mode: streamed and in-memory rewrites now
+  agree on lone CR and mixed line endings, canonicalisation freezes line
+  protection so filler removal cannot create or reclassify a fence,
+  ambiguity-weighted language scores plus sentence votes stop English and
+  Spanish prose being called mixed, truncated cache payloads and in-place
+  rewrites are rejected, and a literal operator byte is escaped as
+  `0x00 <byte>` instead of disabling the connector layer. On a 206 MB English
+  corpus with a few stray C0 bytes this raised the saving from 15.5% to 26.0%
+  and kept 6.2 M connector hits.
+- NCM generator LR now defaults to `1e-3` (was `3e-4`), including the integrated
+  `--ncm-generator-lr`; Studio Smart Options scales from `1e-3`. On a 7.6 MB
+  English sample, 800 generator steps reached teacher code accuracy 0.312 versus
+  0.229 at the old default; free-running code accuracy also rose. Tokenizer LR
+  is unchanged.
+- NCM evaluation prints `free_bytes` alongside greedy `FREE` code accuracy: the
+  fraction of generated bytes that match the tokenizer's decode of the true
+  codes. It separates generator drift from the frozen tokenizer ceiling.
+- NCM short-run sweep. A single global concept level is high-entropy on varied
+  text and drives error accumulation; the 12-level paper ladder reached 0.080
+  free-byte accuracy after 800 steps, while `64,96,128` reached 0.150 with
+  3 NFE and `32,...,128` reached 0.123 with 7 NFE. A single-level ladder is not
+  recommended (0.071: every position loses the informative draft). The runbook
+  documents the measured trade-off; the paper ladder remains the default.
+- NCM opt-in stabilizers: `--prefix-noise` and `--prefix-dropout` perturb the
+  cumulative prefix latent while training, and `--byte-weight` /
+  `--free-byte-weight` add a frozen-decoder byte-reconstruction auxiliary. Noise
+  0.5 raised free code accuracy 0.0053 -> 0.0071 on the paper ladder; both byte
+  auxiliaries changed the code/byte trade-off and were mixed across ladders, so
+  all four are off by default.
+- NCM bug fixes: `RMSNorm` casts its weight to the activation dtype, restoring
+  the fused kernel under bf16/fp16 autocast; code caching now puts the frozen
+  tokenizer in eval mode and restores its previous mode, so `--cache-codes` is
+  deterministic even for a tokenizer with dropout.
+- DRV-LM checkpoints are written atomically (temporary file plus `os.replace`),
+  and Ctrl+C saves the last completed optimizer step, so a crash, full disk or
+  interrupt no longer leaves a truncated checkpoint.
+- Resume is validated before training: `--resume` requires the checkpoint for
+  the stage being continued, rejects an NCM checkpoint in DRV-LM, and `--steps`
+  must exceed the saved step; `--init-from` and `--resume` are mutually
+  exclusive. A shape mismatch reports the config hint instead of a raw
+  `load_state_dict` error.
+- Model geometry is checked before allocation and at the Studio boundary:
+  `dim` must divide by `heads` into an even RoPE head size, and context, block
+  size and loop count have explicit lower bounds.
+- A non-finite DRV-LM gradient update is dropped with a warning instead of
+  stepping NaN weights. NCM keeps its documented abort-on-nonfinite behavior.
+- FlexAttention block masks now receive the per-row causal-only annealing
+  decisions, which were previously ignored on the `--flex` path.
+- Studio reads checkpoints, creates overwrite backups and copies NCM tokenizer
+  files without holding the job-state lock, so `/api/state` and the UI stay
+  responsive during large backups. It reports a crashed paused run as failed,
+  terminates and reaps a trainer if output reading fails or Studio closes, and
+  turns corrupt checkpoint/load errors into actionable messages.
+
 ## v2.3.2 — 2026-11-22
 
 ### Agents

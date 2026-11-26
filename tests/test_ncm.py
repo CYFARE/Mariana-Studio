@@ -65,8 +65,8 @@ def test_config_and_cli():
     assert NCMConfig(ctx_len=1).levels == (1,)
     assert NCMConfig(ctx_len=2).levels == (1, 2)
     assert NCMConfig(ctx_len=512).levels == cfg_from_args(args).levels
-    assert build_parser().parse_args(["train", "--steps", "2"]).generator_lr == 3e-4
-    assert build_parser().parse_args(["generator", "--steps", "2"]).lr == 3e-4
+    assert build_parser().parse_args(["train", "--steps", "2"]).generator_lr == 1e-3
+    assert build_parser().parse_args(["generator", "--steps", "2"]).lr == 1e-3
     try:
         NCMConfig(ctx_len=8, levels=(2, 4))
     except ValueError as e:
@@ -103,7 +103,7 @@ def test_integrated_ncm_flags_and_two_stage_dispatch():
     assert tokenizer.call_args.args[0].steps == 3
     assert tokenizer.call_args.args[0].checkpoint != generator.call_args.args[0].checkpoint
     assert generator.call_args.args[0].steps == 5
-    assert generator.call_args.args[0].lr == 3e-4
+    assert generator.call_args.args[0].lr == 1e-3
 
 
 def test_tokenizer_forward_backward_and_hierarchy():
@@ -314,8 +314,91 @@ def test_free_running_metrics_cover_every_level():
     generator.eval()
     prompt, target = make_batch(cfg)
     metrics = free_running_metrics(generator, (torch.cat((prompt, target), dim=1),), cfg, torch.device("cpu"))
-    assert set(metrics) == {"free", *(f"free_l{i}" for i in range(cfg.n_levels))}
+    assert set(metrics) == {"free", "free_bytes", *(f"free_l{i}" for i in range(cfg.n_levels))}
     assert all(0.0 <= float(value) <= 1.0 for value in metrics.values())
+
+
+def test_prefix_perturbation_is_training_only():
+    cfg, _, generator = make_models(tiny_cfg(prefix_noise=0.5, prefix_dropout=0.5))
+    prompt, target = make_batch(cfg)
+    codes = generator.tokenizer.encode(target)
+    generator.eval()
+    with torch.no_grad():
+        first, second = generator(prompt, codes), generator(prompt, codes)
+    for a, b in zip(first, second):
+        torch.testing.assert_close(a, b)
+    generator.train()
+    with torch.no_grad():
+        first, second = generator(prompt, codes), generator(prompt, codes)
+        steady, again = (
+            generator(prompt, codes, perturb=False),
+            generator(prompt, codes, perturb=False),
+        )
+    assert any(not torch.allclose(a, b) for a, b in zip(first, second))
+    for a, b in zip(steady, again):
+        torch.testing.assert_close(a, b)
+
+
+def test_byte_auxiliary_losses_are_consistent_and_trainable():
+    cfg, tokenizer, generator = make_models(tiny_cfg(self_condition=0.0))
+    generator.eval()
+    prompt, target = make_batch(cfg)
+    codes = tokenizer.encode(target)
+    valid = target != cfg.pad_token
+    with torch.no_grad():
+        true_logits = [
+            F.one_hot(code, cfg.codebook_size).float() * 20.0 for code in codes
+        ]
+        latent = generator._latent_from_logits(true_logits)
+        expected = tokenizer.quantizer.reconstruct(codes)
+        torch.testing.assert_close(latent, expected, atol=1e-4, rtol=1e-4)
+        assert torch.isfinite(generator._byte_loss(true_logits, target, valid))
+
+    cfg.byte_weight = 0.5
+    cfg.free_byte_weight = 0.25
+    with pytest.raises(ValueError, match="target bytes"):
+        generator.loss(prompt, codes)
+    losses = generator.loss(prompt, codes, target=target)
+    for key in ("byte", "free_byte"):
+        assert torch.isfinite(losses[key]), key
+    expected_total = (
+        losses["code"] + cfg.consistency_weight * losses["consistency"]
+        + cfg.byte_weight * losses["byte"] + cfg.free_byte_weight * losses["free_byte"]
+    )
+    torch.testing.assert_close(losses["total"], expected_total)
+    losses["total"].backward()
+    assert generator.heads[0].proj.weight.grad is not None
+    assert all(p.grad is None for p in generator.tokenizer.parameters())
+
+
+def test_new_training_options_validate_and_reach_the_parser():
+    cfg = tiny_cfg()
+    assert cfg.prefix_noise == 0.0 and cfg.prefix_dropout == 0.0
+    assert cfg.byte_weight == 0.0 and cfg.free_byte_weight == 0.0
+    for values in (
+        {"prefix_noise": -0.1}, {"prefix_dropout": 1.5},
+        {"byte_weight": -1.0}, {"free_byte_weight": float("nan")},
+    ):
+        with pytest.raises(ValueError):
+            tiny_cfg(**values)
+    args = build_parser().parse_args([
+        "generator", "--prefix-noise", "0.5", "--prefix-dropout", "0.25",
+        "--byte-weight", "0.5", "--free-byte-weight", "0.25",
+    ])
+    assert args.prefix_noise == 0.5 and args.prefix_dropout == 0.25
+    assert args.byte_weight == 0.5 and args.free_byte_weight == 0.25
+
+
+def test_rms_norm_accepts_mixed_precision_inputs():
+    from mariana.ncm.layers import RMSNorm
+
+    norm = RMSNorm(8)
+    x = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = norm(x)
+    assert output.dtype == torch.bfloat16
+    output.float().sum().backward()
+    assert x.grad is not None and norm.weight.grad is not None
 
 
 def test_cached_generation_matches_uncached():
@@ -614,7 +697,7 @@ def test_ncm_windows_cover_all_target_positions():
 def test_cached_code_training_matches_uncached_training():
     from mariana.ncm.train import run_training
 
-    cfg, _, first = make_models(tiny_cfg(self_condition=0.0))
+    cfg, _, first = make_models(tiny_cfg(self_condition=0.0, dropout=0.2))
     _, _, second = make_models(cfg)
     second.load_state_dict(first.state_dict())
     prompt, target = make_batch(cfg, batch=4)

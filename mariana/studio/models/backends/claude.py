@@ -151,11 +151,19 @@ def stream(gateway, entry, request):
     model = endpoint.get("model") or DEFAULT_MODEL
     system, turns = split_messages(request.messages)
     arguments = {"model": model, "max_tokens": request.max_tokens, "messages": turns}
+    prompt_cache = bool(request.options.get("prompt_cache"))
     if system:
-        arguments["system"] = system
+        arguments["system"] = (
+            [{"type": "text", "text": system,
+              "cache_control": {"type": "ephemeral"}}]
+            if prompt_cache else system
+        )
     tools, aliases = anthropic_tools(request.options.get("tools"))
     native = bool(tools)
     if native:
+        if prompt_cache:
+            # One breakpoint after the tool block caches tools + system together.
+            tools = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
         arguments["tools"] = tools
     effort = request.options.get("effort")
     if effort in EFFORT_LEVELS:
@@ -190,6 +198,16 @@ def stream(gateway, entry, request):
         except anthropic.BadRequestError as error:
             # An endpoint that rejects native tools still gets the prompted JSON path.
             message = str(error).lower()
+            if prompt_cache and not emitted and "cache" in message:
+                prompt_cache = False
+                if system:
+                    arguments["system"] = system
+                if native:
+                    arguments["tools"] = [
+                        {key: value for key, value in tool.items() if key != "cache_control"}
+                        for tool in tools
+                    ]
+                continue
             if (native and not emitted
                     and any(word in message for word in ("tool", "schema", "function"))):
                 native = False
@@ -206,9 +224,16 @@ def stream(gateway, entry, request):
         yield done(usage={}, prompt_format="anthropic-messages", finish_reason="cancelled")
         return
     usage = final.usage
+    counts = {"prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+              "completion_tokens": int(getattr(usage, "output_tokens", 0) or 0)}
+    cached = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    written = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    if cached:
+        counts["cached_tokens"] = cached
+    if written:
+        counts["cache_write_tokens"] = written
     result = {
-        "usage": {"prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-                  "completion_tokens": int(getattr(usage, "output_tokens", 0) or 0)},
+        "usage": counts,
         "prompt_format": "anthropic-messages",
         "finish_reason": {"end_turn": "stop", "max_tokens": "length"}.get(
             final.stop_reason, final.stop_reason or "stop"),

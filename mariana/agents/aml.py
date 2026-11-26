@@ -1,4 +1,4 @@
-"""Agent Management Language (AML) v1.8.
+"""Agent Management Language (AML) v1.9.
 
 AML is a portable JSON (or YAML, when PyYAML is available) document that
 describes an agent as a directed flowchart plus abilities, schedules and run
@@ -22,8 +22,13 @@ from datetime import datetime, timedelta
 
 from .schema import schema_errors
 
-AML_VERSION = "1.8"
-SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8")
+AML_VERSION = "1.9"
+SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9")
+# The leader may plan a large team, but the runtime still governs how many model
+# and tool calls run at once.  Sixty-four keeps the thread and memory footprint
+# bounded on a laptop while covering broad repository-wide audits.
+MAX_SWARM_AGENTS = 64
+DEFAULT_SWARM_AGENTS = 16
 MAX_DOCUMENT_BYTES = 1_000_000
 
 FIELD_TYPES = (
@@ -103,8 +108,6 @@ NODE_TYPES = {
              "help": "Empty uses the member model. The leader plans, decides and synthesises."},
             {"key": "goal", "label": "Swarm goal", "type": "template", "rows": 5,
              "help": "The task the whole swarm must complete. Empty uses the previous node's output."},
-            {"key": "goal", "label": "Swarm goal", "type": "template", "rows": 5,
-             "help": "The task the whole swarm must complete. Empty uses the previous node's output."},
             {"key": "criteria", "label": "Acceptance criteria", "type": "template", "rows": 3,
              "help": "Optional checks the final answer must satisfy, one per line. Empty lets "
                      "the leader derive testable criteria from the goal."},
@@ -124,11 +127,14 @@ NODE_TYPES = {
                          ["high", "High"]],
              "help": "Ask models that support it to think longer while planning, working and "
                      "synthesising. Empty sends no reasoning override."},
+            {"key": "adaptive_effort", "label": "Adaptive reasoning", "type": "boolean",
+             "help": "Spend the configured effort on the first turn and the final answer; "
+                     "routine tool loops and peer reviews run at low effort."},
             {"key": "reflection", "label": "Self-check unfinished plans", "type": "boolean",
              "help": "Ask a member once to finish or justify plan steps that are still open "
                      "before it returns its answer."},
             {"key": "max_agents", "label": "Max agents", "type": "number",
-             "min": 1, "max": 8, "step": 1},
+             "min": 1, "max": MAX_SWARM_AGENTS, "step": 1},
             {"key": "max_steps", "label": "Max model rounds per agent", "type": "number",
              "min": 1, "max": 12, "step": 1},
             {"key": "max_seconds", "label": "Time budget (seconds)", "type": "number",
@@ -345,9 +351,17 @@ ABILITY_TYPES = {
     },
     "file.list": {
         "label": "List files", "icon": "≡",
-        "description": "List sandbox files with an optional glob pattern.",
+        "description": "List files and folders in a sandbox directory with an optional glob pattern.",
         "danger": False, "config": {"pattern": "*"},
-        "params": [{"key": "pattern", "label": "Pattern", "type": "text"}],
+        "params": [
+            {"key": "path", "label": "Folder", "type": "template", "rows": 1,
+             "help": "Relative to the sandbox; empty lists the top level."},
+            {"key": "pattern", "label": "Pattern", "type": "text",
+             "help": "A glob such as *.py; **/name recurses from the folder."},
+            {"key": "recursive", "label": "Recurse", "type": "boolean"},
+            {"key": "max_entries", "label": "Maximum entries", "type": "number",
+             "min": 1, "max": 1000, "step": 1},
+        ],
     },
     "file.edit": {
         "label": "Edit file", "icon": "✎",
@@ -369,7 +383,8 @@ ABILITY_TYPES = {
             {"key": "regex", "label": "Treat as a regular expression", "type": "boolean"},
             {"key": "case_sensitive", "label": "Match case", "type": "boolean"},
             {"key": "include", "label": "File glob", "type": "text",
-             "help": "For example *.py; empty searches every text file."},
+             "help": "For example *.py or src/*.cpp; comma-separates several globs. "
+                     "Empty searches every text file."},
             {"key": "max_results", "label": "Maximum matches", "type": "number",
              "min": 1, "max": 500, "step": 1},
         ],
@@ -380,7 +395,10 @@ ABILITY_TYPES = {
         "danger": False, "config": {"max_entries": 600},
         "params": [
             {"key": "max_entries", "label": "Maximum entries", "type": "number",
-             "min": 1, "max": 2000, "step": 1},
+             "min": 1, "max": 20000, "step": 1},
+            {"key": "depth", "label": "Maximum depth", "type": "number",
+             "min": 1, "max": 32, "step": 1,
+             "help": "Folders deeper than this are listed but not entered."},
         ],
     },
     "file.delete": {
@@ -484,8 +502,8 @@ DEFAULT_NODE_DATA = {
               "temperature": 0.3, "max_tokens": 1024, "fallback_model": ""},
     "swarm": {"model": "", "leader_model": "", "system": "", "goal": "",
               "criteria": "", "agents": [], "tools": [], "strategy": "auto", "rounds": 1,
-              "effort": "", "reflection": True,
-              "max_agents": 4, "max_steps": 6, "max_seconds": 240,
+              "effort": "", "adaptive_effort": True, "reflection": True,
+              "max_agents": 16, "max_steps": 6, "max_seconds": 240,
               "write": False, "memory": True, "ipc": True},
     "tool": {"ability": "", "input": {}},
     "condition": {"expression": "true"},
@@ -511,7 +529,7 @@ DEFAULT_SETTINGS = {
 }
 
 DEFAULT_SWARM = {
-    "max_agents": 6,
+    "max_agents": DEFAULT_SWARM_AGENTS,
     "max_steps": 8,
     "max_rounds": 2,
     "max_seconds": 300,
@@ -519,9 +537,11 @@ DEFAULT_SWARM = {
     "max_message_chars": 4000,
     "max_memory_entries": 120,
     "max_memory_chars": 8000,
-    "max_context_chars": 200000,
-    "max_agent_context_chars": 64000,
-    "max_context_item_chars": 24000,
+    "max_context_chars": 400000,
+    "max_agent_context_chars": 96000,
+    "max_context_item_chars": 32000,
+    "max_model_concurrency": 16,
+    "max_tool_concurrency": 32,
     "allow_write": False,
     "allow_ipc": True,
     "shared_memory": True,
@@ -699,8 +719,9 @@ def _swarm_policy(value) -> dict:
     for key in ("max_agents", "max_steps", "max_rounds", "max_seconds",
                 "max_messages", "max_message_chars", "max_memory_entries",
                 "max_memory_chars", "max_context_chars", "max_agent_context_chars",
-                "max_context_item_chars"):
+                "max_context_item_chars", "max_model_concurrency", "max_tool_concurrency"):
         result[key] = int(_number(value.get(key), float(DEFAULT_SWARM[key])))
+    result["max_agents"] = max(1, min(MAX_SWARM_AGENTS, result["max_agents"]))
     for key in ("allow_write", "allow_ipc", "shared_memory"):
         result[key] = value.get(key, DEFAULT_SWARM[key]) is True
     return result
@@ -751,13 +772,15 @@ def validate_agent(document: dict, known_agent_ids: set[str] | None = None) -> d
     if raw_swarm is not None and not isinstance(raw_swarm, dict):
         error("swarm must be a JSON object", field="swarm")
     policy = agent["swarm"]
-    for key, low, high in (("max_agents", 1, 12), ("max_steps", 1, 24),
+    for key, low, high in (("max_agents", 1, MAX_SWARM_AGENTS), ("max_steps", 1, 24),
                            ("max_rounds", 0, 4), ("max_seconds", 10, 3600),
                            ("max_messages", 0, 1000), ("max_message_chars", 200, 20000),
                            ("max_memory_entries", 0, 1000), ("max_memory_chars", 200, 100000),
                            ("max_context_chars", 0, 2_000_000),
                            ("max_agent_context_chars", 0, 500_000),
-                           ("max_context_item_chars", 500, 200_000)):
+                           ("max_context_item_chars", 500, 200_000),
+                           ("max_model_concurrency", 1, 64),
+                           ("max_tool_concurrency", 1, 128)):
         if not low <= policy[key] <= high:
             error(f"swarm.{key} must be between {low} and {high}", field="swarm")
     if isinstance(raw_swarm, dict):
@@ -961,7 +984,8 @@ def _validate_swarm_node(node: dict, data: dict, ability_types: dict[str, str], 
                     node=node_id, field="rounds")
     except (TypeError, ValueError):
         error(f"Swarm node {node_id} rounds must be a number", node=node_id, field="rounds")
-    for key, low, high in (("max_agents", 1, 8), ("max_steps", 1, 12), ("max_seconds", 10, 1800)):
+    for key, low, high in (("max_agents", 1, MAX_SWARM_AGENTS), ("max_steps", 1, 12),
+                           ("max_seconds", 10, 1800)):
         try:
             value = int(data.get(key, DEFAULT_NODE_DATA["swarm"][key]))
             if not low <= value <= high:
@@ -978,7 +1002,7 @@ def _validate_swarm_node(node: dict, data: dict, ability_types: dict[str, str], 
                         "by the document's swarm policy", node=node_id, field=key)
         except (TypeError, ValueError):
             error(f"Swarm node {node_id} {key} must be a number", node=node_id, field=key)
-    for key in ("write", "memory", "ipc", "reflection"):
+    for key in ("write", "memory", "ipc", "reflection", "adaptive_effort"):
         if key in data and not isinstance(data[key], bool):
             error(f"Swarm node {node_id} {key} must be true or false", node=node_id, field=key)
     effort = str(data.get("effort") or "")

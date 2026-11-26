@@ -8,6 +8,7 @@ readable documents that can evolve with the code.
 | --- | --- | --- | --- |
 | [Sprint-DRV](sprint-drv.md) | Single-pass training for the hybrid diffusion-AR model, with the legacy two-pass objective as its baseline | `mariana/train.py` | [fast-training.md](../fast-training.md) |
 | [SAINT](saint.md) | Adaptive hierarchical discrete/continuous thought memory for a byte-level model | `mariana/saint.py` | [latent-language.md](../latent-language.md) |
+| [AXIOM](axiom.md) | Connector-algebra and domain-adaptive corpus codec: English operators, lossless dictionaries for any text, DNA/protein packing, identity fallback | `mariana/axiom.py` | [axiom.md](../axiom.md) |
 | [NCM](ncm.md) | Multiscale residual VQ and parallel next-concept generation | `mariana/ncm/` | [ncm.md](../ncm.md) |
 | [AML and AMP](aml-amp.md) | Portable agent document and local HTTP/JSON runtime protocol | `mariana/agents/` | [agentic.md](../agentic.md) |
 
@@ -34,7 +35,8 @@ readable documents that can evolve with the code.
 - A **checkpoint** is a Mariana `.pt` file. A **model** is any catalog entry,
   including a remote endpoint.
 - **AR** means the ordinary causal autoregressive path. **Draft** means the
-  block-wise diffusion path. **Memory** is the SAINT latent summary.
+  block-wise diffusion path. **Memory** is the SAINT latent summary. **Wire
+  form** is the AXIOM byte sequence; **display form** is its glyph view.
 - File and flag names match the implementation; if they diverge, the code wins.
 
 ## Citation
@@ -58,10 +60,10 @@ For the project as a whole:
 
 ```bibtex
 @software{mariana2026,
-  title   = {Mariana: a hybrid diffusion-AR language model and local studio},
+  title   = {Mariana: One-stop Research and Development Studio for language models},
   author  = {{Mariana contributors}},
   year    = {2026},
-  version = {2.3.2},
+  version = {2.3.3},
   url     = {https://github.com/CYFARE/Mariana}
 }
 ```

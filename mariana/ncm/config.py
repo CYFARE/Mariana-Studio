@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 
 
@@ -55,6 +56,10 @@ class NCMConfig:
     self_condition: float = 0.25
     consistency_weight: float = 0.05
     prompt_dropout: float = 0.1
+    prefix_noise: float = 0.0
+    prefix_dropout: float = 0.0
+    byte_weight: float = 0.0
+    free_byte_weight: float = 0.0
 
     def __post_init__(self):
         if self.levels is None:
@@ -86,16 +91,20 @@ class NCMConfig:
             raise ValueError("attention head dimensions must be even for RoPE")
         for name in (
             "nested_dropout", "full_recon_weight", "corruption", "self_condition",
-            "prompt_dropout", "level_alpha",
+            "prompt_dropout", "level_alpha", "prefix_dropout",
         ):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if not math.isfinite(self.prefix_noise) or self.prefix_noise < 0.0:
+            raise ValueError("prefix_noise must be finite and non-negative")
         if not 0.0 <= self.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
-        for name in ("commitment", "dead_threshold", "refiner_weight", "consistency_weight"):
-            if getattr(self, name) < 0.0:
-                raise ValueError(f"{name} must be non-negative")
+        for name in ("commitment", "dead_threshold", "refiner_weight", "consistency_weight",
+                     "byte_weight", "free_byte_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         if min(self.bos_token, self.pad_token, self.mask_token) < 256:
             raise ValueError("special tokens must not overlap the byte vocabulary")
         if len({self.bos_token, self.pad_token, self.mask_token}) != 3:

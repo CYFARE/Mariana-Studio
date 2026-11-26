@@ -23,7 +23,9 @@ python -m mariana train --fast \
 Fast mode disables full-sequence `L_align`; `--legacy` restores it and can
 resume the same checkpoint. Compilation has startup cost, so omit `--compile`
 for very short runs. See `docs/fast-training.md` before comparing fast and
-legacy validation losses.
+legacy validation losses. On supported PyTorch builds, `--flex` evaluates the
+same block mask with FlexAttention; the early-training causal-only annealing
+now applies to that path as well.
 
 ## SAINT latent training
 
@@ -47,6 +49,44 @@ for either latent mode. Watch `lat_len`, `lat_reward`, `lat_grammar`, `lat_hier`
 and `lat_kl`, and run `scripts/latent_ablation.py`; do not treat lower training
 loss alone as evidence of useful thought. See `docs/latent-language.md`.
 
+## AXIOM: train on the corpus codec
+
+`--axiom` shortens the corpus before training. English connectors become
+one-byte mathematical operators; a corpus-derived dictionary turns frequent
+words, Unicode symbols, emoji and CJK n-grams into single-byte codes; DNA and
+protein corpora are bit-packed; binary or incompressible data is passed
+through unchanged. The model and objectives are unchanged, so it combines with
+`--fast`, `--legacy`, `--moe` and `--latent`:
+
+```bash
+python -m mariana train --axiom --fast \
+    --data trained-model/teacher-corpus.txt \
+    --checkpoint trained-model/mariana-axiom.pt \
+    --steps 5000 --eval-every 250 --no-gen --device cuda
+
+# DNA/FASTA: auto detects and packs 4 bits per base.
+python -m mariana train --axiom --data genome.fasta \
+    --checkpoint trained-model/mariana-dna.pt --steps 5000 --no-gen
+
+# Non-English or exact text: dictionary-only, no semantic rewriting.
+python -m mariana train --axiom --axiom-profile lossless --data mixed.txt \
+    --checkpoint trained-model/mariana-mixed.pt --steps 5000 --no-gen
+```
+
+The default `auto` profile detects text/language/sequence and chooses the
+smallest codec; `compact` and `reversible` force the English connector layer;
+`lossless` never rewrites semantics. The log prints the selected codec and the
+source/prepared byte counts before the first step, and the prepared corpus is
+cached under `trained-model/axiom/`. `gen` encodes its prompt and decodes its
+output with the checkpoint's stored codec automatically; add `--show-axiom` to
+see the surface view. `--gen-len` counts wire bytes, so the same content needs
+fewer of them than in a plain-byte checkpoint. Sequence checkpoints generate
+record-framed data; free-form generation from them is best-effort.
+
+AXIOM is a DRV-LM corpus codec and is not available with `--ncm`. See
+`docs/axiom.md` and the [whitepaper](docs/whitepapers/axiom.md); do not compare
+wire-byte raw loss with plain-byte loss, use bits per original byte.
+
 ## NCM: single-command two-stage training
 
 `--ncm` trains the multiscale tokenizer and then the next-concept generator;
@@ -60,17 +100,56 @@ Generate with `python mariana.py gen --ncm --checkpoint trained-model/mariana-nc
 Add `--resume` to the training command to resume the generator when its checkpoint
 exists, or the tokenizer otherwise. Format-1 generator checkpoints retain their
 trained head type and reset their optimizer and LR schedule for the corrected objective.
-Generator evaluation prints `FREE` greedy code accuracy per level; use it together
-with teacher-forced `VAL` loss to detect coarse-to-fine error accumulation. Use
-`python mariana.py ncm --help` for stage-specific training and advanced inference
-options; see `docs/ncm.md`.
+Generator evaluation prints `FREE` greedy code accuracy per level and `free_bytes`
+(bytes matching the tokenizer's own decode); use them together with teacher-forced
+`VAL` loss to detect coarse-to-fine error accumulation. The generator LR default is
+`1e-3`. Short runs work better with a shorter hierarchy such as
+`--ncm-levels 64,96,128` than with the 12-level paper ladder; see the few-run section
+in `docs/ncm.md`. Use `python mariana.py ncm --help` for stage-specific training and
+advanced inference options.
+
+## Resume, interruption, and failure handling
+
+For DRV-LM, `--resume` continues the checkpoint named by `--checkpoint`; it
+does not fall back to a fresh model when that file is missing. It also refuses
+an NCM checkpoint, and `--steps` counts absolute positions, so it must be
+larger than the saved step (add the number of new steps rather than repeating
+the old total). `--init-from` and `--resume` are mutually exclusive: initialize
+new weights from a checkpoint, or continue an existing run.
+
+Checkpoints are written to a temporary file and atomically replaced, so a crash
+or a full disk during a save leaves the previous checkpoint readable. Ctrl+C
+saves the last completed optimizer step before exiting. In Studio, **Pause &
+save** does the same at the next step boundary, and a pause is reported only
+when the trainer exits successfully; a trainer that crashes while pausing is
+shown as failed.
+
+The trainer validates architecture arguments before allocating the model:
+`--dim` must be divisible by `--heads`, the resulting head size must be even for
+RoPE, `--ctx` must be at least 2, and block size and loop count must be positive.
+Studio's command builder applies the same checks before the training subprocess
+starts, so invalid geometry appears as an actionable job error rather than a
+model-construction traceback. Request-time checkpoint checks reject an
+unreadable or wrong-stage checkpoint before the job starts, and a resume shape
+mismatch reports the configuration hint instead of a raw traceback. Starting a
+run reads and backs up checkpoints outside the job-state lock, so progress
+polling stays responsive during large backups.
+
+A single non-finite DRV-LM gradient update is skipped with a
+`WARNING: non-finite gradients` log line instead of writing NaNs into the
+weights; if the warning repeats, lower the learning rate or inspect the corpus.
+NCM keeps its documented policy and aborts unscaled training on non-finite
+gradients (fp16 GradScaler still skips its own overflow steps); see
+[`docs/ncm.md`](docs/ncm.md).
 
 ## GUI: folder → training → chat
 
 Run `python mariana.py studio` (or the `--gui` compatibility alias) and open the
 local Mariana Studio page. Select a corpus folder, choose Sprint-DRV, Legacy DRV,
 or NCM, configure the model, and watch the data-first training/validation loss
-chart, stage progress, and throughput. Raw terminal logs are collapsed by default
+chart, stage progress, and throughput. DRV-LM runs expose the **AXIOM connector
+algebra** toggle and profile in **Advanced settings**. Raw terminal logs are
+collapsed by default
 and can be shown with **Logs and command**. The
 corpus scanner is recursive and supports readable text,
 Markdown, source code, CSV, JSON/JSONL, HTML, XML, extensionless files, and Parquet.

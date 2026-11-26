@@ -165,7 +165,7 @@ def test_templates_and_validation():
     assert "missing ability" in " ".join(validate_agent(bad_ability)["errors"])
     legacy = minimal_agent()
     legacy["aml"] = "1.0"
-    assert validate_agent(legacy)["ok"] and validate_agent(legacy)["agent"]["aml"] == "1.8"
+    assert validate_agent(legacy)["ok"] and validate_agent(legacy)["agent"]["aml"] == "1.9"
 
 
 def test_validation_issues_name_the_node_and_field():
@@ -1190,6 +1190,10 @@ def test_swarm_node_validates_and_runs_in_test_mode(manager):
     assert result["ok"] is False
     assert "swarm.allow_write" in " ".join(result["errors"])
     document["nodes"][1]["data"]["write"] = False
+    document["nodes"][1]["data"]["adaptive_effort"] = "yes"
+    assert validate_agent(document)["ok"] is False
+    document["nodes"][1]["data"]["adaptive_effort"] = False
+    assert validate_agent(document)["ok"] is True
 
     saved = manager.save_agent(document)["agent"]
     assert saved["swarm"]["allow_write"] is False and saved["swarm"]["max_agents"] == 3
@@ -1205,10 +1209,51 @@ def test_swarm_node_validates_and_runs_in_test_mode(manager):
         manager.inject_swarm_message(run["id"], {"text": "stop"})
 
 
+def test_swarm_node_forwards_adaptive_effort_to_the_coordinator(monkeypatch):
+    captured = {}
+
+    class FakeCoordinator:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self, agents=None, strategy="auto", rounds=0):
+            return {"ok": True, "final": "done"}
+
+    class FakeRun:
+        dry_run = False
+        timeout = 60.0
+
+        def __init__(self):
+            self.stop = threading.Event()
+            self.swarm_coordinator = None
+
+        def event(self, *args, **kwargs):
+            pass
+
+        def active_elapsed(self):
+            return 0.0
+
+        def check_limits(self, timeout):
+            pass
+
+        def set_swarm(self, snapshot):
+            self.swarm = snapshot
+
+    monkeypatch.setattr(runtime, "SwarmCoordinator", FakeCoordinator)
+    output = runtime._run_swarm_node(
+        {"id": "team", "type": "swarm"},
+        {"goal": "answer", "effort": "high", "adaptive_effort": False},
+        {"last": ""}, FakeRun(), {"id": "probe", "model": "fake", "swarm": {}},
+        None, None, {})
+    assert output["text"] == "done"
+    assert captured["effort"] == "high"
+    assert captured["adaptive_effort"] is False
+
+
 def test_protocol_metadata_is_complete_for_the_designer(manager):
     protocol = manager.protocol_metadata()
     assert protocol["protocol"] == "AMP" and protocol["version"] == "1.10"
-    assert protocol["aml_version"] == "1.8"
+    assert protocol["aml_version"] == "1.9"
     assert protocol["tool_calling"]["formats"] == ["json", "dsml", "native"]
     assert "openai-compatible" in protocol["tool_calling"]["native_backends"]
     assert "validation" in protocol["event_types"]
@@ -1217,8 +1262,9 @@ def test_protocol_metadata_is_complete_for_the_designer(manager):
     allowed = set(protocol["field_types"])
     for name, node in protocol["node_types"].items():
         assert {"label", "description", "category", "icon", "fields", "defaults"} <= set(node), name
-        keys = {field["key"] for field in node["fields"]}
-        assert set(node["defaults"]) == keys, name  # every default is editable, every field has one
+        keys = [field["key"] for field in node["fields"]]
+        assert len(keys) == len(set(keys)), name  # a field is listed once
+        assert set(node["defaults"]) == set(keys), name  # every default is editable, every field has one
         for field in node["fields"]:
             assert field["type"] in allowed and field["label"], (name, field)
             if field["type"] == "select":
@@ -1246,7 +1292,7 @@ def test_protocol_metadata_is_complete_for_the_designer(manager):
     assert "success_criteria" in swarm["leader_protocol"]["plan"]
     defaults = protocol["node_types"]["swarm"]["defaults"]
     assert defaults["criteria"] == "" and defaults["reflection"] is True
-    assert defaults["effort"] == ""
+    assert defaults["effort"] == "" and defaults["adaptive_effort"] is True
     assert {"/api/agents/runs/{run_id}/swarm",
             "/api/agents/runs/{run_id}/swarm/messages"} <= paths
 

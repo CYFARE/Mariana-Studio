@@ -1,18 +1,19 @@
 cff-version: 1.2.0
 message: "If you use Mariana in your work, please cite this repository."
 type: software
-title: "Mariana: a hybrid diffusion-AR language model and local studio"
+title: "Mariana: One-stop Research and Development Studio for language models"
 abstract: >-
-  Mariana is a byte-level hybrid diffusion-autoregressive language model with
-  single-command training, generation, and lossless AR export, plus a local
-  Studio for training, chat, agents, and deployment. The repository includes
-  whitepapers for Sprint-DRV, SAINT, Next-Concept Modeling, and the AML/AMP
-  agent language and protocol.
+  Mariana is a one-stop research and development studio for language models:
+  a byte-level hybrid diffusion-autoregressive model with single-command
+  training, generation, and lossless AR export, plus a local Studio for
+  training, chat, agents, and deployment. The repository includes whitepapers
+  for Sprint-DRV, SAINT, AXIOM, Next-Concept Modeling, and the AML/AMP agent
+  language and protocol.
 authors:
   - name: "Mariana contributors"
 repository-code: "https://github.com/CYFARE/Mariana"
 license: AGPL-3.0-only
-version: "2.3.2"
+version: "2.3.3"
 keywords:
   - language-model
   - diffusion

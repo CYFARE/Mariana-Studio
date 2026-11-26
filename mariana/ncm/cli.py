@@ -66,6 +66,14 @@ def add_architecture(p):
     p.add_argument("--nested-dropout", type=float, default=0.5)
     p.add_argument("--corruption", type=float, default=0.5)
     p.add_argument("--self-condition", type=float, default=0.25)
+    p.add_argument("--prefix-noise", type=float, default=0.0,
+                   help="train with Gaussian noise on the cumulative prefix latent")
+    p.add_argument("--prefix-dropout", type=float, default=0.0,
+                   help="probability of zeroing the cumulative prefix latent while training")
+    p.add_argument("--byte-weight", type=float, default=0.0,
+                   help="weight of the decoder byte-reconstruction auxiliary loss")
+    p.add_argument("--free-byte-weight", type=float, default=0.0,
+                   help="weight of the byte loss on the model's own free-running code prefix")
 
 
 def build_parser():
@@ -86,7 +94,7 @@ def build_parser():
     p.add_argument("--tokenizer-steps", type=int, default=1000)
     p.add_argument("--tokenizer-batch", type=int)
     p.add_argument("--tokenizer-grad-accum", type=int)
-    p.add_argument("--generator-lr", type=float, default=3e-4)
+    p.add_argument("--generator-lr", type=float, default=1e-3)
     p.add_argument("--cache-codes", action="store_true", help="cache frozen tokenizer codes for repeated epochs")
     p.add_argument("--prompt", default="KING RICHARD III:\n")
     p.add_argument("--gen-len", type=int, default=50)
@@ -95,7 +103,7 @@ def build_parser():
     p = sub.add_parser("generator", help="train only stage 2: frozen-tokenizer next-concept generator")
     add_training(p, GENERATOR_PATH)
     add_compilation(p)
-    p.set_defaults(lr=3e-4)
+    p.set_defaults(lr=1e-3)
     p.add_argument("--tokenizer", default=TOKENIZER_PATH)
     p.add_argument("--cache-codes", action="store_true", help="cache frozen tokenizer codes for repeated epochs")
     p.add_argument("--dim", type=int)
@@ -104,6 +112,10 @@ def build_parser():
     p.add_argument("--dropout", type=float)
     p.add_argument("--corruption", type=float)
     p.add_argument("--self-condition", type=float)
+    p.add_argument("--prefix-noise", type=float)
+    p.add_argument("--prefix-dropout", type=float)
+    p.add_argument("--byte-weight", type=float)
+    p.add_argument("--free-byte-weight", type=float)
 
     p = sub.add_parser("gen", aliases=["generate"], help="generate a coarse-to-fine continuation")
     p.add_argument("--checkpoint", default=GENERATOR_PATH)
@@ -146,6 +158,8 @@ def cfg_from_args(args):
         refiner_layers=args.refiner_layers, generator_layers=args.generator_layers,
         dropout=args.dropout, nested_dropout=args.nested_dropout,
         corruption=args.corruption, self_condition=args.self_condition,
+        prefix_noise=args.prefix_noise, prefix_dropout=args.prefix_dropout,
+        byte_weight=args.byte_weight, free_byte_weight=args.free_byte_weight,
     )
 
 
@@ -256,7 +270,10 @@ def cmd_generator(args):
         cfg, _ = load_cfg(args.checkpoint if resuming else args.init_from, "generator")
     else:
         cfg, _ = load_cfg(args.tokenizer, "tokenizer")
-    for name in ("corruption", "self_condition"):
+    for name in (
+        "corruption", "self_condition", "prefix_noise", "prefix_dropout",
+        "byte_weight", "free_byte_weight",
+    ):
         value = getattr(args, name)
         if value is not None:
             setattr(cfg, name, value)

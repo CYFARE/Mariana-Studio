@@ -65,7 +65,7 @@ def test_amp_protocol_workflow(api):
     assert protocol["protocol"] == "AMP" and protocol["version"] == "1.10"
     assert "assistant_delta" in protocol["event_types"]
     assert "reasoning_delta" in protocol["event_types"]
-    assert protocol["aml_version"] == "1.8"
+    assert protocol["aml_version"] == "1.9"
     assert protocol["tool_calling"]["formats"] == ["json", "dsml", "native"]
     assert "swarm" in protocol["node_types"]
     assert protocol["swarm"]["node_type"] == "swarm"

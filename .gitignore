@@ -2,7 +2,7 @@
 .venv/
 venv/
 
-# Python caches.
+# Python caches: __pycache__ folders and CPython bytecode (.pyc/.pyo/.pyd).
 __pycache__/
 *.py[cod]
 .pytest_cache/

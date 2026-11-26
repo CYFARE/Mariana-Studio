@@ -134,7 +134,7 @@ def test_a_real_chat_swarm_streams_over_http(api):
     def answer(handler, payload):
         messages = payload.get("messages") or []
         system = messages[0]["content"] if messages else ""
-        if "Plan a small, focused team" in system:
+        if "Plan a focused team" in system:
             reply = json.dumps({
                 "strategy": "map_reduce", "rounds": 0,
                 "agents": [

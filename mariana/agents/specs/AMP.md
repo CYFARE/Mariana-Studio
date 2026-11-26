@@ -8,7 +8,7 @@ local automation suite.
 - Current version: `1.10` (a superset of `1.9`, `1.8`, `1.7`, `1.6`, `1.5`, `1.4`, `1.3`, `1.2`, `1.1` and `1.0`; see [Changes in 1.10](#12-changes-in-110))
 - Transport: HTTP/1.1, JSON bodies, UTF-8
 - Base path: `/api/agents`
-- Language: [Agent Management Language (AML) v1.8](./AML.md)
+- Language: [Agent Management Language (AML) v1.9](./AML.md)
 - Discovery: `GET /api/agents/protocol`
 - Server default: `http://127.0.0.1:8765`
 
@@ -32,7 +32,7 @@ instead of hardcoding the schema.
 {
   "protocol": "AMP",
   "version": "1.10",
-  "aml_version": "1.8",
+  "aml_version": "1.9",
   "tool_calling": {
     "formats": ["json", "dsml", "native"],
     "native_backends": ["openai-compatible", "anthropic", "ollama"],
@@ -66,9 +66,9 @@ instead of hardcoding the schema.
     "node_type": "swarm",
     "strategies": ["auto", "map_reduce", "peer_review", "debate", "pipeline"],
     "message_kinds": ["message", "request", "response", "review", "feedback", "status", "handoff"],
-    "policy": {"max_agents": 6, "max_steps": 8, "max_rounds": 2, "max_seconds": 300,
-               "max_messages": 200, "max_context_chars": 200000,
-               "max_agent_context_chars": 64000, "max_context_item_chars": 24000,
+    "policy": {"max_agents": 16, "max_steps": 8, "max_rounds": 2, "max_seconds": 300,
+               "max_messages": 200, "max_context_chars": 400000,
+               "max_agent_context_chars": 96000, "max_context_item_chars": 32000,
                "allow_write": false, "allow_ipc": true, "shared_memory": true},
     "leader_protocol": {"plan": "...", "reviews": "...", "continue": "...", "synthesis": "..."},
     "member_protocol": {"tool": "...", "say": "...", "memory": "...", "context": "...",
@@ -380,7 +380,7 @@ The same object is available on its own:
                 "issues": ["measure again"], "round": 1}],
   "changed_files": [],
   "usage": {"prompt_tokens": 1200, "completion_tokens": 340},
-  "context": {"capacity": 200000, "per_agent": 64000, "used": 24000, "free": 176000,
+  "context": {"capacity": 400000, "per_agent": 96000, "used": 24000, "free": 376000,
               "agents": {"profiler": 24000}},
   "context_items": 3,
   "context_handles": [{"handle": "ctx-1a2b3c4d5e", "kind": "tool", "label": "file.read result",
@@ -758,6 +758,15 @@ AMP 1.10 is additive; 1.9 clients keep working.
   long stream cannot push control events out of a reconnect snapshot.
 - Swarm events add the owning flow `node` id, so a UI can place a member update
   on the node that launched the swarm.
+- AML 1.9 adds `swarm.adaptive_effort`; discovery reports it with the other
+  swarm node fields.
+- Swarm policy now defaults to 16 agents and allows a ceiling of 64. The leader
+  chooses the team. `swarm_start` limits report the separate model and tool
+  concurrency caps (defaults 16 and 32), and teams larger than 12 are condensed
+  in parallel group summaries before the final synthesis.
+- Swarm snapshots, `swarm_end` events and run results add `cache`: tool-cache
+  `hits`, `misses`, `saved_seconds`, `entries`, `chars` and `inflight`, plus
+  `prompt_cached_tokens` and `prompt_cache_hit_rate`.
 
 ## 13. Changes in 1.9
 

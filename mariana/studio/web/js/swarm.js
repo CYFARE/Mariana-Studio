@@ -134,6 +134,7 @@
       }
     }
     if (snapshot.context && typeof snapshot.context === "object") meta.context = snapshot.context;
+    if (snapshot.cache && typeof snapshot.cache === "object") meta.cache = snapshot.cache;
     if (snapshot.timed_out) meta.timedOut = true;
     if (Array.isArray(snapshot.warnings) && snapshot.warnings.length) meta.warnings = snapshot.warnings;
     meta.messageCount = Math.max(swarm.messages.length, Number(meta.messageCount) || 0);
@@ -299,6 +300,7 @@
         if (event.reviews !== undefined) meta.reviewCount = event.reviews;
         if (event.blackboard !== undefined) meta.memoryCount = event.blackboard;
         if (Array.isArray(event.changed_files)) meta.changedFiles = event.changed_files.slice(0, 20);
+        if (event.cache && typeof event.cache === "object") meta.cache = event.cache;
         if (event.timed_out) meta.timedOut = true;
         if (event.assembled) meta.assembled = true;
         if (event.error) meta.error = event.error;
@@ -340,6 +342,7 @@
     if (summary.review_count !== undefined) meta.reviewCount = summary.review_count;
     if (summary.memory_count !== undefined) meta.memoryCount = summary.memory_count;
     if (summary.context && typeof summary.context === "object") meta.context = summary.context;
+    if (summary.cache && typeof summary.cache === "object") meta.cache = summary.cache;
     meta.messageCount = Math.max(swarm.messages.length, Number(meta.messageCount) || 0);
     meta.reviewCount = Math.max(swarm.reviews.length, Number(meta.reviewCount) || 0);
     meta.memoryCount = Math.max(swarm.memory.length, Number(meta.memoryCount) || 0);
@@ -389,6 +392,14 @@
           : partial ? "warning"
             : finished ? "completed" : "muted";
     const role = meta.strategy ? String(meta.strategy).replace(/_/g, " ") : "leader-planned";
+    const cache = meta.cache && typeof meta.cache === "object" ? meta.cache : null;
+    const cacheHits = cache ? Math.max(0, Number(cache.hits) || 0) : 0;
+    const cacheSaved = cache ? Math.max(0, Number(cache.saved_seconds) || 0) : 0;
+    const hotHits = cache ? Math.max(0, Number(cache.hot_hits) || 0) : 0;
+    const hotFiles = cache ? Math.max(0, Number(cache.hot_entries) || 0) : 0;
+    const promptRate = cache ? Math.max(0, Math.min(1, Number(cache.prompt_cache_hit_rate) || 0)) : 0;
+    const evidenceAnchors = cache ? Math.max(0, Number(cache.evidence_anchors) || 0) : 0;
+    const contextEpisodes = cache ? Math.max(0, Number(cache.context_episodes) || 0) : 0;
     const root = Studio.ui.render(container);
     const card = h("article", { class: `swarm-card${failed && !ok ? " failed" : ""}` });
     root.append(card);
@@ -426,6 +437,28 @@
         ? Studio.ui.badge(meta.tools.length
           ? `${meta.tools.length} tool${meta.tools.length === 1 ? "" : "s"}`
           : "no tools", "muted")
+        : null,
+      cacheHits
+        ? Studio.ui.badge(`${cacheHits} cache hit${cacheHits === 1 ? "" : "s"}`, "completed",
+          { title: (cacheSaved >= 1
+            ? `Repeated read-only results were reused; about ${cacheSaved.toFixed(1)} s saved.`
+            : "Repeated read-only tool results were reused within this run.")
+            + (hotFiles ? ` ${hotFiles} file${hotFiles === 1 ? "" : "s"} in the RAM hot cache`
+              + (hotHits ? ` (${hotHits} hit${hotHits === 1 ? "" : "s"}).` : ".") : "") })
+        : null,
+      promptRate > 0
+        ? Studio.ui.badge(`${Math.round(promptRate * 100)}% prompt cache`, "muted",
+          { title: "Share of prompt tokens served from the provider's prefix cache." })
+        : null,
+      evidenceAnchors
+        ? Studio.ui.badge(`${evidenceAnchors} evidence anchor${evidenceAnchors === 1 ? "" : "s"}`,
+          "muted",
+          { title: "Paths, lines, errors and commands reused from earlier tool results." })
+        : null,
+      contextEpisodes
+        ? Studio.ui.badge(`${contextEpisodes} compacted episode${contextEpisodes === 1 ? "" : "s"}`,
+          "muted",
+          { title: "Dropped turn groups replaced by anchor-preserving episode cards." })
         : null);
     card.append(metaRow);
 

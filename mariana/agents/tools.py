@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import difflib
 import http.client
 import io
 import ipaddress
@@ -32,6 +33,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .aml import ABILITY_TYPES, evaluate_expression
+from .hotcache import HOT_CACHE, read_cached
 from ..workspace import ensure_workspace
 
 PRIVATE_BLOCKLIST = {"169.254.169.254", "metadata.google.internal"}
@@ -44,7 +46,15 @@ MAX_FILE_BYTES = 2_000_000
 MAX_OUTPUT_CHARS = 64_000
 DEFAULT_TEXT_CHARS = 20_000
 MAX_SEARCH_RESULTS = 500
-MAX_SEARCH_FILES = 2000
+# A real project is larger than the old 2,000-file ceiling (Shotcut is ~3.5k
+# files).  Git grep handles big trees in milliseconds; the Python fallback is
+# bounded by this count and the hot cache makes repeated scans cheap.
+MAX_SEARCH_FILES = 50_000
+MAX_SEARCH_FILE_BYTES = 2_000_000
+MAX_TREE_ENTRIES = 20_000
+MAX_LIST_ENTRIES = 1_000
+MAX_READ_SCAN_BYTES = 64 * 1024 * 1024
+MAX_READ_STREAM_BYTES = 8 * 1024 * 1024
 READ_CHUNK_LINES = 200
 READ_CHUNK_CHARS = 3_600
 MAX_DIAGNOSTIC_FILES = 200
@@ -118,6 +128,269 @@ def nearest_tool_id(value: str, known) -> str:
         return by_key[key]
     matches = difflib.get_close_matches(key, list(by_key), n=1, cutoff=0.62)
     return by_key[matches[0]] if matches else ""
+
+
+def resolve_tool_id(value: str, known) -> str:
+    """An exact tool id, or one that differs only in punctuation and case.
+
+    Models sometimes spell ``file.search`` as ``file_search`` or ``fileSearch``.
+    Correcting that is safe because the normalised keys are identical; anything
+    less certain is left untouched so the model gets a suggestion instead of an
+    unintended tool running.
+    """
+    wanted = str(value or "").strip()
+    candidates = [str(item) for item in known]
+    if wanted in candidates:
+        return wanted
+    key = re.sub(r"[^a-z0-9]", "", wanted.lower())
+    if not key:
+        return ""
+    for candidate in candidates:
+        if re.sub(r"[^a-z0-9]", "", candidate.lower()) == key:
+            return candidate
+    return ""
+
+
+_PATH_ALIASES = frozenset({"path", "file", "filename", "filepath", "file_path", "target",
+                           "location", "dir", "folder"})
+
+# The argument spellings models commonly invent, mapped onto the keys the
+# abilities actually read.  Keeping this table next to the executor means the
+# IDE, the flow runtime and the swarm all accept the same calls.
+_TOOL_ALIASES = {
+    "http.fetch": {
+        "url": {"url", "uri", "link", "href", "endpoint", "address"},
+        "method": {"method", "verb"},
+        "headers": {"headers", "header"},
+        "body": {"body", "payload", "data"},
+        "extract": {"extract", "format", "as"},
+        "max_chars": {"maxchars", "max_chars", "maxlength", "max_length"},
+        "timeout": {"timeout", "timeout_seconds", "seconds"},
+    },
+    "news.headlines": {
+        "url": {"url", "feed", "feed_url"},
+        "query": {"query", "q", "topic", "search", "term", "keywords"},
+        "source": {"source", "provider"},
+        "region": {"region", "country", "locale"},
+        "language": {"language", "lang"},
+        "limit": {"limit", "count", "max", "max_results", "maxresults"},
+        "date": {"date", "day", "published"},
+        "include_summary": {"include_summary", "includesummary", "summary", "summaries"},
+        "timeout": {"timeout", "timeout_seconds", "seconds"},
+    },
+    "browser.fetch": {
+        "url": {"url", "uri", "link", "href", "endpoint", "address"},
+        "timeout": {"timeout", "timeout_seconds", "seconds"},
+        "max_chars": {"maxchars", "max_chars", "maxlength", "max_length"},
+    },
+    "file.read": {
+        "path": _PATH_ALIASES,
+        "start_line": {"start", "startline", "start_line", "from", "firstline",
+                       "first_line", "begin", "offset"},
+        "end_line": {"end", "endline", "end_line", "to", "lastline", "last_line", "stop"},
+        "limit": {"limit", "count", "lines", "num_lines"},
+    },
+    "file.write": {
+        "path": _PATH_ALIASES,
+        "content": {"content", "text", "body", "data", "value", "contents", "file_content"},
+    },
+    "file.edit": {
+        "path": _PATH_ALIASES,
+        "old": {"old", "oldstring", "old_string", "oldtext", "old_text", "find",
+                "search", "before"},
+        "new": {"new", "newstring", "new_string", "newtext", "new_text",
+                "replace", "replacement", "after", "with"},
+        "replace_all": {"replaceall", "replace_all", "all"},
+    },
+    "file.delete": {"path": _PATH_ALIASES},
+    "file.list": {
+        "path": _PATH_ALIASES,
+        "pattern": {"pattern", "glob", "include", "filter", "file_pattern"},
+        "recursive": {"recursive", "recurse", "deep"},
+        "max_entries": {"maxentries", "max_entries", "limit", "count", "max"},
+    },
+    "file.tree": {
+        "path": _PATH_ALIASES,
+        "max_entries": {"maxentries", "max_entries", "limit", "count", "max"},
+        "depth": {"depth", "max_depth", "maxdepth", "levels"},
+    },
+    "file.search": {
+        "query": {"query", "q", "search", "term", "needle", "text", "expression"},
+        "include": {"include", "include_pattern", "includepattern", "glob", "pattern",
+                    "filepattern", "file_pattern", "path_glob", "filter"},
+        "max_results": {"maxresults", "maxresult", "max_results", "max", "limit", "count",
+                        "take"},
+    },
+    "code.diagnostics": {"path": _PATH_ALIASES},
+    "git.inspect": {
+        "path": _PATH_ALIASES,
+        "action": {"action", "command", "op", "mode", "subcommand"},
+        "limit": {"limit", "count", "max", "number"},
+        "max_chars": {"maxchars", "max_chars", "maxlength", "max_length"},
+    },
+    "csv.read": {
+        "path": _PATH_ALIASES,
+        "delimiter": {"delimiter", "sep", "separator"},
+        "header": {"header", "headers", "has_header"},
+        "max_rows": {"maxrows", "max_rows", "limit", "rows"},
+    },
+    "sqlite.query": {
+        "path": _PATH_ALIASES,
+        "sql": {"sql", "query", "statement", "sql_query"},
+        "params": {"params", "parameters", "bind", "values"},
+        "max_rows": {"maxrows", "max_rows", "limit", "rows"},
+        "timeout": {"timeout", "timeout_seconds", "seconds"},
+    },
+    "shell.exec": {
+        "command": {"command", "cmd", "shell", "script", "line"},
+        "timeout": {"timeout", "timeout_seconds", "seconds"},
+    },
+    "math.eval": {"expression": {"expression", "expr", "formula", "math", "input"}},
+    "memory": {
+        "action": {"action", "op", "operation"},
+        "key": {"key", "name", "id"},
+        "value": {"value", "content", "text", "data"},
+    },
+    "skill.read": {"name": {"name", "id", "skill", "skill_id", "skillid"}},
+    "file.inspect": {"path": _PATH_ALIASES},
+}
+
+# The key a bare string argument means for each tool ({"tool": "file.read",
+# "input": "src/main.py"} is a common model shortcut).
+_TOOL_PRIMARY_ARGUMENT = {
+    "http.fetch": "url", "news.headlines": "query", "browser.fetch": "url",
+    "file.read": "path", "file.write": "path", "file.edit": "path",
+    "file.delete": "path", "file.list": "path", "file.tree": "path",
+    "file.search": "query", "code.diagnostics": "path", "git.inspect": "path",
+    "csv.read": "path", "sqlite.query": "sql", "shell.exec": "command",
+    "math.eval": "expression", "skill.read": "name", "file.inspect": "path",
+}
+
+# Keys every call to the tool needs before it can do useful work.  Catching a
+# missing one here produces a precise correction prompt instead of a failed
+# execution that the model has to diagnose from an error string.
+_REQUIRED_TOOL_INPUTS = {
+    "http.fetch": ("url",), "browser.fetch": ("url",),
+    "file.read": ("path",), "file.write": ("path", "content"),
+    "file.edit": ("path", "old", "new"), "file.delete": ("path",),
+    "file.search": ("query",), "sqlite.query": ("sql",),
+    "shell.exec": ("command",), "math.eval": ("expression",),
+    "csv.read": ("path",), "skill.read": ("name",), "file.inspect": ("path",),
+}
+
+_TOOL_INT_ARGUMENTS = frozenset({
+    "start_line", "end_line", "limit", "max_results", "max_entries", "depth",
+    "timeout", "max_chars", "max_rows", "max_agents", "max_steps", "max_seconds",
+    "rounds", "max_tokens", "rows", "count",
+})
+_TOOL_FLAG_ARGUMENTS = frozenset({
+    "regex", "case_sensitive", "recursive", "replace_all", "staged", "header",
+    "include_summary", "write", "memory", "ipc", "translate",
+})
+_TOOL_LIST_ARGUMENTS = frozenset({"tasks", "agents", "tools", "writes", "headers", "params"})
+_STRIPPED_STRING_ARGUMENTS = frozenset({
+    "path", "query", "include", "pattern", "command", "url", "sql", "expression",
+    "name", "old", "new", "action",
+})
+
+
+def normalise_tool_arguments(tool_id: str, arguments) -> dict:
+    """Map the argument spellings models use onto the ability's real keys.
+
+    A missing ``file_path`` or a camelCase ``startLine`` is a model habit, not a
+    tool failure.  Normalising here also lets the read cache deduplicate calls
+    that were semantically identical but spelled differently, and makes the IDE,
+    the flow runtime and the swarm behave the same way.
+    """
+    if isinstance(arguments, str):
+        text = arguments.strip()
+        try:
+            parsed = json.loads(text) if text[:1] in {"{", "["} else None
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            arguments = parsed
+        elif isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+            arguments = parsed[0]
+        else:
+            primary = _TOOL_PRIMARY_ARGUMENT.get(tool_id)
+            arguments = {primary: arguments} if primary else {"input": arguments}
+    if not isinstance(arguments, dict):
+        arguments = {"input": arguments}
+    result = dict(arguments)
+    key_lookup = {re.sub(r"[-_\s]", "", str(key)).lower(): key for key in result}
+    for canonical, spellings in _TOOL_ALIASES.get(tool_id, {}).items():
+        if canonical in result:
+            continue
+        for spelling in spellings:
+            original = key_lookup.get(re.sub(r"[-_\s]", "", str(spelling)).lower())
+            if original is not None and original in result:
+                result[canonical] = result.pop(original)
+                break
+    primary = _TOOL_PRIMARY_ARGUMENT.get(tool_id)
+    if primary and primary not in result:
+        # Many models send a bare string as the only argument.
+        for key in ("input", "file", "value"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                result[primary] = value
+                result.pop(key, None)
+                break
+    for key in list(result):
+        value = result[key]
+        if isinstance(value, str) and key in _STRIPPED_STRING_ARGUMENTS:
+            stripped = value.strip()
+            if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "`'\"":
+                stripped = stripped[1:-1]
+            result[key] = stripped
+        if key in {"path", "include", "pattern"} and isinstance(result[key], str):
+            result[key] = result[key].replace("\\", "/")
+    for key in _TOOL_LIST_ARGUMENTS:
+        value = result.get(key)
+        if isinstance(value, str) and value.strip()[:1] in {"[", "{"}:
+            try:
+                result[key] = json.loads(value)
+            except (TypeError, ValueError):
+                pass
+    for key in _TOOL_INT_ARGUMENTS:
+        if key in result and not isinstance(result[key], (int, float)):
+            try:
+                result[key] = int(float(str(result[key]).strip()))
+            except (TypeError, ValueError):
+                pass
+    for key in _TOOL_FLAG_ARGUMENTS:
+        if key in result and not isinstance(result[key], bool):
+            text = str(result[key]).strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                result[key] = True
+            elif text in {"0", "false", "no", "off"}:
+                result[key] = False
+    if tool_id == "file.read" and "limit" in result and "end_line" not in result:
+        start = result.get("start_line")
+        count = result.get("limit")
+        if isinstance(start, int) and isinstance(count, int) and count > 0:
+            result["end_line"] = start + count - 1
+            result.pop("limit", None)
+    return result
+
+
+def missing_required_arguments(tool_id: str, arguments) -> list[str]:
+    """Required input keys the call omitted or left blank."""
+    required = _REQUIRED_TOOL_INPUTS.get(tool_id, ())
+    if not required:
+        return []
+    values = arguments if isinstance(arguments, dict) else {}
+    missing = []
+    for key in required:
+        value = values.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(key)
+    return missing
+
+
+def required_arguments(tool_id: str) -> tuple[str, ...]:
+    """The keys a model must provide for this tool (for correction prompts)."""
+    return _REQUIRED_TOOL_INPUTS.get(tool_id, ())
 
 
 def describe_abilities() -> dict:
@@ -295,15 +568,34 @@ def _truthy(value, default: bool = False) -> bool:
     return bool(value)
 
 
-def _text_bytes(path: Path) -> bytes | None:
-    """Read a workspace file when it is small and textual, else ``None``."""
-    try:
-        if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
-            return None
-        data = path.read_bytes()
-    except OSError:
-        return None
-    return None if b"\x00" in data[:4096] else data
+_SHELL_READ_ONLY = frozenset({
+    "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "find", "wc",
+    "pwd", "tree", "stat", "file", "du", "df", "which", "whereis", "echo",
+})
+_GIT_READ_ONLY = frozenset({
+    "status", "diff", "log", "show", "grep", "ls-files", "rev-parse", "blame",
+    "describe", "shortlog", "branch", "remote", "tag",
+})
+
+
+def _shell_may_write(command: str) -> bool:
+    """Whether a shell command may change files and must invalidate the cache."""
+    parts = str(command or "").strip().split()
+    if not parts:
+        return True
+    head = os.path.basename(parts[0])
+    if head in _SHELL_READ_ONLY:
+        return False
+    if head == "git":
+        return len(parts) < 2 or parts[1] not in _GIT_READ_ONLY
+    return True
+
+
+def _text_bytes(path: Path, max_bytes: int = MAX_SEARCH_FILE_BYTES) -> bytes | None:
+    """Read a small textual file through the process-wide hot cache."""
+    data, _ = read_cached(
+        path, max_bytes, accept=lambda value: b"\x00" not in value[:4096])
+    return data
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -315,6 +607,7 @@ def _write_text_atomic(path: Path, text: str) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+    HOT_CACHE.invalidate(str(path))
 
 
 def _pyflakes_issues(text: str, relative: str) -> list[dict]:
@@ -442,6 +735,130 @@ class _AbilityRunner:
             except ValueError:
                 continue
         return False
+
+    @staticmethod
+    def _clean_path(value) -> str:
+        """A model-supplied path without quotes, ``./`` noise or Windows slashes."""
+        text = str(value or "").strip().strip("`'\"")
+        if text.startswith("file://"):
+            text = urllib.parse.unquote(text[7:])
+        text = text.replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        return text
+
+    def _suggest_path(self, value: str, limit: int = 3) -> list[str]:
+        """Close existing paths, so a missing file does not become a dead end."""
+        target = self._clean_path(value)
+        if not target:
+            return []
+        candidates = []
+        try:
+            for path in self._walk_files():
+                try:
+                    candidates.append(path.relative_to(self.files).as_posix())
+                except ValueError:
+                    continue
+                if len(candidates) >= 5_000:
+                    break
+        except OSError:
+            pass
+        close = difflib.get_close_matches(target, candidates, n=limit, cutoff=0.55)
+        if close:
+            return close
+        base = Path(target).name
+        return [item for item in candidates if Path(item).name == base][:limit]
+
+    def _missing_path_message(self, path: Path) -> str:
+        relative = self._relative(path)
+        suggestions = self._suggest_path(relative)
+        nearby = []
+        parent = path.parent
+        if parent.is_dir():
+            try:
+                nearby = [item.name + ("/" if item.is_dir() else "")
+                          for item in sorted(parent.iterdir())[:12]
+                          if not item.name.startswith(".")]
+            except OSError:
+                nearby = []
+        message = f"File not found: {relative}."
+        if suggestions:
+            message += " Did you mean: " + ", ".join(suggestions) + "?"
+        if nearby:
+            message += " Nearby: " + ", ".join(nearby) + "."
+        if not suggestions and not nearby:
+            message += " Use file.tree or file.list to find the right path."
+        return message
+
+    def _directory_listing(self, path: Path, limit: int = 200) -> dict:
+        entries = []
+        truncated = False
+        try:
+            children = sorted(path.iterdir(),
+                              key=lambda item: (not item.is_dir(), item.name.lower()))
+        except OSError as error:
+            raise ToolError(f"Cannot list {self._relative(path)}: {error}") from error
+        for child in children:
+            if len(entries) >= limit:
+                truncated = True
+                break
+            if child.name == ".mariana-ide.json":
+                continue
+            try:
+                resolved = child.resolve()
+                resolved.relative_to(self.files)
+            except (OSError, ValueError):
+                continue
+            if self._denied(resolved):
+                continue
+            if resolved.is_dir():
+                entries.append({"path": self._relative(child) + "/", "type": "dir"})
+            elif resolved.is_file():
+                try:
+                    entries.append({"path": self._relative(child), "type": "file",
+                                    "bytes": resolved.stat().st_size})
+                except OSError:
+                    continue
+        return {"path": self._relative(path), "directory": True, "entries": entries,
+                "truncated": truncated,
+                "hint": "This path is a directory. Use file.tree or pass a file path."}
+
+    def _relative(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.files).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _sandbox_path(self, value: str, for_write: bool = False) -> Path:
+        raw = self._clean_path(value)
+        if not raw:
+            raise ToolError("A file path is required")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.files / candidate
+            # Models often prefix paths with the project folder name; accept that
+            # spelling when the direct path does not exist.
+            prefix = f"{self.files.name}/"
+            if not candidate.exists() and raw.startswith(prefix):
+                alternative = self.files / raw[len(prefix):]
+                if alternative.exists() or (for_write and alternative.parent.exists()):
+                    candidate = alternative
+        try:
+            candidate = candidate.resolve(strict=False)
+        except OSError as error:
+            raise ToolError(f"Cannot resolve {raw}: {error}") from error
+        try:
+            candidate.relative_to(self.files)
+        except ValueError:
+            raise ToolError(
+                "File abilities are restricted to paths inside the file sandbox; "
+                f"{raw} resolves outside {self.files}"
+            ) from None
+        if self._denied(candidate):
+            raise ToolError("This folder is private to Mariana Studio")
+        if for_write and not self.dry_run:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
 
     def _walk_paths(self):
         """Paths under the sandbox, pruning ignored folders and denied subtrees."""
@@ -841,33 +1258,85 @@ class _AbilityRunner:
                     "Private addresses are blocked; set allow_private on this ability to opt in"
                 )
 
-    def _sandbox_path(self, value: str, for_write: bool = False) -> Path:
-        if not value:
-            raise ToolError("A file path is required")
-        candidate = Path(value)
-        if not candidate.is_absolute():
-            candidate = self.files / candidate
-        if candidate.is_symlink():
-            raise ToolError("Files reached through a symlink are not editable")
-        candidate = candidate.resolve()
+    def _stream_read(self, path: Path, relative: str, start: int, end: int) -> dict:
+        """Read a large file line by line, never loading it into memory."""
+        selected: list[str] = []
+        used = 0
+        midline = False
+        included_end = start
+        has_more = False
         try:
-            candidate.relative_to(self.files)
-        except ValueError:
-            raise ToolError("File abilities are restricted to paths inside the file sandbox")
-        if self._denied(candidate):
-            raise ToolError("This folder is private to Mariana Studio")
-        if for_write and not self.dry_run:
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-        return candidate
+            with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+                for number, line in enumerate(handle, 1):
+                    if number < start:
+                        continue
+                    if number > end:
+                        has_more = True
+                        break
+                    if not selected and len(line) > READ_CHUNK_CHARS:
+                        selected.append(line[:READ_CHUNK_CHARS])
+                        midline = True
+                        has_more = True
+                        included_end = number
+                        break
+                    if selected and used + len(line) > READ_CHUNK_CHARS:
+                        has_more = True
+                        break
+                    selected.append(line)
+                    used += len(line)
+                    included_end = number
+                    if used >= READ_CHUNK_CHARS:
+                        has_more = True
+                        break
+        except OSError as error:
+            raise ToolError(f"Cannot read {relative}: {error}") from error
+        body = "".join(selected)
+        result = {
+            "path": relative, "content": body, "start_line": start,
+            "end_line": included_end, "truncated": has_more, "large_file": True,
+            "total_lines": None,
+        }
+        if not selected:
+            result["hint"] = (
+                f"Line {start:,} is past the end of {relative}; read from a smaller "
+                "start_line or use file.search."
+            )
+        elif has_more and not midline:
+            result["next_start_line"] = included_end + 1
+        if midline:
+            result["content_cut_midline"] = True
+            result["hint"] = (
+                "This line is longer than the read budget; use file.search to inspect "
+                "the rest instead of re-reading the same line."
+            )
+        return result
 
     def file_read(self, params: dict, context: dict) -> dict:
         path = self._sandbox_path(str(params.get("path") or params.get("input") or ""))
+        relative = self._relative(path)
+        if path.is_dir():
+            return self._directory_listing(path)
         if not path.is_file():
-            raise ToolError(f"File not found: {path.relative_to(self.files)}")
-        if path.stat().st_size > MAX_FILE_BYTES:
-            raise ToolError("File exceeds the 2 MB ability limit")
-        content = path.read_bytes().decode("utf-8", errors="replace")
-        lines = content.splitlines(keepends=True)
+            raise ToolError(self._missing_path_message(path))
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            raise ToolError(f"Cannot stat {relative}: {error}") from error
+        if size > MAX_READ_SCAN_BYTES:
+            raise ToolError(
+                f"{relative} is {size / 1e6:.1f} MB, above the "
+                f"{MAX_READ_SCAN_BYTES / 1e6:.0f} MB read limit; use file.search or "
+                "git.inspect to inspect it."
+            )
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(4096)
+        except OSError as error:
+            raise ToolError(f"Cannot read {relative}: {error}") from error
+        if b"\x00" in head:
+            return {"path": relative, "binary": True, "bytes": size,
+                    "hint": "This is a binary file; use file.search for text matches or "
+                            "another tool that understands its format."}
         try:
             start = max(1, int(params.get("start_line") or 1))
         except (TypeError, ValueError):
@@ -876,6 +1345,18 @@ class _AbilityRunner:
             end = int(params.get("end_line") or start + READ_CHUNK_LINES - 1)
         except (TypeError, ValueError):
             end = start + READ_CHUNK_LINES - 1
+        end = max(start, end)
+        if size > MAX_READ_STREAM_BYTES:
+            return self._stream_read(path, relative, start, end)
+        data, _ = read_cached(
+            path, MAX_READ_STREAM_BYTES,
+            accept=lambda value: b"\x00" not in value[:4096])
+        if data is None:
+            return self._stream_read(path, relative, start, end)
+        content = data.decode("utf-8", errors="replace")
+        if content.startswith("\ufeff"):
+            content = content[1:]
+        lines = content.splitlines(keepends=True)
         total = len(lines)
         start = min(start, max(1, total))
         end = max(start, min(max(1, total), end))
@@ -900,7 +1381,7 @@ class _AbilityRunner:
         included_end = start + len(selected) - 1 if selected else start
         truncated = included_end < total
         result = {
-            "path": str(path.relative_to(self.files)), "content": body,
+            "path": relative, "content": body,
             "start_line": start, "end_line": included_end, "total_lines": total,
             "truncated": truncated,
         }
@@ -909,8 +1390,8 @@ class _AbilityRunner:
         if midline:
             result["content_cut_midline"] = True
             result["hint"] = (
-                "This line is longer than the read budget; use file.search or "
-                "file.inspect to inspect the rest instead of re-reading the same line."
+                "This line is longer than the read budget; use file.search to inspect "
+                "the rest instead of re-reading the same line."
             )
         return result
 
@@ -931,19 +1412,59 @@ class _AbilityRunner:
                 "bytes": len(content.encode("utf-8")), "written": True}
 
     def file_list(self, params: dict, context: dict) -> dict:
-        pattern = str(params.get("pattern") or "*")
-        if "/" in pattern or "\\" in pattern:
-            raise ToolError("List patterns cannot traverse directories")
-        files = []
-        for path in sorted(self.files.glob(pattern))[:200]:
-            if (path.is_file() and not path.is_symlink()
-                    and path.name != ".mariana-ide.json"
-                    and not self._denied(path.resolve())):
-                files.append({
-                    "name": path.name, "bytes": path.stat().st_size,
-                    "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
-                })
-        return {"pattern": pattern, "files": files}
+        directory = self._sandbox_path(
+            str(params.get("path") or params.get("input") or "."))
+        relative = self._relative(directory)
+        if not directory.exists():
+            raise ToolError(self._missing_path_message(directory))
+        pattern = str(params.get("pattern") or "*").strip() or "*"
+        if pattern.startswith("/") or ".." in Path(pattern).parts:
+            raise ToolError("List patterns cannot traverse outside the sandbox")
+        recursive = _truthy(params.get("recursive"), False) or "**" in pattern
+        try:
+            limit = max(1, min(MAX_LIST_ENTRIES, int(params.get("max_entries") or 200)))
+        except (TypeError, ValueError):
+            limit = 200
+        if directory.is_file():
+            paths = [directory]
+        elif pattern in {"*", "."} and not recursive:
+            paths = sorted(directory.iterdir())
+        elif recursive:
+            paths = sorted(directory.rglob(pattern))
+        else:
+            paths = sorted(directory.glob(pattern))
+        entries: list[dict] = []
+        files: list[dict] = []
+        truncated = False
+        for child in paths:
+            if len(entries) >= limit:
+                truncated = True
+                break
+            if child.name == ".mariana-ide.json" or child.is_symlink():
+                continue
+            try:
+                resolved = child.resolve()
+                resolved.relative_to(self.files)
+            except (OSError, ValueError):
+                continue
+            if self._denied(resolved):
+                continue
+            item = {"name": child.name, "path": self._relative(child)}
+            if resolved.is_dir():
+                item.update({"type": "dir"})
+                entries.append(item)
+            elif resolved.is_file():
+                try:
+                    info = resolved.stat()
+                except OSError:
+                    continue
+                modified = datetime.fromtimestamp(info.st_mtime).isoformat(timespec="seconds")
+                item.update({"type": "file", "bytes": info.st_size, "modified": modified})
+                entries.append(item)
+                files.append({"name": child.name, "bytes": info.st_size,
+                              "modified": modified, "path": self._relative(child)})
+        return {"path": relative, "pattern": pattern, "entries": entries,
+                "files": files, "truncated": truncated}
 
     def file_edit(self, params: dict, context: dict) -> dict:
         """Replace one exact block; refusing ambiguity is safer than guessing."""
@@ -991,6 +1512,79 @@ class _AbilityRunner:
             "bytes": len(encoded), "changed": content != updated,
         }
 
+    def _git_grep(self, query: str, use_regex: bool, case_sensitive: bool,
+                  include: str, limit: int) -> dict | None:
+        """Search a Git work tree with git grep, or return ``None`` to fall back."""
+        git_dir = self.files / ".git"
+        if not git_dir.exists() or git_dir.is_symlink():
+            return None
+        git = shutil.which("git")
+        if not git:
+            return None
+        arguments = [
+            git, "-C", str(self.files), "grep", "-n", "-I", "--no-color",
+            "--untracked", "-m", str(max(1, limit + 1)),
+        ]
+        if not case_sensitive:
+            arguments.append("-i")
+        arguments.append("-E" if use_regex else "-F")
+        arguments += ["-e", query]
+        paths = [item.strip() for item in str(include or "").split(",") if item.strip()]
+        arguments += ["--", *(paths or ["."])]
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("GIT_")}
+        environment.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+                            "GIT_PAGER": "cat", "GIT_CONFIG_NOSYSTEM": "1",
+                            "GIT_CONFIG_GLOBAL": os.devnull})
+        matches = []
+        truncated = False
+        process = None
+        try:
+            process = subprocess.Popen(
+                arguments, cwd=self.files, env=environment, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) < 3:
+                    continue
+                path, number, text = parts
+                try:
+                    line_number = int(number)
+                except ValueError:
+                    continue
+                matches.append({"path": path.replace("\\", "/"), "line": line_number,
+                                "text": text.strip()[:300]})
+            if truncated:
+                # The requested result count is already reached; stopping git now
+                # avoids buffering a huge match stream for a broad query.
+                process.terminate()
+            try:
+                returncode = process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            if process is not None:
+                process.kill()
+            return None
+        finally:
+            if process is not None:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+        if returncode not in {0, 1, -15} and not matches:
+            # Git versions before --untracked, or a regex dialect Git rejects:
+            # the Python walker below is the portable path.
+            return None
+        return {"query": query, "matches": matches, "files_scanned": None,
+                "truncated": truncated, "engine": "git"}
+
     def file_search(self, params: dict, context: dict) -> dict:
         query = str(params.get("query") or params.get("input") or "")
         if not query:
@@ -1000,29 +1594,56 @@ class _AbilityRunner:
         flags = 0 if case_sensitive else re.IGNORECASE
         if len(query) > 300:
             raise ToolError("Search query is limited to 300 characters")
+        regex_fallback = False
         if use_regex:
             try:
                 pattern = re.compile(query, flags)
-            except re.error as error:
-                raise ToolError(f"Invalid regular expression: {error}") from error
-            match_line = lambda line: pattern.search(line) is not None  # noqa: E731
+            except re.error:
+                # Models frequently send a literal snippet such as "strlen(".
+                # Falling back to a literal search is more useful than failing.
+                regex_fallback = True
+                use_regex = False
+                pattern = None
+            if use_regex:
+                match_line = lambda line: pattern.search(line) is not None  # noqa: E731
+            else:
+                needle = query if case_sensitive else query.lower()
+                match_line = (lambda line: needle in line if case_sensitive  # noqa: E731
+                              else needle in line.lower())
         else:
             needle = query if case_sensitive else query.lower()
-            match_line = lambda line: needle in line if case_sensitive else needle in line.lower()  # noqa: E731
+            match_line = (lambda line: needle in line if case_sensitive  # noqa: E731
+                          else needle in line.lower())
         try:
             limit = max(1, min(MAX_SEARCH_RESULTS, int(params.get("max_results") or 100)))
         except (TypeError, ValueError):
             limit = 100
-        include = str(params.get("include") or "").strip()
+        include = str(params.get("include") or "").replace("\\", "/").strip()
+        self._check_cancelled()
+        fast = self._git_grep(query, use_regex, case_sensitive, include, limit)
+        if fast is not None:
+            if regex_fallback:
+                fast.update({"regex_fallback": True,
+                             "hint": "The query was not a valid regular expression; "
+                                     "it was searched as literal text."})
+            return fast
         matches, scanned, truncated = [], 0, False
         visited = 0
+        includes = [item.strip() for item in include.split(",") if item.strip()]
         for path in self._walk_files():
             visited += 1
             if visited > MAX_SEARCH_FILES:
                 truncated = True
                 break
-            if include and not path.match(include):
-                continue
+            if visited % 250 == 0:
+                self._check_cancelled()
+            if includes:
+                try:
+                    relative = path.relative_to(self.files)
+                except ValueError:
+                    continue
+                if not any(relative.match(item) for item in includes):
+                    continue
             data = _text_bytes(path)
             if data is None:
                 continue
@@ -1041,39 +1662,70 @@ class _AbilityRunner:
                     break
             if truncated:
                 break
-        return {"query": query, "matches": matches, "files_scanned": scanned,
-                "truncated": truncated}
+        result = {"query": query, "matches": matches, "files_scanned": scanned,
+                  "truncated": truncated, "engine": "python"}
+        if regex_fallback:
+            result.update({"regex_fallback": True,
+                           "hint": "The query was not a valid regular expression; "
+                                   "it was searched as literal text."})
+        return result
 
     def file_tree(self, params: dict, context: dict) -> dict:
         try:
-            limit = max(1, min(2000, int(params.get("max_entries") or 600)))
+            limit = max(1, min(MAX_TREE_ENTRIES, int(params.get("max_entries") or 600)))
         except (TypeError, ValueError):
             limit = 600
+        try:
+            depth = max(1, min(32, int(params.get("depth") or 12)))
+        except (TypeError, ValueError):
+            depth = 12
         entries, truncated = [], False
-        for path in self._walk_paths():
+        for base, directories, names in os.walk(self.files, followlinks=False):
+            base_path = Path(base)
             try:
-                resolved = path.resolve()
-                relative = resolved.relative_to(self.files)
-            except (OSError, ValueError):
+                relative_base = base_path.relative_to(self.files)
+            except ValueError:
+                directories[:] = []
                 continue
-            if resolved.name == ".mariana-ide.json":
-                continue
-            if resolved.name.startswith(".") and resolved.name.endswith(".tmp"):
-                continue
-            if resolved != path:
-                continue  # never expose a file through a symlink
-            if resolved.is_dir():
-                entries.append({"path": str(relative), "type": "dir"})
-            elif resolved.is_file():
+            directories[:] = sorted(
+                name for name in directories
+                if name not in IGNORED_DIRS
+                and not (base_path / name).is_symlink()
+                and not self._denied((base_path / name).resolve()))
+            if len(relative_base.parts) >= depth:
+                directories[:] = []
+            for name in directories:
+                if len(entries) >= limit:
+                    truncated = True
+                    break
+                entries.append({"path": (relative_base / name).as_posix(), "type": "dir"})
+            if truncated:
+                break
+            for name in sorted(names):
+                if len(entries) >= limit:
+                    truncated = True
+                    break
+                path = base_path / name
+                if name == ".mariana-ide.json" or path.is_symlink():
+                    continue
+                if name.startswith(".") and name.endswith(".tmp"):
+                    continue
                 try:
-                    entries.append({"path": str(relative), "type": "file",
-                                    "bytes": resolved.stat().st_size})
+                    resolved = path.resolve()
+                    resolved.relative_to(self.files)
+                except (OSError, ValueError):
+                    continue
+                if self._denied(resolved) or not resolved.is_file():
+                    continue
+                try:
+                    size = resolved.stat().st_size
                 except OSError:
                     continue
-            if len(entries) >= limit:
-                truncated = True
+                entries.append({"path": (relative_base / name).as_posix(),
+                                "type": "file", "bytes": size})
+            if truncated:
                 break
-        return {"entries": entries, "truncated": truncated}
+        return {"entries": entries, "truncated": truncated, "depth": depth}
 
     def file_delete(self, params: dict, context: dict) -> dict:
         path = self._sandbox_path(str(params.get("path") or params.get("input") or ""))
@@ -1082,6 +1734,7 @@ class _AbilityRunner:
         if self.dry_run:
             return {"dry_run": True, "path": str(path.relative_to(self.files)), "deleted": True}
         path.unlink()
+        HOT_CACHE.invalidate(str(path))
         return {"path": str(path.relative_to(self.files)), "deleted": True}
 
     def code_diagnostics(self, params: dict, context: dict) -> dict:
@@ -1299,15 +1952,30 @@ class _AbilityRunner:
 
     def git_inspect(self, params: dict, context: dict) -> dict:
         """Read-only git status, diff or log with fixed arguments and a sanitized environment."""
-        git_dir = self.files / ".git"
-        if not git_dir.is_dir() or git_dir.is_symlink():
-            raise ToolError("No Git repository in this folder")
-        git = shutil.which("git")
-        if not git:
-            raise ToolError("Git is not installed; install git to inspect a repository")
-        action = str(params.get("action") or "status").lower()
+        action = str(params.get("action") or "status").strip().lower()
+        action = action.split()[0] if action else "status"
+        aliases = {
+            "changes": "status", "working": "status", "short": "status",
+            "files": "status", "staged": "diff", "history": "log",
+            "commits": "log", "show": "log", "head": "log", "last": "log",
+        }
+        action = aliases.get(action, action)
         if action not in {"status", "diff", "log"}:
             raise ToolError("git.inspect action must be status, diff, or log")
+        git_dir = self.files / ".git"
+        if not git_dir.exists() or git_dir.is_symlink():
+            # A missing repository is a normal property of a project, not a tool
+            # failure; returning a structured miss lets the model choose another
+            # source instead of retrying the same call.
+            return {"action": action, "repository": False, "clean": None,
+                    "files": [], "truncated": False,
+                    "hint": "No Git repository in this folder; use file.tree, file.list "
+                            "or file.search instead."}
+        git = shutil.which("git")
+        if not git:
+            return {"action": action, "repository": True, "git": False,
+                    "clean": None, "files": [], "truncated": False,
+                    "hint": "Git is not installed; use file.tree or file.search instead."}
         try:
             limit = max(1, min(200, int(params.get("limit") or 30)))
         except (TypeError, ValueError):
@@ -1317,7 +1985,7 @@ class _AbilityRunner:
         except (TypeError, ValueError):
             max_chars = 12000
         arguments = [
-            git, "--no-pager", "--git-dir", str(git_dir), "--work-tree", str(self.files),
+            git, "--no-pager", "-C", str(self.files),
             "-c", "core.fsmonitor=false", "-c", "core.pager=cat",
             "-c", "advice.detachedHead=false",
         ]
@@ -1494,6 +2162,8 @@ class _AbilityRunner:
                 break
             except subprocess.TimeoutExpired:
                 continue
+        if _shell_may_write(command):
+            HOT_CACHE.clear()
         return {
             "command": command, "returncode": process.returncode,
             "stdout": stdout[-MAX_OUTPUT_CHARS:],
